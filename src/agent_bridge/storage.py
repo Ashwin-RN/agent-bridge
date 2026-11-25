@@ -362,6 +362,89 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
     return changed
 
 
+def _reconcile_session_safety_cur(
+    cur: sqlite3.Cursor,
+    backend: str,
+    session_id: str,
+    *,
+    persist: bool,
+) -> tuple[str, str] | None:
+    """Return active `(blocking_job_id, provider_state)` for `(backend, session_id)`.
+
+    Checks durable `session_safety_state` AND reconciles against the latest terminal invoked row in
+    `jobs` so mixed-version older writers (which don't populate `session_safety_state`) can never
+    bypass the uncertain-prior-turn resume gate.
+    """
+    safety = cur.execute(
+        """
+        SELECT blocking_job_id, provider_state, updated_at
+        FROM session_safety_state
+        WHERE backend = ? AND session_id = ?
+        """,
+        (backend, session_id),
+    ).fetchone()
+
+    latest = cur.execute(
+        """
+        SELECT rowid AS rid, job_id, provider_state, COALESCE(finished_at, created_at) AS ts
+        FROM jobs
+        WHERE backend = ? AND session_id = ?
+          AND status IN ('completed', 'failed', 'cancelled', 'timed_out')
+          AND (
+              provider_invoked = 1
+              OR started_at IS NOT NULL
+              OR provider_state IN ('possibly_running', 'unknown')
+          )
+        ORDER BY COALESCE(finished_at, created_at) DESC, rowid DESC
+        LIMIT 1
+        """,
+        (backend, session_id),
+    ).fetchone()
+
+    if latest is not None and str(latest["provider_state"]) in {"possibly_running", "unknown"}:
+        latest_id = str(latest["job_id"])
+        latest_state = str(latest["provider_state"])
+        latest_ts = float(latest["ts"] or time.time())
+
+        if safety is None:
+            if persist:
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO session_safety_state (
+                        backend, session_id, blocking_job_id, provider_state, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (backend, session_id, latest_id, latest_state, latest_ts),
+                )
+            return latest_id, latest_state
+
+        safety_id = str(safety["blocking_job_id"])
+        safety_state = str(safety["provider_state"])
+        if safety_id == latest_id:
+            return safety_id, safety_state
+
+        safety_job = cur.execute(
+            "SELECT 1 FROM jobs WHERE job_id = ?",
+            (safety_id,),
+        ).fetchone()
+        if safety_job is not None or latest_ts >= float(safety["updated_at"]):
+            if persist:
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO session_safety_state (
+                        backend, session_id, blocking_job_id, provider_state, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (backend, session_id, latest_id, latest_state, latest_ts),
+                )
+            return latest_id, latest_state
+        return safety_id, safety_state
+
+    if safety is not None:
+        return str(safety["blocking_job_id"]), str(safety["provider_state"])
+    return None
+
+
 class BridgeStore:
     """Concurrency-safe SQLite store shared across multiple bridge processes."""
 
@@ -462,51 +545,83 @@ class BridgeStore:
                 )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_quota_pool ON usage_events(quota_pool)")
 
-            # One-time backfill of durable session_safety_state for any existing unresolved sessions.
-            if (
-                cur.execute(
-                    "SELECT 1 FROM meta WHERE key = 'session_safety_backfilled'"
+            # Always reconcile any latest-uncertain terminal rows in `jobs` into durable
+            # `session_safety_state` (covers initial upgrade AND mixed-version older writers).
+            uncertain_rows = cur.execute(
+                """
+                SELECT j.backend, j.session_id, j.job_id, j.provider_state,
+                       COALESCE(j.finished_at, j.created_at) AS ts
+                FROM jobs j
+                WHERE j.session_id IS NOT NULL
+                  AND j.status IN ('completed', 'failed', 'cancelled', 'timed_out')
+                  AND j.provider_state IN ('possibly_running', 'unknown')
+                  AND (
+                      j.provider_invoked = 1
+                      OR j.started_at IS NOT NULL
+                      OR j.provider_state IN ('possibly_running', 'unknown')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jobs j2
+                      WHERE j2.backend = j.backend
+                        AND j2.session_id = j.session_id
+                        AND j2.status IN ('completed', 'failed', 'cancelled', 'timed_out')
+                        AND (
+                            j2.provider_invoked = 1
+                            OR j2.started_at IS NOT NULL
+                            OR j2.provider_state IN ('possibly_running', 'unknown')
+                        )
+                        AND (
+                            COALESCE(j2.finished_at, j2.created_at) > COALESCE(j.finished_at, j.created_at)
+                            OR (
+                                COALESCE(j2.finished_at, j2.created_at) = COALESCE(j.finished_at, j.created_at)
+                                AND j2.rowid > j.rowid
+                            )
+                        )
+                  )
+                """
+            ).fetchall()
+            now = time.time()
+            for urow in uncertain_rows:
+                u_backend = str(urow["backend"])
+                u_sid = str(urow["session_id"])
+                u_jid = str(urow["job_id"])
+                u_state = str(urow["provider_state"])
+                u_ts = float(urow["ts"] or now)
+                existing = cur.execute(
+                    """
+                    SELECT blocking_job_id, updated_at
+                    FROM session_safety_state
+                    WHERE backend = ? AND session_id = ?
+                    """,
+                    (u_backend, u_sid),
                 ).fetchone()
-                is None
-            ):
-                now = time.time()
-                uncertain_rows = cur.execute(
-                    """
-                    SELECT j.backend, j.session_id, j.job_id, j.provider_state
-                    FROM jobs j
-                    WHERE j.session_id IS NOT NULL
-                      AND j.provider_invoked = 1
-                      AND j.status IN ('completed', 'failed', 'cancelled', 'timed_out')
-                      AND j.provider_state IN ('possibly_running', 'unknown')
-                      AND NOT EXISTS (
-                          SELECT 1 FROM jobs j2
-                          WHERE j2.backend = j.backend
-                            AND j2.session_id = j.session_id
-                            AND j2.provider_invoked = 1
-                            AND j2.status IN ('completed', 'failed', 'cancelled', 'timed_out')
-                            AND COALESCE(j2.finished_at, j2.created_at) > COALESCE(j.finished_at, j.created_at)
-                      )
-                    """
-                ).fetchall()
-                for urow in uncertain_rows:
+                if existing is None:
                     cur.execute(
                         """
-                        INSERT OR IGNORE INTO session_safety_state (
+                        INSERT INTO session_safety_state (
                             backend, session_id, blocking_job_id, provider_state, updated_at
                         ) VALUES (?, ?, ?, ?, ?)
                         """,
-                        (
-                            str(urow["backend"]),
-                            str(urow["session_id"]),
-                            str(urow["job_id"]),
-                            str(urow["provider_state"]),
-                            now,
-                        ),
+                        (u_backend, u_sid, u_jid, u_state, u_ts),
                     )
-                cur.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('session_safety_backfilled', ?)",
-                    (str(now),),
-                )
+                elif str(existing["blocking_job_id"]) != u_jid:
+                    ex_job = cur.execute(
+                        "SELECT 1 FROM jobs WHERE job_id = ?",
+                        (str(existing["blocking_job_id"]),),
+                    ).fetchone()
+                    if ex_job is not None or u_ts >= float(existing["updated_at"]):
+                        cur.execute(
+                            """
+                            INSERT OR REPLACE INTO session_safety_state (
+                                backend, session_id, blocking_job_id, provider_state, updated_at
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (u_backend, u_sid, u_jid, u_state, u_ts),
+                        )
+            cur.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('session_safety_backfilled', ?)",
+                (str(now),),
+            )
 
         self._import_legacy_files_if_needed()
 
@@ -879,21 +994,14 @@ class BridgeStore:
         backend: str,
         session_id: str,
     ) -> dict[str, str] | None:
-        """Return durable unresolved provider state for `(backend, session_id)`, independent of job pruning."""
+        """Return durable unresolved provider state for `(backend, session_id)` (reconciling older writers too)."""
         with self._tx(write=False) as cur:
-            row = cur.execute(
-                """
-                SELECT blocking_job_id, provider_state
-                FROM session_safety_state
-                WHERE backend = ? AND session_id = ?
-                """,
-                (backend, session_id),
-            ).fetchone()
-            if row is None:
+            block = _reconcile_session_safety_cur(cur, backend, session_id, persist=False)
+            if block is None:
                 return None
             return {
-                "blocking_job_id": str(row["blocking_job_id"]),
-                "provider_state": str(row["provider_state"]),
+                "blocking_job_id": block[0],
+                "provider_state": block[1],
             }
 
     def try_claim_session(
@@ -1002,18 +1110,10 @@ class BridgeStore:
                         (now, str(rrow["owner_id"])),
                     )
 
-            # Durable safety gate (independent of jobs table pruning, bound to the exact blocking_job_id!):
-            safety = cur.execute(
-                """
-                SELECT blocking_job_id, provider_state
-                FROM session_safety_state
-                WHERE backend = ? AND session_id = ?
-                """,
-                (backend, session_id),
-            ).fetchone()
+            # Durable safety gate (independent of jobs pruning AND reconciled against older writers!):
+            safety = _reconcile_session_safety_cur(cur, backend, session_id, persist=True)
             if safety is not None:
-                blocking_id = str(safety["blocking_job_id"])
-                blocking_state = str(safety["provider_state"])
+                blocking_id, blocking_state = safety
                 if blocking_id != job_id and confirm_prior_job_id != blocking_id:
                     return "blocked", blocking_id, blocking_state
 
@@ -1390,7 +1490,7 @@ class BridgeStore:
                             record.session_id,
                             record.job_id,
                             str(record.provider_state),
-                            now,
+                            record.finished_at or now,
                         ),
                     )
                 else:

@@ -1979,3 +1979,429 @@ print(json.dumps({{
     assert res_opt.status == "completed"
     assert "RAN:DEFAULT_GEMINI" in res_opt.response
     assert res_opt.model_notice is not None
+
+
+async def test_windows_containment_failure_terminates_suspended_worker_without_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit High #1: if Windows Job Object attachment fails, NEVER resume the suspended worker;
+    terminate it while still suspended and return a clear launch_error."""
+    if sys.platform != "win32":
+        pytest.skip("Windows-specific Job Object containment test")
+
+    from agent_bridge import process_control as pc
+
+    ran_marker = tmp_path / "worker_should_not_run.txt"
+    gc_marker = tmp_path / "child_should_not_spawn.pid"
+    worker = tmp_path / "forbidden_worker.py"
+    worker.write_text(
+        f"""
+import subprocess, sys
+from pathlib import Path
+
+Path({str(ran_marker)!r}).write_text("RAN", encoding="utf-8")
+g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+Path({str(gc_marker)!r}).write_text(str(g.pid), encoding="utf-8")
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(pc._kernel32, "AssignProcessToJobObject", lambda _j, _p: 0)
+
+    # 1. Direct spawn_managed_process raises ProcessContainmentError and never runs the worker!
+    with pytest.raises(pc.ProcessContainmentError, match="AssignProcessToJobObject"):
+        await pc.spawn_managed_process(sys.executable, str(worker))
+    await asyncio.sleep(0.15)
+    assert not ran_marker.exists(), "Suspended worker resumed despite Job Object containment failure!"
+    assert not gc_marker.exists(), "Child spawned despite Job Object containment failure!"
+
+    # 2. Through JobManager -> returns structured failed/launch_error with provider_state=stopped!
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(settings, codex_runner=StubCodexRunner(settings, worker))
+    rec = await mgr.run(mgr.prepare_request(backend="codex", prompt="must fail closed"))
+    assert rec.status == "failed"
+    assert rec.failure_reason == "launch_error"
+    assert rec.provider_state == "stopped"
+    assert rec.provider_invoked is False
+    assert "Job Object" in (rec.error or "")
+    await asyncio.sleep(0.15)
+    assert not ran_marker.exists()
+    assert not gc_marker.exists()
+    await mgr.shutdown()
+
+
+async def test_cancellation_during_posix_spawn_pipe_setup_captures_and_cleans_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit High #2: cancelling during POSIX asyncio pipe setup waits atomically for launch +
+    registration so the child's process group is obtained, killed, and verified stopped."""
+    import signal
+
+    from agent_bridge import process_control as pc
+
+    sigterm = signal.SIGTERM
+    sigkill = getattr(signal, "SIGKILL", 9)
+
+    monkeypatch.setattr(pc.sys, "platform", "linux")
+    monkeypatch.setattr(pc.ManagedProcess, "_POSIX_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(pc.ManagedProcess, "_POSIX_KILL_WAIT_SECONDS", 0.1)
+
+    entered_pipe_setup = asyncio.Event()
+    release_pipe_setup = asyncio.Event()
+    state = {"grandchild_alive": True, "signals": []}
+
+    class FakePosixProc:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.returncode: int | None = None
+
+        async def wait(self) -> int:
+            while self.returncode is None:
+                await asyncio.sleep(0.01)
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    fake_proc = FakePosixProc(pid=7788)
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        entered_pipe_setup.set()
+        await release_pipe_setup.wait()
+        return fake_proc
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        assert pgid == 7788
+        if sig == 0:
+            if state["grandchild_alive"] or fake_proc.returncode is None:
+                return
+            raise ProcessLookupError()
+        state["signals"].append(sig)
+        if sig == sigterm:
+            fake_proc.returncode = -15
+        elif sig == sigkill:
+            state["grandchild_alive"] = False
+
+    monkeypatch.setattr(pc.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(pc.os, "killpg", fake_killpg, raising=False)
+
+    tracker = pc.ProcessTracker()
+
+    async def runner_task_fn() -> None:
+        token = pc.CURRENT_PROCESS_TRACKER.set(tracker)
+        try:
+            await pc.spawn_managed_process("fake-cmd")
+        finally:
+            pc.CURRENT_PROCESS_TRACKER.reset(token)
+
+    task = asyncio.create_task(runner_task_fn())
+    await asyncio.wait_for(entered_pipe_setup.wait(), timeout=2.0)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    release_pipe_setup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert state["signals"] == [sigterm, sigkill]
+    assert state["grandchild_alive"] is False
+    assert await tracker.terminate_all_and_verify() is True
+
+
+async def test_mixed_version_old_writer_timeout_blocks_new_window_resume(tmp_path: Path) -> None:
+    """Audit High #3: when an older window writes an uncertain terminal job directly to `jobs`
+    after the DB has already migrated, the new window reconciles it and blocks automatic resume
+    (both live and after reopening)."""
+    from agent_bridge.storage import BridgeStore
+
+    fake_agy = tmp_path / "fake_agy_mixed.py"
+    fake_agy.write_text(
+        """
+import json, sys
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+prompt = [a for a in args if a.startswith("--print=")][0][len("--print="):]
+print(json.dumps({
+    "conversation_id": "conv-mixed-ver",
+    "status": "SUCCESS",
+    "response": f"OK:{prompt}",
+    "num_turns": 2,
+    "usage": {"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(settings, neon_runner=StubAgyRunner(settings, fake_agy))
+    # DB is now fully migrated (`session_safety_backfilled` is already populated in `meta`).
+
+    # Simulate an older window (which never touches `session_safety_state`) recording a timed_out
+    # job with `provider_state='possibly_running'` and default `provider_invoked=0`!
+    now = time.time()
+    with mgr.store._tx(write=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO jobs (
+                job_id, owner_id, backend, quota_pool, cwd, effective_cwd, mode,
+                prompt_preview, session_id, status, failure_reason, provider_state,
+                created_at, started_at, finished_at, duration_seconds, usage_status,
+                provider_invoked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "neon-oldwin1",
+                "old-window-1",
+                "neon",
+                "agy_gemini",
+                str(tmp_path),
+                str(tmp_path),
+                "read_only",
+                "old turn",
+                "conv-mixed-ver",
+                "timed_out",
+                "provider_timeout_still_running",
+                "possibly_running",
+                now - 5.0,
+                now - 4.5,
+                now - 1.0,
+                3.5,
+                "missing",
+                0,  # Simulates pre-0b40240 writer omitting `provider_invoked`!
+            ),
+        )
+
+    # 1. Live already-open new window MUST block unconfirmed resume and persist into session_safety_state!
+    blocked_live = await mgr.run(
+        mgr.prepare_request(
+            backend="neon",
+            model="neon-medium",
+            prompt="SHOULD_BLOCK_LIVE",
+            resume_from="conv-mixed-ver",
+        )
+    )
+    assert blocked_live.status == "failed"
+    assert blocked_live.failure_reason == "prior_turn_uncertain"
+    assert "neon-oldwin1" in (blocked_live.error or "")
+
+    # 2. Simulate a SECOND older-window uncertain timeout and verify reopening ALSO catches it!
+    with mgr.store._tx(write=True) as cur:
+        cur.execute("DELETE FROM session_safety_state WHERE session_id = 'conv-mixed-ver'")
+        cur.execute(
+            """
+            INSERT INTO jobs (
+                job_id, owner_id, backend, quota_pool, cwd, effective_cwd, mode,
+                prompt_preview, session_id, status, failure_reason, provider_state,
+                created_at, started_at, finished_at, duration_seconds, usage_status,
+                provider_invoked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "neon-oldwin2",
+                "old-window-2",
+                "neon",
+                "agy_gemini",
+                str(tmp_path),
+                str(tmp_path),
+                "read_only",
+                "old turn 2",
+                "conv-mixed-ver",
+                "timed_out",
+                "timeout",
+                "possibly_running",
+                now - 0.8,
+                now - 0.7,
+                now - 0.1,
+                0.6,
+                "missing",
+                1,
+            ),
+        )
+
+    reopened_store = BridgeStore(settings.state_dir, max_stored_jobs=settings.max_stored_jobs)
+    block_after_reopen = reopened_store.get_session_safety_block("neon", "conv-mixed-ver")
+    assert block_after_reopen == {
+        "blocking_job_id": "neon-oldwin2",
+        "provider_state": "possibly_running",
+    }
+
+    mgr2 = JobManager(settings, neon_runner=StubAgyRunner(settings, fake_agy), store=reopened_store)
+    blocked_reopen = await mgr2.run(
+        mgr2.prepare_request(
+            backend="neon",
+            model="neon-medium",
+            prompt="SHOULD_BLOCK_REOPEN",
+            resume_from="conv-mixed-ver",
+        )
+    )
+    assert blocked_reopen.status == "failed"
+    assert blocked_reopen.failure_reason == "prior_turn_uncertain"
+    assert "neon-oldwin2" in (blocked_reopen.error or "")
+
+    # 3. Confirmed resume succeeds and clears the block cleanly!
+    confirmed = await mgr2.run(
+        mgr2.prepare_request(
+            backend="neon",
+            model="neon-medium",
+            prompt="CONFIRMED_OK",
+            resume_from="conv-mixed-ver",
+            confirm_prior_stopped=True,
+        )
+    )
+    assert confirmed.status == "completed"
+    assert "OK:CONFIRMED_OK" in confirmed.response
+    assert reopened_store.get_session_safety_block("neon", "conv-mixed-ver") is None
+
+    await mgr.shutdown()
+    await mgr2.shutdown()
+
+
+async def test_normal_exit_with_pipe_inheriting_descendant_completes_without_timeout(
+    tmp_path: Path,
+) -> None:
+    """Audit Medium #4: when a worker emits a valid result and exits 0 while a sleeping child
+    inherits its stdout/stderr pipes, the bridge detects leader exit, cleans up the child, drains
+    remaining output, and reports `completed` (never falsely `timed_out`)."""
+    from agent_bridge.process_control import is_pid_alive
+
+    # Part A: Codex worker with pipe-inheriting sleeping descendant
+    codex_gc_pid = tmp_path / "codex_pipe_gc.pid"
+    codex_script = tmp_path / "codex_pipe_inherit.py"
+    codex_script.write_text(
+        f"""
+import json, subprocess, sys
+from pathlib import Path
+
+# Deliberately inherit stdout & stderr pipes (NO DEVNULL)!
+g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+Path({str(codex_gc_pid)!r}).write_text(str(g.pid), encoding="utf-8")
+_ = sys.stdin.read()
+print(json.dumps({{"type": "thread.started", "thread_id": "thr-pipe-ok"}}), flush=True)
+print(json.dumps({{"type": "item.completed", "item": {{"id": "m1", "type": "agent_message", "text": "CODEX_PIPE_SUCCESS"}}}}), flush=True)
+print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 12, "output_tokens": 8}}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    # Part B: Neon worker with pipe-inheriting sleeping descendant
+    neon_gc_pid = tmp_path / "neon_pipe_gc.pid"
+    neon_script = tmp_path / "neon_pipe_inherit.py"
+    neon_script.write_text(
+        f"""
+import json, subprocess, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+Path({str(neon_gc_pid)!r}).write_text(str(g.pid), encoding="utf-8")
+print(json.dumps({{"event": "init", "conversation_id": "conv-pipe-ok", "init": {{"model": "gemini-4-neon-medium"}}}}), flush=True)
+print(json.dumps({{"event": "result", "result": {{"conversation_id": "conv-pipe-ok", "status": "SUCCESS", "response": "NEON_PIPE_SUCCESS", "num_turns": 1, "usage": {{"input_tokens": 15, "output_tokens": 5, "total_tokens": 20}}}}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(
+        settings,
+        codex_runner=StubCodexRunner(settings, codex_script),
+        neon_runner=StubAgyRunner(settings, neon_script),
+    )
+
+    t0 = time.monotonic()
+    c_rec = await mgr.run(mgr.prepare_request(backend="codex", prompt="go", timeout_seconds=10))
+    assert (time.monotonic() - t0) < 4.5
+    assert c_rec.status == "completed"
+    assert c_rec.provider_state == "stopped"
+    assert "CODEX_PIPE_SUCCESS" in c_rec.response
+    assert codex_gc_pid.exists()
+    assert not is_pid_alive(int(codex_gc_pid.read_text(encoding="utf-8").strip()))
+
+    t1 = time.monotonic()
+    n_rec = await mgr.run(
+        mgr.prepare_request(backend="neon", model="neon-medium", prompt="go", timeout_seconds=10)
+    )
+    assert (time.monotonic() - t1) < 4.5
+    assert n_rec.status == "completed"
+    assert n_rec.provider_state == "stopped"
+    assert "NEON_PIPE_SUCCESS" in n_rec.response
+    assert neon_gc_pid.exists()
+    assert not is_pid_alive(int(neon_gc_pid.read_text(encoding="utf-8").strip()))
+
+    await mgr.shutdown()
+
+
+async def test_empty_initial_catalog_refuses_unverified_cli_default_on_neon_low(
+    tmp_path: Path,
+) -> None:
+    """Audit Medium #5: with `neon-low`, cross-pool fallback disabled, and an empty catalog,
+    NeonRunner MUST NOT omit `--model` and accidentally spend the CLI default's Claude/GPT pool."""
+    invocations_log = tmp_path / "empty_cat_calls.log"
+    fake_agy = tmp_path / "fake_agy_empty_cat.py"
+    fake_agy.write_text(
+        f"""
+import json, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    sys.stderr.write("temporary catalog outage\\n")
+    sys.exit(1)
+
+model = args[args.index("--model") + 1] if "--model" in args else "CLI_DEFAULT_SONNET"
+with Path({str(invocations_log)!r}).open("a", encoding="utf-8") as fh:
+    fh.write(model + "\\n")
+
+print(json.dumps({{
+    "conversation_id": "conv-sonnet-default",
+    "status": "SUCCESS",
+    "response": f"RAN:{{model}}",
+    "num_turns": 1,
+    "usage": {{"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}},
+}}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    nrunner = StubAgyRunner(settings, fake_agy)
+
+    # Default (allow_cross_pool_fallback=False): MUST fail with model_unavailable without spawning!
+    res = await nrunner.run(
+        RunRequest(
+            backend="neon",
+            model="neon-low",
+            prompt="hello",
+            cwd=str(tmp_path),
+            allow_cross_pool_fallback=False,
+        )
+    )
+    assert res.status == "failed"
+    assert res.failure_reason == "model_unavailable"
+    assert res.provider_invoked is False
+    assert not invocations_log.exists(), "agy should NEVER have run with unverified CLI default!"
+
+    # Opt-in (allow_cross_pool_fallback=True): permitted to fall back to CLI default with notice.
+    res_opt = await nrunner.run(
+        RunRequest(
+            backend="neon",
+            model="neon-low",
+            prompt="hello",
+            cwd=str(tmp_path),
+            allow_cross_pool_fallback=True,
+        )
+    )
+    assert res_opt.status == "completed"
+    assert "RAN:CLI_DEFAULT_SONNET" in res_opt.response
+    assert res_opt.model_notice is not None

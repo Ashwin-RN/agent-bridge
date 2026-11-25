@@ -494,14 +494,15 @@ class NeonModelCatalog:
             desired_prov, _, _, _, is_versioned = _parse_intent(effective, effort_override=effort_override)
             if is_versioned and not effort_override:
                 return ResolvedModel(requested=requested or effective, resolved=effective)
-            if (
-                is_explicit_request
-                and not allow_cross_pool_fallback
-                and desired_prov in {"claude", "gpt"}
-            ):
+            requested_pool = (
+                "agy_claude_gpt"
+                if desired_prov in {"claude", "gpt"}
+                else classify_quota_pool("neon", effective)
+            )
+            if not allow_cross_pool_fallback and req.lower() not in {"default", "latest", "auto"}:
                 raise ModelPoolUnavailableError(
                     requested=effective,
-                    requested_pool="agy_claude_gpt",
+                    requested_pool=requested_pool,
                     available_pools=[],
                 )
             return ResolvedModel(
@@ -544,6 +545,18 @@ class NeonModelCatalog:
             raise pool_err
 
         if selected is None:
+            if not allow_cross_pool_fallback and req.lower() not in {"default", "latest", "auto"}:
+                desired_prov, _, _, _, _ = _parse_intent(effective, effort_override=effort_override)
+                requested_pool = (
+                    "agy_claude_gpt"
+                    if desired_prov in {"claude", "gpt"}
+                    else classify_quota_pool("neon", effective)
+                )
+                raise ModelPoolUnavailableError(
+                    requested=effective,
+                    requested_pool=requested_pool,
+                    available_pools=[],
+                )
             return ResolvedModel(
                 requested=requested or effective,
                 resolved=None,

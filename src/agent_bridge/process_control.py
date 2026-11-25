@@ -11,10 +11,21 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Coroutine
 from ctypes import wintypes
 from typing import Any
 
 logger = logging.getLogger("agent_bridge.process_control")
+
+_LAUNCH_CANCEL_WAIT_SECONDS = 3.0
+
+
+class ProcessContainmentError(RuntimeError):
+    """Raised when a subprocess cannot be contained (or resumed after containment) before execution."""
+
+    def __init__(self, message: str, *, process_still_alive: bool = False) -> None:
+        self.process_still_alive = process_still_alive
+        super().__init__(message)
 
 # Windows Win32 constants
 _PROCESS_TERMINATE = 0x0001
@@ -112,6 +123,8 @@ if sys.platform == "win32":
     _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
     _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
     _kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.TerminateProcess.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
     _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
@@ -242,6 +255,9 @@ class ProcessTracker:
         if not verified_stopped:
             self._unverified_stop = True
 
+    def mark_unverified_stop(self) -> None:
+        self._unverified_stop = True
+
     def has_alive_processes(self) -> bool:
         return any(m.is_alive() for m in list(self._active))
 
@@ -282,6 +298,7 @@ class ManagedProcess:
         *,
         tracker: ProcessTracker | None = None,
         resume_suspended: bool = False,
+        require_containment: bool | None = None,
     ) -> None:
         self.proc = proc
         self._job_handle: int | None = None
@@ -289,9 +306,14 @@ class ManagedProcess:
         self._closed_cleanly = False
         self._terminated_verified = False
         self._tracker = tracker if tracker is not None else CURRENT_PROCESS_TRACKER.get()
+        enforce_containment = resume_suspended if require_containment is None else require_containment
 
         if sys.platform == "win32":
-            self._attach_windows_job_object(proc.pid, resume_suspended=resume_suspended)
+            self._attach_windows_job_object(
+                proc.pid,
+                resume_suspended=resume_suspended,
+                require_containment=enforce_containment,
+            )
         else:
             # With start_new_session=True, pgid equals child's pid from instruction 0.
             self._pgid = proc.pid
@@ -299,28 +321,52 @@ class ManagedProcess:
         if self._tracker is not None:
             self._tracker.register(self)
 
-    def _attach_windows_job_object(self, pid: int, *, resume_suspended: bool = False) -> None:
+    @property
+    def verified_stopped(self) -> bool:
+        return self._terminated_verified or (self._closed_cleanly and not self.is_alive())
+
+    def _attach_windows_job_object(
+        self,
+        pid: int,
+        *,
+        resume_suspended: bool = False,
+        require_containment: bool = False,
+    ) -> None:
         proc_handle = None
         job = None
+        failure_reason: str | None = None
         try:
             access = _PROCESS_SET_QUOTA | _PROCESS_TERMINATE
             if resume_suspended:
                 access |= _PROCESS_SUSPEND_RESUME
             proc_handle = _kernel32.OpenProcess(access, False, int(pid))
-
-            job = _kernel32.CreateJobObjectW(None, None)
-            if job and proc_handle:
-                info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-                info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-                if _kernel32.SetInformationJobObject(
-                    job,
-                    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                    ctypes.byref(info),
-                    ctypes.sizeof(info),
-                ) and _kernel32.AssignProcessToJobObject(job, proc_handle):
-                    self._job_handle = int(job)
-                    job = None  # Ownership transferred to self._job_handle
+            if not proc_handle:
+                err = ctypes.get_last_error()
+                failure_reason = f"OpenProcess failed (winerr={err})"
+            else:
+                job = _kernel32.CreateJobObjectW(None, None)
+                if not job:
+                    err = ctypes.get_last_error()
+                    failure_reason = f"CreateJobObjectW failed (winerr={err})"
+                else:
+                    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    if not _kernel32.SetInformationJobObject(
+                        job,
+                        _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                        ctypes.byref(info),
+                        ctypes.sizeof(info),
+                    ):
+                        err = ctypes.get_last_error()
+                        failure_reason = f"SetInformationJobObject failed (winerr={err})"
+                    elif not _kernel32.AssignProcessToJobObject(job, proc_handle):
+                        err = ctypes.get_last_error()
+                        failure_reason = f"AssignProcessToJobObject failed (winerr={err})"
+                    else:
+                        self._job_handle = int(job)
+                        job = None  # Ownership transferred to self._job_handle
         except Exception as exc:
+            failure_reason = f"{type(exc).__name__}: {exc}"
             logger.debug("Could not attach Windows Job Object to pid %s: %s", pid, exc)
         finally:
             if job:
@@ -328,6 +374,33 @@ class ManagedProcess:
                     _kernel32.CloseHandle(job)
                 except Exception:
                     pass
+
+        # Fail closed: if containment failed while required, NEVER resume the still-suspended worker!
+        if self._job_handle is None and require_containment:
+            try:
+                if proc_handle:
+                    try:
+                        _kernel32.TerminateProcess(wintypes.HANDLE(proc_handle), 1)
+                    except Exception:
+                        pass
+                try:
+                    self.proc.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+            finally:
+                if proc_handle:
+                    try:
+                        _kernel32.CloseHandle(proc_handle)
+                    except Exception:
+                        pass
+            raise ProcessContainmentError(
+                f"Failed to contain Windows subprocess pid={pid} in a Job Object "
+                f"({failure_reason or 'unknown error'}); terminated suspended worker before execution."
+            )
+
+        try:
             if resume_suspended:
                 resumed = _resume_suspended_windows_process(pid, proc_handle)
                 if not resumed:
@@ -337,10 +410,28 @@ class ManagedProcess:
                             _kernel32.TerminateJobObject(wintypes.HANDLE(self._job_handle), 1)
                         except Exception:
                             pass
+                        try:
+                            _kernel32.CloseHandle(wintypes.HANDLE(self._job_handle))
+                        except Exception:
+                            pass
+                        self._job_handle = None
+                    if proc_handle:
+                        try:
+                            _kernel32.TerminateProcess(wintypes.HANDLE(proc_handle), 1)
+                        except Exception:
+                            pass
                     try:
                         self.proc.kill()
+                    except ProcessLookupError:
+                        pass
                     except Exception:
                         pass
+                    if require_containment:
+                        raise ProcessContainmentError(
+                            f"Failed to resume suspended Windows subprocess pid={pid} after Job Object "
+                            "attachment; terminated worker before execution."
+                        )
+        finally:
             if proc_handle:
                 try:
                     _kernel32.CloseHandle(proc_handle)
@@ -602,15 +693,320 @@ async def spawn_managed_process(
     stderr: int | None = asyncio.subprocess.PIPE,
     tracker: ProcessTracker | None = None,
 ) -> tuple[asyncio.subprocess.Process, ManagedProcess]:
-    """Spawn a subprocess already contained in a Windows Job Object (via CREATE_SUSPENDED) or POSIX session."""
+    """Spawn and register a contained subprocess as one cancellation-safe operation.
+
+    - Windows: spawns `CREATE_SUSPENDED`, attaches a Job Object before executing any instruction,
+      and fails closed (terminating the still-suspended worker) if containment fails.
+    - POSIX: runs `create_subprocess_exec` + `ManagedProcess` registration inside an uncancelled
+      task so cancellation during asyncio pipe setup still captures and terminates the process group.
+    """
     use_suspended = sys.platform == "win32"
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=cwd,
-        stdin=stdin,
-        stdout=stdout,
-        stderr=stderr,
-        **subprocess_creation_kwargs(suspended=use_suspended),
+    resolved_tracker = tracker if tracker is not None else CURRENT_PROCESS_TRACKER.get()
+    caller_cancelled = False
+
+    async def _reap_failed_windows_proc(proc: asyncio.subprocess.Process) -> bool:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+        if proc.returncode is None and proc.pid and is_pid_alive(proc.pid):
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/PID",
+                    str(proc.pid),
+                    "/T",
+                    "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(killer.wait(), timeout=5.0)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
+            except Exception:
+                pass
+        still_alive = bool(proc.pid and is_pid_alive(proc.pid))
+        if still_alive and resolved_tracker is not None:
+            resolved_tracker.mark_unverified_stop()
+        return still_alive
+
+    async def _launch() -> tuple[asyncio.subprocess.Process, ManagedProcess] | None:
+        if caller_cancelled:
+            return None
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            **subprocess_creation_kwargs(suspended=use_suspended),
+        )
+        # If caller cancelled while Windows process was still suspended, kill it without resuming.
+        if caller_cancelled and use_suspended:
+            await _reap_failed_windows_proc(proc)
+            return None
+        try:
+            managed = ManagedProcess(
+                proc,
+                tracker=resolved_tracker,
+                resume_suspended=use_suspended,
+                require_containment=use_suspended,
+            )
+        except ProcessContainmentError as exc:
+            still_alive = await _reap_failed_windows_proc(proc)
+            if still_alive != exc.process_still_alive:
+                raise ProcessContainmentError(str(exc), process_still_alive=still_alive) from exc
+            raise
+        return proc, managed
+
+    launch_task: asyncio.Task[tuple[asyncio.subprocess.Process, ManagedProcess] | None] = (
+        asyncio.create_task(_launch())
     )
-    managed = ManagedProcess(proc, tracker=tracker, resume_suspended=use_suspended)
-    return proc, managed
+    try:
+        result = await asyncio.shield(launch_task)
+    except BaseException:
+        caller_cancelled = True
+        # Wait briefly (shielded) so POSIX pipe setup + process-group registration finish atomically.
+        wait_deadline = time.monotonic() + _LAUNCH_CANCEL_WAIT_SECONDS
+        while not launch_task.done():
+            rem = wait_deadline - time.monotonic()
+            if rem <= 0:
+                break
+            try:
+                await asyncio.wait({launch_task}, timeout=rem)
+            except asyncio.CancelledError:
+                continue
+
+        if not launch_task.done():
+            if resolved_tracker is not None:
+                resolved_tracker.mark_unverified_stop()
+
+            def _late_cleanup(t: asyncio.Task[Any]) -> None:
+                if t.cancelled():
+                    return
+                try:
+                    res = t.result()
+                except BaseException:
+                    return
+                if res is not None:
+                    res[1].terminate_sync()
+
+            launch_task.add_done_callback(_late_cleanup)
+            launch_task.cancel()
+            try:
+                await asyncio.wait({launch_task}, timeout=1.0)
+            except BaseException:
+                pass
+            raise
+
+        if not launch_task.cancelled():
+            launch_exc = launch_task.exception()
+            if launch_exc is None:
+                launched = launch_task.result()
+                if launched is not None:
+                    _, managed = launched
+                    try:
+                        await managed.terminate()
+                    except BaseException:
+                        managed.terminate_sync()
+                        if managed.is_alive() and resolved_tracker is not None:
+                            resolved_tracker.mark_unverified_stop()
+            elif not isinstance(
+                launch_exc,
+                (FileNotFoundError, PermissionError, NotADirectoryError, ProcessContainmentError),
+            ):
+                if resolved_tracker is not None:
+                    resolved_tracker.mark_unverified_stop()
+        raise
+
+    if result is None:
+        raise asyncio.CancelledError()
+    return result
+
+
+async def _wait_for_leader_exit(proc: asyncio.subprocess.Process) -> int:
+    """Wait for the subprocess leader itself to exit, independent of descendant-held pipe EOF.
+
+    Python's `asyncio.subprocess.Process.wait()` waits for `BaseSubprocessTransport._try_finish()`,
+    which blocks until ALL stdout/stderr pipes hit EOF too. By observing `proc.returncode` (set
+    immediately inside `BaseSubprocessTransport._process_exited`) and hooking `_protocol.process_exited`,
+    we detect leader exit right away even when a child process inherited and kept pipes open.
+    """
+    if proc.returncode is not None:
+        return proc.returncode
+
+    exited_event = asyncio.Event()
+    proto = getattr(proc, "_protocol", None)
+    orig_cb = getattr(proto, "process_exited", None)
+    hooked = proto is not None and callable(orig_cb)
+    if hooked:
+        def _on_exited() -> None:
+            try:
+                orig_cb()
+            finally:
+                exited_event.set()
+
+        setattr(proto, "process_exited", _on_exited)
+
+    try:
+        while proc.returncode is None:
+            try:
+                await asyncio.wait_for(exited_event.wait(), timeout=0.05)
+            except asyncio.TimeoutError:
+                pass
+        return proc.returncode
+    finally:
+        if hooked:
+            setattr(proto, "process_exited", orig_cb)
+
+
+async def run_managed_process_io(
+    proc: asyncio.subprocess.Process,
+    managed: ManagedProcess,
+    *,
+    read_stdout: Callable[[], Coroutine[Any, Any, Any]] | None = None,
+    read_stderr: Callable[[], Coroutine[Any, Any, Any]] | None = None,
+    write_stdin: Callable[[], Coroutine[Any, Any, Any]] | None = None,
+    timeout: float,
+) -> bool:
+    """Await leader exit independently of pipe EOF, reap descendants, then drain remaining output.
+
+    Prevents a normally exiting worker from being misclassified as timed out when a descendant
+    inherits its stdout/stderr pipe handles and keeps them open.
+    Returns `True` only when leader and all descendants are verified stopped.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    wait_task: asyncio.Task[int] = asyncio.create_task(_wait_for_leader_exit(proc))
+    stdin_task = asyncio.create_task(write_stdin()) if write_stdin is not None else None
+    stdout_task = asyncio.create_task(read_stdout()) if read_stdout is not None else None
+    stderr_task = asyncio.create_task(read_stderr()) if read_stderr is not None else None
+
+    all_tasks: list[asyncio.Task[Any]] = [
+        t for t in (wait_task, stdin_task, stdout_task, stderr_task) if t is not None
+    ]
+    io_tasks: list[asyncio.Task[Any]] = [
+        t for t in (stdin_task, stdout_task, stderr_task) if t is not None
+    ]
+    read_tasks: list[asyncio.Task[Any]] = [
+        t for t in (stdout_task, stderr_task) if t is not None
+    ]
+
+    try:
+        # Phase 1: Monitor leader exit and IO errors within `timeout`.
+        while not wait_task.done():
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise asyncio.TimeoutError()
+            pending = {wait_task, *(t for t in io_tasks if not t.done())}
+            done, _ = await asyncio.wait(
+                pending,
+                timeout=rem,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError()
+            for task in done:
+                if task is not wait_task and not task.cancelled():
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+
+        # Phase 2: Leader exited — stop stdin writer if still pending.
+        if stdin_task is not None and not stdin_task.done():
+            stdin_task.cancel()
+            await asyncio.gather(stdin_task, return_exceptions=True)
+
+        # Allow a tiny natural-EOF window before reaping lingering descendants.
+        pending_reads = [t for t in read_tasks if not t.done()]
+        if pending_reads:
+            quick_grace = (
+                0.05
+                if managed.is_alive()
+                else min(0.25, max(0.05, deadline - time.monotonic()))
+            )
+            await asyncio.wait(pending_reads, timeout=quick_grace)
+
+        # Phase 3: Reap any lingering descendants so inherited pipe write ends close!
+        process_stopped = await managed.finish()
+
+        # Phase 4: Drain all remaining buffered stdout/stderr output now that descendants stopped.
+        pending_reads = [t for t in read_tasks if not t.done()]
+        if pending_reads:
+            drain_timeout = 2.5 if process_stopped else 0.25
+            _, still_pending = await asyncio.wait(pending_reads, timeout=drain_timeout)
+            if still_pending:
+                for t in still_pending:
+                    t.cancel()
+                await asyncio.gather(*still_pending, return_exceptions=True)
+
+        for t in read_tasks:
+            if t.done() and not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    raise exc
+
+        if process_stopped:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.5)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+        return process_stopped
+    except BaseException:
+        for t in all_tasks:
+            if not t.done():
+                t.cancel()
+        try:
+            await managed.terminate()
+        finally:
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+        raise
+
+
+async def communicate_managed(
+    proc: asyncio.subprocess.Process,
+    managed: ManagedProcess,
+    *,
+    timeout: float,
+) -> tuple[bytes, bytes, bool]:
+    """Read stdout/stderr while detecting leader exit independently of descendant-held pipes."""
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+
+    async def _read_out() -> None:
+        if proc.stdout is None:
+            return
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                break
+            out_chunks.append(chunk)
+
+    async def _read_err() -> None:
+        if proc.stderr is None:
+            return
+        while True:
+            chunk = await proc.stderr.read(8192)
+            if not chunk:
+                break
+            err_chunks.append(chunk)
+
+    stopped = await run_managed_process_io(
+        proc,
+        managed,
+        read_stdout=_read_out if proc.stdout is not None else None,
+        read_stderr=_read_err if proc.stderr is not None else None,
+        timeout=timeout,
+    )
+    return b"".join(out_chunks), b"".join(err_chunks), stopped

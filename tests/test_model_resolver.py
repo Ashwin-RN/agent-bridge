@@ -161,15 +161,39 @@ async def test_stale_cache_status_and_refresh_on_new_exact_model(tmp_path: Path)
     assert catalog.status_info()["models_status"] == "live"
 
 
-async def test_empty_catalog_falls_back_to_cli_default(tmp_path: Path) -> None:
+async def test_empty_catalog_enforces_pool_restriction_unless_opted_in(tmp_path: Path) -> None:
     async def fetch() -> list[dict[str, str]]:
         raise RuntimeError("offline")
 
     catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
-    res = await catalog.resolve("neon-high")
-    assert res.resolved is None
-    assert res.notice is not None
+
+    # Default (allow_cross_pool_fallback=False): unverified CLI default MUST NOT be invoked!
+    for req, expected_pool in (
+        ("neon-low", "agy_gemini"),
+        ("neon-high", "agy_gemini"),
+        (None, "agy_gemini"),
+        ("claude-sonnet-medium", "agy_claude_gpt"),
+    ):
+        with pytest.raises(ModelPoolUnavailableError) as exc_info:
+            await catalog.resolve(req)
+        assert exc_info.value.requested_pool == expected_pool
+        assert exc_info.value.available_pools == []
+
     assert catalog.status_info()["models_status"] == "unavailable"
+
+    # Exact versioned model ID stays pinned via --model and is still allowed.
+    pinned = await catalog.resolve("gemini-4-neon-low")
+    assert pinned.resolved == "gemini-4-neon-low"
+    assert pinned.notice is None
+
+    # Explicit opt-in (allow_cross_pool_fallback=True) or explicit "default" permits CLI default.
+    res_opt = await catalog.resolve("neon-low", allow_cross_pool_fallback=True)
+    assert res_opt.resolved is None
+    assert res_opt.notice is not None
+
+    res_def = await catalog.resolve("default")
+    assert res_def.resolved is None
+    assert res_def.notice is not None
 
 
 @pytest.mark.parametrize(

@@ -13,7 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +26,13 @@ from agent_bridge.model_resolver import (
     is_newer_codex_model_in_same_family,
 )
 from agent_bridge.models import JobStatus, ProviderState, RunRequest, RunResult, UsageStatus
-from agent_bridge.process_control import ManagedProcess, spawn_managed_process
+from agent_bridge.process_control import (
+    ManagedProcess,
+    ProcessContainmentError,
+    communicate_managed,
+    run_managed_process_io,
+    spawn_managed_process,
+)
 from agent_bridge.usage import (
     compute_agy_usage_delta,
     normalize_usage,
@@ -123,27 +129,6 @@ def _repo_worktree_lock(repo_root_key: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _WORKTREE_REPO_LOCKS[repo_root_key] = lock
     return lock
-
-
-async def _gather_with_cancellation(
-    coros: list[Coroutine[Any, Any, Any]],
-    *,
-    timeout: float,
-    managed: ManagedProcess,
-) -> None:
-    """Await IO & process tasks under `timeout`; terminate `managed` and cancel tasks on ANY exit."""
-    tasks = [asyncio.create_task(c) for c in coros]
-    try:
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
-    except BaseException:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        try:
-            await managed.terminate()
-        finally:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        raise
 
 
 def classify_failure(
@@ -476,11 +461,11 @@ async def _run_git(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(),
+        stdout_b, stderr_b, _ = await communicate_managed(
+            proc,
+            managed,
             timeout=max(0.01, timeout_seconds),
         )
-        await managed.finish()
         return (
             int(proc.returncode or 0),
             stdout_b.decode("utf-8", errors="replace").strip(),
@@ -734,8 +719,7 @@ async def _check_cli_health(cmd: list[str]) -> tuple[bool, str | None, str | Non
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        await managed.finish()
+        stdout_b, stderr_b, _ = await communicate_managed(proc, managed, timeout=10.0)
         out = stdout_b.decode("utf-8", errors="replace").strip()
         err = stderr_b.decode("utf-8", errors="replace").strip()
         text = out or err
@@ -799,8 +783,7 @@ class NeonRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-            await managed.finish()
+            stdout, _stderr, _ = await communicate_managed(proc, managed, timeout=20.0)
         except BaseException:
             if managed is not None:
                 await managed.terminate()
@@ -903,13 +886,33 @@ class NeonRunner:
         if on_activity:
             on_activity(f"running agy ({resolved_model or 'agy-default'})")
 
-        proc, managed = await spawn_managed_process(
-            *cmd,
-            cwd=request.cwd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc, managed = await spawn_managed_process(
+                *cmd,
+                cwd=request.cwd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except ProcessContainmentError as exc:
+            return RunResult(
+                status="failed",
+                session_id=request.session_id,
+                model=resolved_model,
+                effort=request.effort,
+                model_notice=model_notice,
+                effective_cwd=request.cwd,
+                duration_seconds=round(max(0.0, time.monotonic() - started), 2),
+                usage_status="missing",
+                error=str(exc),
+                failure_reason="launch_error",
+                provider_state="possibly_running" if exc.process_still_alive else "stopped",
+                retry_guidance=(
+                    "Windows process containment failed before launching agy; worker was terminated "
+                    "while still suspended. Inspect host Job Object permissions/environment and retry."
+                ),
+                provider_invoked=False,
+            )
         if on_provider_start:
             on_provider_start()
 
@@ -994,18 +997,25 @@ class NeonRunner:
         async def _read_stdout() -> None:
             assert proc.stdout is not None
             buf = bytearray()
-            while True:
-                chunk = await proc.stdout.read(65536)
-                if not chunk:
-                    break
-                buf.extend(chunk)
+            try:
                 while True:
-                    nl_idx = buf.find(b"\n")
-                    if nl_idx == -1:
+                    chunk = await proc.stdout.read(65536)
+                    if not chunk:
                         break
-                    raw_line = bytes(buf[: nl_idx + 1])
-                    del buf[: nl_idx + 1]
-                    _handle_line(raw_line.decode("utf-8", errors="replace"))
+                    buf.extend(chunk)
+                    while True:
+                        nl_idx = buf.find(b"\n")
+                        if nl_idx == -1:
+                            break
+                        raw_line = bytes(buf[: nl_idx + 1])
+                        del buf[: nl_idx + 1]
+                        _handle_line(raw_line.decode("utf-8", errors="replace"))
+            except asyncio.CancelledError:
+                if buf:
+                    tail = bytes(buf)
+                    buf.clear()
+                    _handle_line(tail.decode("utf-8", errors="replace"))
+                raise
             if buf:
                 _handle_line(bytes(buf).decode("utf-8", errors="replace"))
 
@@ -1025,15 +1035,16 @@ class NeonRunner:
                 timed_out_locally = True
                 process_stopped = await managed.terminate()
             else:
-                await _gather_with_cancellation(
-                    [_read_stdout(), _read_stderr(), proc.wait()],
+                process_stopped = await run_managed_process_io(
+                    proc,
+                    managed,
+                    read_stdout=_read_stdout,
+                    read_stderr=_read_stderr,
                     timeout=wait_budget,
-                    managed=managed,
                 )
-                process_stopped = await managed.finish()
         except asyncio.TimeoutError:
             timed_out_locally = True
-            process_stopped = not managed.is_alive()
+            process_stopped = managed.verified_stopped and (not managed.is_alive())
 
         # Always measure wall-clock duration per invocation (never cumulative agy duration).
         elapsed = round(max(0.0, time.monotonic() - started), 2)
@@ -1716,13 +1727,36 @@ class CodexRunner:
         if on_activity:
             on_activity(f"running codex ({reported_model})")
 
-        proc, managed = await spawn_managed_process(
-            *cmd,
-            cwd=request.cwd,
-            stdin=asyncio.subprocess.PIPE if use_stdin_prompt else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc, managed = await spawn_managed_process(
+                *cmd,
+                cwd=request.cwd,
+                stdin=asyncio.subprocess.PIPE if use_stdin_prompt else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except ProcessContainmentError as exc:
+            return RunResult(
+                status="failed",
+                session_id=request.session_id,
+                model=reported_model,
+                effort=reported_effort,
+                model_notice=model_notice,
+                effective_cwd=request.cwd,
+                worktree_path=request.worktree_path,
+                worktree_branch=request.worktree_branch,
+                worktree_commit=request.worktree_commit,
+                duration_seconds=round(max(0.0, time.monotonic() - started), 2),
+                usage_status="missing",
+                error=str(exc),
+                failure_reason="launch_error",
+                provider_state="possibly_running" if exc.process_still_alive else "stopped",
+                retry_guidance=(
+                    "Windows process containment failed before launching Codex; worker was terminated "
+                    "while still suspended. Inspect host Job Object permissions/environment and retry."
+                ),
+                provider_invoked=False,
+            )
         if on_provider_start:
             on_provider_start()
 
@@ -1765,18 +1799,25 @@ class CodexRunner:
         async def _read_stdout() -> None:
             assert proc.stdout is not None
             buf = bytearray()
-            while True:
-                chunk = await proc.stdout.read(65536)
-                if not chunk:
-                    break
-                buf.extend(chunk)
+            try:
                 while True:
-                    nl_idx = buf.find(b"\n")
-                    if nl_idx == -1:
+                    chunk = await proc.stdout.read(65536)
+                    if not chunk:
                         break
-                    raw_line = bytes(buf[: nl_idx + 1])
-                    del buf[: nl_idx + 1]
-                    _handle_stdout_line(raw_line.decode("utf-8", errors="replace"))
+                    buf.extend(chunk)
+                    while True:
+                        nl_idx = buf.find(b"\n")
+                        if nl_idx == -1:
+                            break
+                        raw_line = bytes(buf[: nl_idx + 1])
+                        del buf[: nl_idx + 1]
+                        _handle_stdout_line(raw_line.decode("utf-8", errors="replace"))
+            except asyncio.CancelledError:
+                if buf:
+                    tail = bytes(buf)
+                    buf.clear()
+                    _handle_stdout_line(tail.decode("utf-8", errors="replace"))
+                raise
             if buf:
                 _handle_stdout_line(bytes(buf).decode("utf-8", errors="replace"))
 
@@ -1796,15 +1837,17 @@ class CodexRunner:
                 timed_out_locally = True
                 process_stopped = await managed.terminate()
             else:
-                await _gather_with_cancellation(
-                    [_write_stdin(), _read_stdout(), _read_stderr(), proc.wait()],
+                process_stopped = await run_managed_process_io(
+                    proc,
+                    managed,
+                    read_stdout=_read_stdout,
+                    read_stderr=_read_stderr,
+                    write_stdin=_write_stdin if prompt_bytes is not None else None,
                     timeout=wait_budget,
-                    managed=managed,
                 )
-                process_stopped = await managed.finish()
         except asyncio.TimeoutError:
             timed_out_locally = True
-            process_stopped = not managed.is_alive()
+            process_stopped = managed.verified_stopped and (not managed.is_alive())
 
         elapsed = round(max(0.0, time.monotonic() - started), 2)
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")

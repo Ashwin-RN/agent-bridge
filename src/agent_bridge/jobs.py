@@ -26,6 +26,7 @@ from agent_bridge.config import (
 from agent_bridge.models import JobRecord, RunRequest, RunResult
 from agent_bridge.process_control import (
     CURRENT_PROCESS_TRACKER,
+    ProcessContainmentError,
     ProcessTracker,
     is_pid_alive,
 )
@@ -636,7 +637,9 @@ class JobManager:
             logger.exception("Unhandled error running job %s", record.job_id)
             stopped = await tracker.terminate_all_and_verify()
             record.status = "failed"
-            record.failure_reason = "cli_error"
+            record.failure_reason = (
+                "launch_error" if isinstance(exc, ProcessContainmentError) else "cli_error"
+            )
             record.provider_state = "stopped" if stopped else "possibly_running"
             record.error = f"{type(exc).__name__}: {exc}"
             record.retry_guidance = (

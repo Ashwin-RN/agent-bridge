@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from agent_bridge.process_control import ManagedProcess, spawn_managed_process
+from agent_bridge.process_control import ManagedProcess, communicate_managed, spawn_managed_process
 
 logger = logging.getLogger("agent_bridge.quota")
 
@@ -763,8 +763,7 @@ async def fetch_neon_quota(agy_cmd: list[str], *, timeout_seconds: float = 15.0)
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-        await managed.finish()
+        stdout_b, stderr_b, _ = await communicate_managed(proc, managed, timeout=timeout_seconds)
 
         stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0 or not stdout_text:
