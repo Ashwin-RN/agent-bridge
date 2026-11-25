@@ -44,10 +44,10 @@ uv sync
 claude mcp add --scope user agent-bridge -- <REPO_DIR>\.venv\Scripts\python.exe -m agent_bridge
 ```
 
-Example when cloned at `C:\Users\ashwi\agent-bridge`:
+Example when cloned at `C:\Users\<you>\agent-bridge`:
 
 ```powershell
-claude mcp add --scope user agent-bridge -- C:\Users\ashwi\agent-bridge\.venv\Scripts\python.exe -m agent_bridge
+claude mcp add --scope user agent-bridge -- C:\Users\<you>\agent-bridge\.venv\Scripts\python.exe -m agent_bridge
 ```
 
 **macOS / Linux:**
