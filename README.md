@@ -2,17 +2,15 @@
 
 Lightweight local stdio MCP server that connects **Claude Code** (or any MCP client) to **Antigravity (`agy` — Gemini Neon, Hydrogen, Flash)** and **Codex (`codex` — GPT)** subagents over your existing CLI subscriptions.
 
-No API keys. No separate UI or web app. One lightweight integration across all subscriptions, with dynamic model auto-upgrading and parent-visible usage tracking.
+No API keys. No separate UI or web app. Shared SQLite state across multiple Claude windows, accurate per-turn usage & opt-in live quota checks, dynamic effort-preserving model resolution, and single-owner process tree cleanup.
 
 ---
 
 ## Quick Setup (For Humans & AI Agents)
 
-If you are an AI agent setting this up after a fresh `git clone` or `git pull`, run the steps below in order.
+If you are an AI agent setting this up after a fresh `git clone` or `git pull`, run these steps in order.
 
 ### 1. Check prerequisites
-
-Verify `uv`, `claude`, and at least one of `agy` / `codex` are installed and authenticated:
 
 ```powershell
 # Windows (PowerShell)
@@ -36,7 +34,7 @@ cd <REPO_DIR>
 uv sync
 ```
 
-*(After any future `git pull`, re-run `uv sync` to update dependencies cleanly.)*
+*(After any future `git pull`, re-run `uv sync`.)*
 
 ### 3. Register with Claude Code (user scope — available in every project)
 
@@ -58,98 +56,102 @@ claude mcp add --scope user agent-bridge -- C:\Users\ashwi\agent-bridge\.venv\Sc
 claude mcp add --scope user agent-bridge -- <REPO_DIR>/.venv/bin/python -m agent_bridge
 ```
 
-*(To register for only one repository instead of globally, change `--scope user` to `--scope project`.)*
+*(Use `--scope project` instead of `--scope user` to register for a single repository.)*
 
 ### 4. Verify the integration
 
 ```powershell
-# Run automated unit & stdio MCP protocol tests
 uv run pytest
-
-# Confirm Claude Code sees and connects to agent-bridge
 claude mcp get agent-bridge
 ```
 
 Inside Claude Code, ask:
-> *"Check `list_backends` on agent-bridge and confirm Neon and Codex are ready."*
+> *"Check `list_backends` on agent-bridge and confirm Neon and Codex are healthy."*
 
 ---
 
-## Seamless Model Updates (No Hardcoded Version Breakage)
-
-`agent-bridge` is designed so newer model releases work automatically without editing code or breaking calls:
+## Seamless Model Updates & Effort Control
 
 - **Neon (`agy`)**:
-  - Defaults to the versionless intent `neon-high` (not a hardcoded version number).
-  - Queries live `agy models` (cached in `~/.agent-bridge/agy_models_cache.json`, TTL 15 min) and automatically selects the **highest numeric version** matching the requested family and effort tier (e.g. `neon`, `neon-xhigh`, `neon-high`, `neon-medium`, `neon-low`, `hydrogen`, `hydrogen-xhigh`, `carbon`, `argon`, `flash`, `flash-low`).
-  - When a newer generation rolls out (e.g. `gemini-4-neon-high` → `gemini-5-neon-high`), versionless shortcuts pick it up automatically, and even retired exact IDs are auto-upgraded to the latest matching family/tier with a transparent `model_notice`.
-  - If `agy` ever rejects a cached model at runtime, `agent-bridge` force-refreshes `agy models` and retries once automatically (falling back to `agy`'s own default if needed).
+  - Defaults to the versionless intent `neon-high` and resolves against live `agy models` (cached in `~/.agent-bridge/agy_models_cache.json`).
+  - **Preserves requested effort tier by default**: e.g. `neon-medium` picks the newest version offering `medium`. If a requested tier is unavailable in that family, `agent-bridge` substitutes the nearest available tier and always discloses it in `model_notice`.
+  - Retired versioned model IDs auto-upgrade to the newest matching family/tier, and if `agy` rejects a cached model at runtime, `agent-bridge` force-refreshes `agy models` and retries once automatically within the job's overall deadline.
 - **Codex (`codex`)**:
-  - Omits `-m` by default so Codex always uses your subscription's latest default model.
-  - If an explicit pinned model ID is ever rejected or retired by Codex CLI, `agent-bridge` automatically retries once using Codex's current default model and attaches a `model_notice`.
+  - Omits `-m` by default so Codex inherits your subscription's latest default model (shown in `list_backends` under `local_config_defaults`).
+  - Pass `effort="low" | "medium" | "high" | "xhigh"` (or set `AGENT_BRIDGE_CODEX_EFFORT`) to override `~/.codex/config.toml`'s `model_reasoning_effort` per call.
+  - If an explicit model ID is rejected, `agent-bridge` falls back once to Codex's default model and attaches a `model_notice`.
 
 ---
 
-## Parent-Visible Usage Tracking
+## Usage Planning & Opt-In Live Quota
 
-Every tool call gives the parent AI (Claude) immediate visibility into external subagent consumption:
-
-- **Per-run `usage`**: normalized across both CLIs into `{input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens}`.
-- **Inline `session_usage`**: compact current-session totals by backend (`neon` vs `codex`) included on `run_agent`, `run_parallel`, `review_code`, `check_jobs`, and `list_backends`.
-- **Persistent ledger (`~/.agent-bridge/usage.jsonl`)**: append-only JSONL history queried via `get_usage(period="session" | "today" | "7d" | "30d" | "all", backend=...)`, broken down by totals, backend, model, and recent runs.
+- **Accurate per-turn usage**:
+  - Antigravity runs use `agy --output-format stream-json` so per-turn token usage is summed directly from the current turn's `step_update` events (preventing double-counting on resumed sessions), with wall-clock duration measured per invocation.
+  - Provider-specific cache metrics (`cache_read_tokens` vs `cached_input_tokens`) are preserved separately in `provider_metrics`, and `get_usage` reports `usage_coverage` (`exact`, `delta`, `partial`, `missing`) per backend without conflating cross-provider token totals.
+- **Planning & live quota**:
+  - `get_usage(compact=True, cwd=..., parent_run=..., include_quota=True)` gives a concise planning view with per-backend runs, active `in_flight` jobs across windows, recent duration, usage coverage, and cached live subscription quota (`codex app-server` `account/rateLimits/read` + `agy --print=/usage`).
+  - If a quota probe or parser fails, `get_usage` still succeeds and returns `status: "unknown"` with timestamp and error details.
 
 ---
 
-## MCP Tools
+## Reliability & Stuck-Job Handling
+
+- **Multi-window SQLite store (`~/.agent-bridge/bridge.db`)**: Per-job updates with WAL mode and owner PID tracking prevent multiple Claude Code windows from overwriting each other's job history or misclassifying live jobs as failed. Terminal job status, usage events, and session watermarks commit in a single SQLite transaction.
+- **Per-process concurrency cap**: `AGENT_BRIDGE_MAX_CONCURRENT` applies **per bridge process** (per Claude window).
+- **Per-session serialization**: Concurrent turns targeting the same `(backend, session_id)` automatically serialize within the job's overall deadline.
+- **Worktree & resume safety**:
+  - Codex `worktree=True` requires `mode="edit"` and reports `effective_cwd`, `worktree_path`, `worktree_branch`, and `worktree_commit`.
+  - Unsupported resume options (such as `extra_dirs` on Codex resume) are rejected explicitly instead of silently dropped.
+  - Native `codex exec review` explicitly passes `-c sandbox_mode="read-only"`.
+- **Single overall deadline & separate wait window**:
+  - Queueing, model discovery, execution, and any retry share one `timeout_seconds` deadline (defaulting to `AGENT_BRIDGE_DEFAULT_TIMEOUT` when omitted).
+  - For multi-minute work, use `start_agent`, `run_parallel(wait=False)`, or a shorter `wait_seconds` on `run_agent`, then poll with `check_jobs`. When a wait ends with `queued`/`running`, the job stays active; if a synchronous `run_agent` call is cancelled by the client, its underlying job is cancelled cleanly.
+  - Failures return machine-readable `failure_reason`, `provider_state` (`stopped` / `possibly_running` / `unknown`), partial `response` + `session_id`, and `retry_guidance`. Subprocess cleanup has a single owner using Windows Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on Windows and process groups on POSIX.
+
+---
+
+## MCP Tools (8)
 
 | Tool | Purpose |
 |---|---|
-| `run_agent` | Run a Neon (`agy`) or Codex (`codex`) subagent synchronously; supports `resume_from` (`job_id` or `session_id`), `mode="read_only" \| "edit"`, `model`, and Codex `worktree=True` |
-| `start_agent` | Start a subagent in the background and return a `job_id` immediately |
-| `run_parallel` | Fan out up to 10 tasks across Neon and/or Codex concurrently (`wait=True` or background `wait=False`) |
-| `check_jobs` | List recent jobs, fetch results, or wait (`wait_seconds`, `wait_mode="all" \| "any"`) without busy-polling |
-| `cancel_job` | Cancel a running job and terminate its subprocess tree cleanly |
-| `review_code` | Run a read-only code review (`uncommitted`, vs `base` branch, or `commit`) via Neon, Codex, or both in parallel |
-| `get_usage` | Inspect cumulative token, run-count, and duration usage (`session`, `today`, `7d`, `30d`, `all`) by backend and model |
-| `list_backends` | Verify CLI availability, versions, live `agy` models, dynamic shortcuts, and session usage |
+| `run_agent` | Run Neon or Codex synchronously (supports `effort`, `resume_from`, `mode`, `worktree`, `parent_run`, and optional `wait_seconds` separate from `timeout_seconds`) |
+| `start_agent` | Launch a subagent in the background and return `job_id` immediately |
+| `run_parallel` | Fan out up to 10 tasks concurrently (`wait=True` or background `wait=False`) |
+| `check_jobs` | List/filter jobs across windows, fetch results, or wait (`wait_seconds`, `wait_mode="all" \| "any"`) |
+| `cancel_job` | Cancel a queued/running job owned by this bridge process and terminate its subprocess tree |
+| `review_code` | Read-only code review (`uncommitted`, vs `base`, or `commit`) via Neon, Codex, or both |
+| `get_usage` | Per-backend usage, `in_flight` load, coverage, optional `cwd`/`parent_run` scope, `compact=True` view, and opt-in `include_quota=True` |
+| `list_backends` | Executable discovery, `--version` health check, live/cached/stale Neon catalog status, Codex local config defaults, and session usage |
 
 ---
 
 ## Optional `CLAUDE.md` Snippet
 
-Drop this into `~/.claude/CLAUDE.md` (or a project's `CLAUDE.md`) so Claude naturally delegates when helpful:
+Drop this into `~/.claude/CLAUDE.md` (or a project's `CLAUDE.md`):
 
 ```markdown
 ## Multi-Model Subagents (`agent-bridge` MCP)
-- Use `agent-bridge` to delegate reviews, second opinions, or parallel work to `neon` (Gemini Neon via `agy`) and `codex` (GPT via `codex`).
-- Always pass the current repo path as `cwd`. Keep `mode="read_only"` unless I ask for edits; use `worktree=True` for parallel Codex edits.
-- Prefer versionless Neon shortcuts (`neon-medium`, `neon-high`, `neon-xhigh`, `flash`) and omit `model` for Codex so latest models are used automatically.
-- Use `review_code` for dual-model reviews, `run_parallel` or `start_agent` + `check_jobs` for concurrent tasks, `resume_from` for follow-ups, and `get_usage` when I ask about usage across subscriptions.
+- Before substantial fan-out, call `get_usage(compact=True, cwd=<repo>, include_quota=True)` to check load and subscription quota.
+- Start with one subagent for routine work; use both `neon` and `codex` when independent perspectives or dual reviews matter; resume the original agent (`resume_from`) when prior context matters.
+- Always pass `cwd`. Default to `mode="read_only"`; for unattended edits prefer `codex` with `mode="edit"` and `worktree=True`, and inspect the returned `effective_cwd` / `worktree_path`. Pass `effort` explicitly when you want to cap reasoning cost.
+- For multi-minute work, use `start_agent` or `run_parallel(wait=False)` and poll with `check_jobs`. Return concise findings inline and reference longer outputs by `job_id`.
 ```
 
 ---
 
 ## Configuration (Environment Variables)
 
-All settings are optional; pass via `-e KEY=VALUE` on `claude mcp add` if you want to override defaults:
-
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_BRIDGE_NEON_MODEL` | `neon-high` | Default versionless intent or model ID for `neon` |
 | `AGENT_BRIDGE_CODEX_MODEL` | *(unset)* | Optional Codex `-m` override (unset = Codex CLI default) |
-| `AGENT_BRIDGE_DEFAULT_TIMEOUT` | `300` | Default per-job timeout in seconds (10–3600) |
-| `AGENT_BRIDGE_MAX_CONCURRENT` | `8` | Maximum simultaneous subagent subprocesses |
+| `AGENT_BRIDGE_CODEX_EFFORT` | *(unset)* | Optional default Codex reasoning effort (`low`, `medium`, `high`, `xhigh`) |
+| `AGENT_BRIDGE_DEFAULT_TIMEOUT` | `300` | Default overall job deadline in seconds (10–3600) |
+| `AGENT_BRIDGE_MAX_CONCURRENT` | `8` | Maximum concurrent subagents **per bridge process** |
+| `AGENT_BRIDGE_MAX_STORED_JOBS` | `500` | Maximum terminal jobs retained in `bridge.db` |
 | `AGENT_BRIDGE_MODELS_TTL_SECONDS` | `900` | Cache TTL (seconds) for live `agy models` discovery |
-| `AGENT_BRIDGE_STATE_DIR` | `~/.agent-bridge` | Directory for `jobs.json`, `usage.jsonl`, and `agy_models_cache.json` |
+| `AGENT_BRIDGE_QUOTA_TTL_SECONDS` | `120` | Cache TTL (seconds) for opt-in `include_quota=True` readings |
+| `AGENT_BRIDGE_STATE_DIR` | `~/.agent-bridge` | Directory for `bridge.db` and `agy_models_cache.json` |
 | `AGENT_BRIDGE_AGY_BIN` | *(auto)* | Explicit path to `agy` executable |
 | `AGENT_BRIDGE_CODEX_BIN` | *(auto)* | Explicit path to `codex` executable |
 | `AGENT_BRIDGE_DEFAULT_CWD` | *(server cwd)* | Fallback working directory when `cwd` is omitted |
-
----
-
-## Architecture Notes
-
-- Pure Python 3.12+ with only `mcp>=2.0.0` (stdio transport) as a runtime dependency.
-- All logs go strictly to `stderr`; `stdout` is reserved exclusively for MCP JSON-RPC frames.
-- On Windows, `codex` resolves directly to the native `codex.exe` binary (or `node codex.js`), bypassing `.cmd` shell quoting/length limits, and prompts are piped via stdin (`-`).
-- Cancelling or timing out a job terminates the full subprocess tree cleanly (`taskkill /T /F` on Windows, process groups on POSIX).

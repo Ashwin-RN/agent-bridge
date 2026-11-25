@@ -1,4 +1,4 @@
-"""Dynamic, self-healing model resolution for Neon (`agy`) and Codex (`codex`)."""
+"""Dynamic, effort-preserving, self-healing model resolution for Neon (`agy`) and Codex."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +39,10 @@ DEFAULT_INTENT_TOKENS: frozenset[str] = frozenset({"", "default", "latest", "aut
 
 MODEL_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(unknown|invalid|unsupported|unavailable|deprecated|retired)\s+model\b", re.I),
-    re.compile(r"\bmodel\b[^\n]{0,60}\b(not\s+found|does\s+not\s+exist|not\s+supported|unavailable|deprecated|invalid)\b", re.I),
+    re.compile(
+        r"\bmodel\b[^\n]{0,60}\b(not\s+found|does\s+not\s+exist|not\s+supported|unavailable|deprecated|invalid)\b",
+        re.I,
+    ),
     re.compile(r"\bno\s+such\s+model\b", re.I),
     re.compile(r"\bmodel_not_found\b", re.I),
 )
@@ -87,11 +91,7 @@ def parse_agy_model_id(model_id: str, label: str = "") -> ParsedModel:
 
     for tok in rest:
         if re.fullmatch(r"\d+(?:\.\d+)*", tok):
-            if not family_parts:
-                version_parts.extend(int(piece) for piece in tok.split("."))
-            else:
-                # Handles IDs like `claude-opus-5-5-high` where version follows family name.
-                version_parts.extend(int(piece) for piece in tok.split("."))
+            version_parts.extend(int(piece) for piece in tok.split("."))
         else:
             family_parts.append(tok)
 
@@ -107,52 +107,73 @@ def parse_agy_model_id(model_id: str, label: str = "") -> ParsedModel:
     )
 
 
-def _parse_intent(requested: str) -> tuple[str | None, str | None, bool]:
-    """Extract `(family, tier, is_versioned_literal)` from a user/caller model spec."""
+def _parse_intent(
+    requested: str,
+    *,
+    effort_override: str | None = None,
+) -> tuple[str | None, str | None, bool, bool]:
+    """Return `(family, desired_tier, tier_explicit, is_versioned_literal)`."""
     raw = requested.strip().lower()
+    norm_effort = TIER_ALIASES.get(effort_override.strip().lower()) if effort_override else None
+
     if raw in DEFAULT_INTENT_TOKENS:
-        return ("neon", "high", False)
+        if norm_effort:
+            return ("neon", norm_effort, True, False)
+        return ("neon", "high", False, False)
 
-    # Shorthand effort-only requests like "xhigh" -> neon + xhigh.
     if raw in TIER_ALIASES:
-        return ("neon", TIER_ALIASES[raw], False)
+        tier = norm_effort or TIER_ALIASES[raw]
+        return ("neon", tier, True, False)
 
-    # Check if caller passed a versioned exact ID like `gemini-4-neon-high`.
     has_version = bool(re.search(r"(?:^|-)(\d+(?:\.\d+)?)(?:-|$)", raw))
     if has_version:
         parsed = parse_agy_model_id(raw)
-        return (parsed.family, parsed.tier, True)
+        tier = norm_effort or parsed.tier
+        return (parsed.family, tier, bool(tier), True)
 
     tokens = [t for t in raw.split("-") if t]
     tier: str | None = None
+    tier_explicit = False
     if tokens and tokens[-1] in TIER_ALIASES:
         tier = TIER_ALIASES[tokens.pop()]
+        tier_explicit = True
 
     if tokens and tokens[0] == "gemini" and len(tokens) > 1:
         tokens = tokens[1:]
 
     family = "-".join(tokens) if tokens else "neon"
-    if tier is None:
+    if norm_effort:
+        tier = norm_effort
+        tier_explicit = True
+    elif tier is None:
         tier = "high"
-    return (family, tier, False)
+    return (family, tier, tier_explicit, False)
 
 
 def _select_from_catalog(
     requested: str,
     catalog: list[dict[str, str]],
+    *,
+    effort_override: str | None = None,
 ) -> ResolvedModel | None:
-    """Resolve `requested` against a non-empty `agy models` catalog."""
+    """Resolve `requested` against a non-empty `agy models` catalog.
+
+    Preserves the requested effort tier by default (selecting the newest model version that
+    offers that tier), and always attaches a `notice` when substituting a different tier,
+    upgrading a retired versioned ID, or falling back to another family.
+    """
     if not catalog:
         return None
 
     req_clean = requested.strip()
     req_lower = req_clean.lower()
 
-    # 1. Exact ID match (case-insensitive) always wins.
-    for entry in catalog:
-        mid = entry.get("id", "").strip()
-        if mid.lower() == req_lower:
-            return ResolvedModel(requested=req_clean, resolved=mid)
+    # Exact ID match wins unless caller explicitly asked for a different effort tier.
+    if not effort_override:
+        for entry in catalog:
+            mid = entry.get("id", "").strip()
+            if mid.lower() == req_lower:
+                return ResolvedModel(requested=req_clean, resolved=mid)
 
     parsed_catalog = [
         parse_agy_model_id(entry["id"], entry.get("label", ""))
@@ -162,7 +183,10 @@ def _select_from_catalog(
     if not parsed_catalog:
         return None
 
-    family, desired_tier, is_versioned_literal = _parse_intent(req_clean)
+    family, desired_tier, tier_explicit, is_versioned_literal = _parse_intent(
+        req_clean,
+        effort_override=effort_override,
+    )
     want_orchestrator = bool(family and "orchestrator" in family)
 
     pool = [
@@ -170,7 +194,6 @@ def _select_from_catalog(
         if want_orchestrator or not m.is_orchestrator
     ] or parsed_catalog
 
-    # Prefer exact family match, then suffix/substring family match.
     family_matches = [m for m in pool if family and m.family == family]
     if not family_matches and family:
         family_matches = [
@@ -178,7 +201,6 @@ def _select_from_catalog(
             if family in m.family or m.family in family
         ]
 
-    # If the requested family disappeared entirely, fall back to the newest Gemini model.
     used_family_fallback = False
     candidates = family_matches
     if not candidates:
@@ -189,33 +211,45 @@ def _select_from_catalog(
     tier_order = TIER_FALLBACK_ORDER.get(desired_tier or "high", ("high", "xhigh", "medium", "low"))
 
     def _sort_key(m: ParsedModel) -> tuple[int, tuple[int, ...], int]:
-        # Always prefer newest version within the matching family, then closest desired tier.
-        if m.tier in tier_order:
-            tier_score = len(tier_order) - tier_order.index(m.tier)
-        else:
-            tier_score = 0
+        tier_score = len(tier_order) - tier_order.index(m.tier) if m.tier in tier_order else 0
         prefer_gemini = 1 if m.provider == "gemini" else 0
         return (prefer_gemini, m.version, tier_score)
 
-    best = max(candidates, key=_sort_key)
+    tier_substituted = False
+    if desired_tier:
+        exact_tier = [m for m in candidates if m.tier == desired_tier]
+        if exact_tier:
+            best = max(exact_tier, key=_sort_key)
+        else:
+            best = max(candidates, key=_sort_key)
+            tier_substituted = best.tier != desired_tier
+    else:
+        best = max(candidates, key=_sort_key)
 
-    notice: str | None = None
-    if is_versioned_literal:
-        notice = (
-            f"Requested model {req_clean!r} is not in the live agy catalog; "
-            f"automatically resolved to {best.model_id!r}."
+    notices: list[str] = []
+    if used_family_fallback and req_lower not in DEFAULT_INTENT_TOKENS:
+        notices.append(
+            f"No live agy model matched {req_clean!r}; fell back to {best.model_id!r}."
         )
-    elif used_family_fallback and req_lower not in DEFAULT_INTENT_TOKENS:
-        notice = (
-            f"No live agy model matched {req_clean!r}; "
-            f"automatically fell back to {best.model_id!r}."
+    elif is_versioned_literal and best.model_id.lower() != req_lower:
+        notices.append(
+            f"Requested model {req_clean!r} was resolved to {best.model_id!r}."
+        )
+    if tier_substituted and (tier_explicit or req_lower not in DEFAULT_INTENT_TOKENS):
+        notices.append(
+            f"Requested effort tier {desired_tier!r} is unavailable in this family; "
+            f"substituted {best.model_id!r} (tier={best.tier or 'unspecified'})."
         )
 
-    return ResolvedModel(requested=req_clean, resolved=best.model_id, notice=notice)
+    return ResolvedModel(
+        requested=req_clean,
+        resolved=best.model_id,
+        notice=" ".join(notices) if notices else None,
+    )
 
 
 class NeonModelCatalog:
-    """Caches `agy models` (memory + disk) and dynamically resolves versionless or outdated model IDs."""
+    """Caches `agy models` (memory + disk) and reports fresh/cached/stale status."""
 
     def __init__(
         self,
@@ -229,6 +263,7 @@ class NeonModelCatalog:
         self._ttl_seconds = max(30.0, ttl_seconds)
         self._models: list[dict[str, str]] = []
         self._fetched_at: float = 0.0
+        self._last_status: str = "unavailable"
         self._load_disk_cache()
 
     def _load_disk_cache(self) -> None:
@@ -243,6 +278,8 @@ class NeonModelCatalog:
                     if isinstance(m, dict) and m.get("id")
                 ]
                 self._fetched_at = float(payload.get("fetched_at", 0.0))
+                if self._models:
+                    self._last_status = "cached" if self.is_fresh() else "stale_cache"
         except Exception as exc:
             logger.debug("Ignoring unreadable model cache %s: %s", self._cache_path, exc)
 
@@ -264,19 +301,55 @@ class NeonModelCatalog:
     def is_fresh(self) -> bool:
         return bool(self._models) and (time.time() - self._fetched_at) < self._ttl_seconds
 
-    async def get_models(self, *, refresh: bool = False) -> list[dict[str, str]]:
+    def status_info(self) -> dict[str, Any]:
+        if not self._models:
+            return {
+                "models_status": "unavailable",
+                "models_fetched_at": None,
+                "models_age_seconds": None,
+            }
+        age = max(0.0, time.time() - self._fetched_at)
+        status = self._last_status
+        if status in {"live", "cached"} and age >= self._ttl_seconds:
+            status = "stale_cache"
+        return {
+            "models_status": status,
+            "models_fetched_at": datetime.fromtimestamp(
+                self._fetched_at, tz=timezone.utc
+            ).isoformat(timespec="seconds"),
+            "models_age_seconds": round(age, 1),
+        }
+
+    async def get_models(
+        self,
+        *,
+        refresh: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> list[dict[str, str]]:
         if not refresh and self.is_fresh():
+            if self._last_status != "live":
+                self._last_status = "cached"
             return list(self._models)
         try:
-            live = await self._fetcher()
+            coro = self._fetcher()
+            live = await (
+                asyncio.wait_for(coro, timeout=timeout_seconds)
+                if timeout_seconds is not None
+                else coro
+            )
             if live:
                 self._models = live
                 self._fetched_at = time.time()
+                self._last_status = "live"
                 self._save_disk_cache()
+                return list(self._models)
         except Exception as exc:
             logger.warning("Failed refreshing agy models catalog: %s", exc)
-            if not self._models:
-                return []
+            if self._models:
+                self._last_status = "stale_cache"
+                return list(self._models)
+            self._last_status = "unavailable"
+            return []
         return list(self._models)
 
     async def resolve(
@@ -284,16 +357,17 @@ class NeonModelCatalog:
         requested: str | None,
         *,
         default_intent: str = "neon-high",
+        effort_override: str | None = None,
         force_refresh: bool = False,
+        timeout_seconds: float | None = None,
     ) -> ResolvedModel:
         req = (requested or "").strip()
         effective = req if req and req.lower() not in DEFAULT_INTENT_TOKENS else default_intent
 
-        catalog = await self.get_models(refresh=force_refresh)
+        catalog = await self.get_models(refresh=force_refresh, timeout_seconds=timeout_seconds)
         if not catalog:
-            # If agy models could not be fetched at all, omit --model unless caller gave an exact versioned ID.
-            _, _, is_versioned = _parse_intent(effective)
-            if is_versioned:
+            _, _, _, is_versioned = _parse_intent(effective, effort_override=effort_override)
+            if is_versioned and not effort_override:
                 return ResolvedModel(requested=requested or effective, resolved=effective)
             return ResolvedModel(
                 requested=requested or effective,
@@ -301,18 +375,24 @@ class NeonModelCatalog:
                 notice="Could not fetch live agy model list; letting agy choose its default model.",
             )
 
-        selected = _select_from_catalog(effective, catalog)
+        selected = _select_from_catalog(effective, catalog, effort_override=effort_override)
 
-        # If caller gave a specific model ID that wasn't in a cached list, refresh live once before falling back!
         if (
             selected is not None
             and selected.notice is not None
             and not force_refresh
             and (time.time() - self._fetched_at) > 5.0
         ):
-            fresh_catalog = await self.get_models(refresh=True)
+            fresh_catalog = await self.get_models(
+                refresh=True,
+                timeout_seconds=timeout_seconds,
+            )
             if fresh_catalog:
-                selected = _select_from_catalog(effective, fresh_catalog)
+                selected = _select_from_catalog(
+                    effective,
+                    fresh_catalog,
+                    effort_override=effort_override,
+                )
 
         if selected is None:
             return ResolvedModel(
@@ -327,7 +407,6 @@ class NeonModelCatalog:
         )
 
     def summarize_latest_aliases(self) -> dict[str, str]:
-        """Compute live shortcut -> resolved model ID mapping for `list_backends`."""
         if not self._models:
             return {}
         shortcuts = (
@@ -349,3 +428,6 @@ class NeonModelCatalog:
             if res and res.resolved and res.notice is None:
                 mapping[alias] = res.resolved
         return mapping
+
+
+import asyncio  # noqa: E402

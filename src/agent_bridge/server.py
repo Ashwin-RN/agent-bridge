@@ -12,31 +12,32 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from agent_bridge.config import Settings, normalize_backend
+from agent_bridge.config import EffortLevel, Settings, normalize_backend
 from agent_bridge.jobs import JobManager
-from agent_bridge.usage import UsagePeriod
+from agent_bridge.storage import UsagePeriod
 
 SERVER_INSTRUCTIONS = """
 `agent-bridge` lets you delegate tasks, reviews, and parallel work to two external CLI subagents
 using the user's existing subscriptions:
 
-- `neon` (Antigravity CLI / Gemini Neon, Hydrogen, Flash, etc.) — great for architecture reviews,
-  second opinions, large-context codebase analysis, debugging, and independent edits.
-  Prefer versionless shortcuts (`neon`, `neon-xhigh`, `neon-medium`, `flash`, `hydrogen-xhigh`)
-  so newer model versions are picked up automatically from live `agy models`.
+- `neon` (Antigravity CLI / Gemini Neon, Hydrogen, Flash) — great for architecture reviews,
+  second opinions, large-context codebase analysis, and debugging.
+  Prefer versionless shortcuts (`neon-medium`, `neon-high`, `neon-xhigh`, `flash`) so newer
+  model versions are picked up automatically while preserving your requested effort tier.
 - `codex` (OpenAI Codex CLI / GPT) — great for focused code reviews, targeted implementations,
-  test generation, bug fixes, and isolated worktree edits. Omit `model` to always use the user's
-  latest Codex subscription default.
+  test generation, bug fixes, and isolated worktree edits. Omit `model` for the subscription default,
+  and pass `effort` (`low` | `medium` | `high` | `xhigh`) when you want to override local Codex effort.
 
 Guidelines:
 - Always pass `cwd` pointing to the repository or workspace you want the subagent to inspect.
-- Default `mode` is `"read_only"`. Only pass `mode="edit"` when the user wants the subagent to modify files.
-  For parallel edits with Codex, prefer `worktree=True` to avoid conflicting edits.
-- Use `run_agent` for quick blocking tasks; use `start_agent` or `run_parallel` + `check_jobs` for
-  long-running work or running Neon and Codex simultaneously.
-- Every completed run returns `session_id`, `job_id`, normalized token `usage`, and `session_usage`.
-  Pass `job_id` or `session_id` into `resume_from` on a follow-up call to continue that conversation.
-- Call `get_usage` anytime to inspect cumulative token and run usage across `session`, `today`, `7d`, `30d`, or `all`.
+- Default `mode` is `"read_only"`. Only pass `mode="edit"` when the user wants file edits;
+  for Codex edits prefer `worktree=True` and inspect the returned `effective_cwd` / `worktree_path`.
+- For multi-minute work, prefer `start_agent` or `run_parallel(wait=False)` (or pass a bounded
+  `wait_seconds` separate from the overall `timeout_seconds` deadline), then follow up with `check_jobs`.
+- Turns on the same `session_id` serialize automatically; pass `job_id` or `session_id` into
+  `resume_from` to continue a conversation.
+- Call `get_usage(compact=True, cwd=..., include_quota=True)` before heavy fan-out to check
+  in-flight load, recent usage, and live subscription quota.
 """.strip()
 
 
@@ -56,9 +57,13 @@ class ParallelTaskSpec(BaseModel):
     model: str | None = Field(
         default=None,
         description=(
-            "Optional model ID or versionless Neon shortcut (e.g. 'neon-xhigh', 'neon-medium', "
-            "'flash', 'hydrogen'). Omit for backend default."
+            "Optional model ID or versionless Neon shortcut (e.g. 'neon-medium', 'neon-high', "
+            "'neon-xhigh', 'flash'). Omit for backend default."
         ),
+    )
+    effort: EffortLevel | None = Field(
+        default=None,
+        description="Optional reasoning effort override ('low', 'medium', 'high', 'xhigh').",
     )
     resume_from: str | None = Field(
         default=None,
@@ -70,7 +75,7 @@ class ParallelTaskSpec(BaseModel):
     )
     extra_dirs: list[str] | None = Field(
         default=None,
-        description="Optional extra directories to grant read/write access to.",
+        description="Optional extra directories to grant read/write access to (new sessions only on Codex).",
     )
     label: str | None = Field(
         default=None,
@@ -137,7 +142,7 @@ def create_server(
         title="Agent Bridge (Neon & Codex Subagents)",
         description=(
             "Delegate tasks, parallel work, and code reviews to Antigravity (Neon) "
-            "and Codex CLI subagents with dynamic model resolution and usage tracking."
+            "and Codex CLI subagents with shared SQLite state, dynamic models, and usage/quota visibility."
         ),
         instructions=SERVER_INSTRUCTIONS,
         lifespan=lifespan,
@@ -156,17 +161,22 @@ def create_server(
         cwd: str | None = None,
         mode: Literal["read_only", "edit"] = "read_only",
         model: str | None = None,
+        effort: EffortLevel | None = None,
         resume_from: str | None = None,
         worktree: bool = False,
         extra_dirs: list[str] | None = None,
-        timeout_seconds: int = 300,
+        timeout_seconds: int | None = None,
+        wait_seconds: int | None = None,
         label: str | None = None,
+        parent_run: str | None = None,
     ) -> dict[str, Any]:
         """Run a Neon (`agy`) or Codex (`codex`) subagent synchronously and return its response.
 
-        Pass `resume_from` with a prior `job_id` or `session_id` to continue an existing conversation.
-        Defaults to `mode="read_only"`. Use versionless Neon intents like `'neon-high'`, `'neon-xhigh'`,
-        `'neon-medium'`, `'flash'` (or omit `model`) so newer model versions update seamlessly.
+        - `timeout_seconds`: overall job deadline (defaults to `AGENT_BRIDGE_DEFAULT_TIMEOUT`).
+        - `wait_seconds`: optional shorter MCP wait window; if it expires while the job is still
+          running, returns the live `job_id` so you can poll via `check_jobs` without stopping the job.
+        - `effort`: optional reasoning effort override (`low`, `medium`, `high`, `xhigh`).
+        - `resume_from`: prior `job_id` or `session_id` to continue (turns on the same session serialize).
         """
         req = job_manager.prepare_request(
             backend=backend,
@@ -174,15 +184,17 @@ def create_server(
             cwd=cwd,
             mode=mode,
             model=model,
+            effort=effort,
             resume_from=resume_from,
             worktree=worktree,
             extra_dirs=extra_dirs,
             timeout_seconds=timeout_seconds,
             label=label,
+            parent_run=parent_run,
         )
-        record = await job_manager.run(req)
+        record = await job_manager.run(req, wait_seconds=wait_seconds)
         detail = record.to_detail()
-        detail["session_usage"] = job_manager.usage_tracker.session_compact_summary()
+        detail["session_usage"] = job_manager.store.session_compact_summary(job_manager.owner_id)
         return detail
 
     @mcp.tool(
@@ -198,11 +210,13 @@ def create_server(
         cwd: str | None = None,
         mode: Literal["read_only", "edit"] = "read_only",
         model: str | None = None,
+        effort: EffortLevel | None = None,
         resume_from: str | None = None,
         worktree: bool = False,
         extra_dirs: list[str] | None = None,
-        timeout_seconds: int = 600,
+        timeout_seconds: int | None = None,
         label: str | None = None,
+        parent_run: str | None = None,
     ) -> dict[str, Any]:
         """Launch a Neon or Codex subagent in the background and immediately return its `job_id`.
 
@@ -214,22 +228,28 @@ def create_server(
             cwd=cwd,
             mode=mode,
             model=model,
+            effort=effort,
             resume_from=resume_from,
             worktree=worktree,
             extra_dirs=extra_dirs,
             timeout_seconds=timeout_seconds,
             label=label,
+            parent_run=parent_run,
         )
         record = job_manager.start(req)
         return {
             "job_id": record.job_id,
+            "owner_id": record.owner_id,
             "backend": record.backend,
             "requested_model": record.requested_model,
+            "effort": record.effort,
             "mode": record.mode,
             "cwd": record.cwd,
             "status": record.status,
             "label": record.label,
+            "parent_run": record.parent_run,
             "session_id": record.session_id,
+            "timeout_seconds": req.timeout_seconds,
             "hint": f"Call check_jobs(job_ids=['{record.job_id}'], wait_seconds=60) to wait for results.",
         }
 
@@ -245,12 +265,14 @@ def create_server(
         cwd: str | None = None,
         mode: Literal["read_only", "edit"] = "read_only",
         wait: bool = True,
-        timeout_seconds: int = 300,
+        timeout_seconds: int | None = None,
+        wait_seconds: int | None = None,
+        parent_run: str | None = None,
     ) -> dict[str, Any]:
         """Run multiple Neon and/or Codex subagent tasks concurrently in one call.
 
-        Set `wait=True` (default) to wait for all tasks and return all responses together, or
-        `wait=False` to start them in the background and return their `job_ids` immediately.
+        Set `wait=True` (default) to wait for all tasks (up to `wait_seconds` or `timeout_seconds`),
+        or `wait=False` to start them in the background and return their `job_ids` immediately.
         """
         if not tasks:
             raise ValueError("tasks must contain at least one task.")
@@ -264,24 +286,29 @@ def create_server(
                 cwd=spec.cwd or cwd,
                 mode=spec.mode or mode,
                 model=spec.model,
+                effort=spec.effort,
                 resume_from=spec.resume_from,
                 worktree=spec.worktree,
                 extra_dirs=spec.extra_dirs,
                 timeout_seconds=timeout_seconds,
                 label=spec.label,
+                parent_run=parent_run,
             )
             for spec in tasks
         ]
+        effective_wait = wait_seconds if wait_seconds is not None else (
+            requests[0].timeout_seconds if wait else 0
+        )
         records = await job_manager.run_parallel(
             requests,
             wait=wait,
-            wait_seconds=timeout_seconds if wait else 0,
+            wait_seconds=effective_wait,
         )
         return {
             "count": len(records),
             "all_done": all(r.is_terminal for r in records),
             "results": [r.to_detail() if wait else r.to_summary() for r in records],
-            "session_usage": job_manager.usage_tracker.session_compact_summary(),
+            "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
         }
 
     @mcp.tool(
@@ -297,12 +324,15 @@ def create_server(
         wait_mode: Literal["all", "any"] = "all",
         status: str | None = None,
         backend: str | None = None,
+        cwd: str | None = None,
+        parent_run: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
-        """Inspect background or recent subagent jobs, or wait for specific jobs to complete.
+        """Inspect background or recent subagent jobs across windows, or wait for specific jobs.
 
         - If `job_ids` is provided: waits up to `wait_seconds` (capped at 300s) for `'all'` or
-          `'any'` of those jobs to complete, then returns full details (`response`, `session_id`, `usage`).
+          `'any'` of those jobs to reach a terminal state, then returns full details. A wait ending
+          with `'queued'` or `'running'` leaves the job active.
         - If `job_ids` is omitted: returns a compact summary list of recent jobs.
         """
         if job_ids:
@@ -316,14 +346,20 @@ def create_server(
                 "all_done": all(r.is_terminal for r in records),
                 "any_done": any(r.is_terminal for r in records),
                 "jobs": [r.to_detail() for r in records],
-                "session_usage": job_manager.usage_tracker.session_compact_summary(),
+                "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
             }
 
-        summaries = job_manager.list_jobs(limit=limit, status=status, backend=backend)
+        summaries = job_manager.list_jobs(
+            limit=limit,
+            status=status,
+            backend=backend,
+            cwd=cwd,
+            parent_run=parent_run,
+        )
         return {
             "count": len(summaries),
             "jobs": summaries,
-            "session_usage": job_manager.usage_tracker.session_compact_summary(),
+            "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
         }
 
     @mcp.tool(
@@ -334,7 +370,7 @@ def create_server(
         )
     )
     async def cancel_job(job_id: str) -> dict[str, Any]:
-        """Cancel a running or queued background subagent job and terminate its subprocess tree."""
+        """Cancel a running or queued background subagent job owned by this bridge process."""
         record = await job_manager.cancel(job_id)
         return record.to_detail()
 
@@ -354,14 +390,17 @@ def create_server(
         focus: str | None = None,
         neon_model: str | None = None,
         codex_model: str | None = None,
+        effort: EffortLevel | None = None,
         wait: bool = True,
-        timeout_seconds: int = 300,
+        timeout_seconds: int | None = None,
+        wait_seconds: int | None = None,
+        parent_run: str | None = None,
     ) -> dict[str, Any]:
         """Run a read-only code review using Neon, Codex, or both in parallel.
 
         - `backends`: defaults to `["neon", "codex"]` for dual-model review.
         - `scope`: `'uncommitted'` (default), `'base'` (with `base="main"`), or `'commit'` (with `commit="<sha>"`).
-        - `focus`: optional custom review criteria (e.g. security, concurrency, API compatibility).
+        - `effort`: optional reasoning effort override applied to selected backends.
         """
         selected = backends if backends else ["neon", "codex"]
         normalized_backends = []
@@ -385,8 +424,10 @@ def create_server(
                     cwd=cwd,
                     mode="read_only",
                     model=codex_model,
+                    effort=effort,
                     timeout_seconds=timeout_seconds,
                     label=f"codex-review-{scope}",
+                    parent_run=parent_run,
                     review_scope=scope,
                     review_base=base,
                     review_commit=commit,
@@ -398,15 +439,20 @@ def create_server(
                     cwd=cwd,
                     mode="read_only",
                     model=neon_model if backend == "neon" else codex_model,
+                    effort=effort,
                     timeout_seconds=timeout_seconds,
                     label=f"{backend}-review-{scope}",
+                    parent_run=parent_run,
                 )
             requests.append(req)
 
+        effective_wait = wait_seconds if wait_seconds is not None else (
+            requests[0].timeout_seconds if wait else 0
+        )
         records = await job_manager.run_parallel(
             requests,
             wait=wait,
-            wait_seconds=timeout_seconds if wait else 0,
+            wait_seconds=effective_wait,
         )
         return {
             "scope": scope,
@@ -414,31 +460,41 @@ def create_server(
             "commit": commit,
             "all_done": all(r.is_terminal for r in records),
             "reviews": [r.to_detail() if wait else r.to_summary() for r in records],
-            "session_usage": job_manager.usage_tracker.session_compact_summary(),
+            "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
         }
 
     @mcp.tool(
         annotations=ToolAnnotations(
             readOnlyHint=True,
             destructiveHint=False,
-            openWorldHint=False,
+            openWorldHint=True,
         )
     )
     async def get_usage(
         period: UsagePeriod = "today",
         backend: str | None = None,
+        cwd: str | None = None,
+        parent_run: str | None = None,
+        include_quota: bool = False,
+        refresh_quota: bool = False,
+        compact: bool = False,
         recent_limit: int = 10,
     ) -> dict[str, Any]:
-        """Inspect token, run-count, and duration usage across external Neon and Codex subagents.
+        """Inspect usage, in-flight load, coverage, and optional live subscription quota.
 
-        - `period`: `'session'` (this MCP run), `'today'` (local calendar day), `'7d'`, `'30d'`, or `'all'`.
-        - `backend`: optional filter (`'neon'` or `'codex'`).
-        - Returns totals, breakdown `by_backend` and `by_model`, plus the most recent runs.
+        - `period`: `'session'`, `'today'`, `'7d'`, `'30d'`, or `'all'`.
+        - `cwd` / `parent_run`: optional filters for project-scoped or workflow-scoped planning.
+        - `compact=True`: concise planning view (per-backend runs, in-flight jobs, duration, coverage).
+        - `include_quota=True`: opt-in cached live quota lookup (Codex rate limits + Antigravity `/usage`).
         """
-        norm_backend = normalize_backend(backend) if backend and backend.strip() else None
-        return job_manager.usage_tracker.summarize(
+        return await job_manager.get_usage_summary(
             period=period,
-            backend=norm_backend,
+            backend=backend,
+            cwd=cwd,
+            parent_run=parent_run,
+            include_quota=include_quota,
+            refresh_quota=refresh_quota,
+            compact=compact,
             recent_limit=recent_limit,
         )
 
@@ -450,45 +506,44 @@ def create_server(
         )
     )
     async def list_backends(refresh_models: bool = False) -> dict[str, Any]:
-        """Check installed `agy` (Neon) and `codex` CLIs, live models, dynamic shortcuts, and session usage."""
+        """Check CLI discovery, executable health, live/cached Neon models, Codex defaults, and usage."""
+        neon_health = await job_manager.neon_runner.check_health()
         neon_info: dict[str, Any] = {
             "backend": "neon",
             "cli": "agy",
             "default_intent": cfg.default_neon_model,
+            **neon_health,
         }
-        try:
-            neon_info["command"] = job_manager.neon_runner.resolve_command()
-            neon_info["available"] = True
-            neon_info["version"] = await job_manager.neon_runner.get_version()
+        if neon_health["healthy"]:
             models = await job_manager.neon_runner.list_models(refresh=refresh_models)
+            neon_info.update(job_manager.neon_runner.catalog.status_info())
             neon_info["models"] = models
-            neon_info["resolved_shortcuts"] = job_manager.neon_runner.catalog.summarize_latest_aliases()
+            neon_info["resolved_shortcuts"] = (
+                job_manager.neon_runner.catalog.summarize_latest_aliases()
+            )
             default_res = await job_manager.neon_runner.catalog.resolve(
                 None, default_intent=cfg.default_neon_model
             )
             neon_info["resolved_default_model"] = default_res.resolved
-        except Exception as exc:
-            neon_info["available"] = False
-            neon_info["error"] = str(exc)
+        else:
+            neon_info.update(job_manager.neon_runner.catalog.status_info())
 
+        codex_health = await job_manager.codex_runner.check_health()
         codex_info: dict[str, Any] = {
             "backend": "codex",
             "cli": "codex",
-            "default_model": cfg.default_codex_model or "(Codex CLI subscription default)",
+            "configured_model_override": cfg.default_codex_model,
+            "configured_effort_override": cfg.default_codex_effort,
+            **codex_health,
         }
-        try:
-            codex_info["command"] = job_manager.codex_runner.resolve_command()
-            codex_info["available"] = True
-            codex_info["version"] = await job_manager.codex_runner.get_version()
-        except Exception as exc:
-            codex_info["available"] = False
-            codex_info["error"] = str(exc)
 
         return {
+            "owner_id": job_manager.owner_id,
             "default_cwd": str(cfg.default_cwd),
             "default_timeout_seconds": cfg.default_timeout_seconds,
-            "max_concurrent_jobs": cfg.max_concurrent_jobs,
-            "session_usage": job_manager.usage_tracker.session_compact_summary(),
+            "max_concurrent_jobs_per_process": cfg.max_concurrent_jobs,
+            "db_path": str(job_manager.store.db_path),
+            "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
             "backends": {
                 "neon": neon_info,
                 "codex": codex_info,

@@ -1,4 +1,4 @@
-"""Tests for dynamic, self-healing model resolution."""
+"""Tests for dynamic, effort-preserving, self-healing model resolution."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def test_parse_agy_model_id() -> None:
     assert p3.is_orchestrator
 
 
-async def test_versionless_intent_picks_highest_version(tmp_path: Path) -> None:
+async def test_versionless_intent_picks_highest_version_with_matching_tier(tmp_path: Path) -> None:
     async def fetch() -> list[dict[str, str]]:
         return list(SAMPLE_CATALOG_V5)
 
@@ -62,6 +62,10 @@ async def test_versionless_intent_picks_highest_version(tmp_path: Path) -> None:
     res_default = await catalog.resolve(None, default_intent="neon-high")
     assert res_default.resolved == "gemini-5-neon-high"
     assert res_default.notice is None
+
+    res_med = await catalog.resolve("neon-medium")
+    assert res_med.resolved == "gemini-5-neon-medium"
+    assert res_med.notice is None
 
     res_xhigh = await catalog.resolve("neon-xhigh")
     assert res_xhigh.resolved == "gemini-5-neon-xhigh"
@@ -72,8 +76,40 @@ async def test_versionless_intent_picks_highest_version(tmp_path: Path) -> None:
     assert res_flash.notice is None
 
 
+async def test_preserves_requested_effort_tier_when_newer_version_lacks_tier(tmp_path: Path) -> None:
+    mixed = [
+        {"id": "gemini-4-neon-medium", "label": "Gemini 4 Neon (Medium)"},
+        {"id": "gemini-5-neon-high", "label": "Gemini 5 Neon (High)"},
+    ]
+
+    async def fetch() -> list[dict[str, str]]:
+        return list(mixed)
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
+    # Must preserve requested `medium` effort instead of silently upgrading to `high`!
+    res = await catalog.resolve("neon-medium")
+    assert res.resolved == "gemini-4-neon-medium"
+    assert res.notice is None
+
+
+async def test_discloses_tier_substitution_when_requested_tier_unavailable(tmp_path: Path) -> None:
+    only_high = [
+        {"id": "gemini-5-neon-high", "label": "Gemini 5 Neon (High)"},
+        {"id": "gemini-5-neon-xhigh", "label": "Gemini 5 Neon (XHigh)"},
+    ]
+
+    async def fetch() -> list[dict[str, str]]:
+        return list(only_high)
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
+    res = await catalog.resolve("neon-medium")
+    assert res.resolved == "gemini-5-neon-high"
+    assert res.notice is not None
+    assert "medium" in res.notice.lower()
+    assert "gemini-5-neon-high" in res.notice
+
+
 async def test_retired_exact_model_auto_upgrades_seamlessly(tmp_path: Path) -> None:
-    # Catalog only has Gemini 5 Neon; caller passed retired gemini-4-neon-high.
     only_v5 = [
         {"id": "gemini-5-neon-high", "label": "Gemini 5 Neon (High)"},
         {"id": "gemini-5-neon-medium", "label": "Gemini 5 Neon (Medium)"},
@@ -90,37 +126,18 @@ async def test_retired_exact_model_auto_upgrades_seamlessly(tmp_path: Path) -> N
     assert "gemini-5-neon-high" in res.notice
 
 
-async def test_tier_fallback_when_tier_missing(tmp_path: Path) -> None:
-    only_medium_high = [
-        {"id": "gemini-5-neon-high", "label": "Gemini 5 Neon (High)"},
-        {"id": "gemini-5-neon-medium", "label": "Gemini 5 Neon (Medium)"},
-    ]
-
+async def test_effort_override_on_neon(tmp_path: Path) -> None:
     async def fetch() -> list[dict[str, str]]:
-        return list(only_medium_high)
+        return list(SAMPLE_CATALOG_V5)
 
     catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
-    res = await catalog.resolve("neon-xhigh")
-    assert res.resolved == "gemini-5-neon-high"
-
-
-async def test_newer_version_wins_over_older_exact_tier(tmp_path: Path) -> None:
-    mixed = [
-        {"id": "gemini-4-neon-high", "label": "Gemini 4 Neon (High)"},
-        {"id": "gemini-5-neon-medium", "label": "Gemini 5 Neon (Medium)"},
-    ]
-
-    async def fetch() -> list[dict[str, str]]:
-        return list(mixed)
-
-    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
-    res = await catalog.resolve("neon-high")
+    res = await catalog.resolve(None, default_intent="neon-high", effort_override="medium")
     assert res.resolved == "gemini-5-neon-medium"
+    assert res.notice is None
 
 
-async def test_stale_cache_refreshes_on_new_exact_model(tmp_path: Path) -> None:
+async def test_stale_cache_status_and_refresh_on_new_exact_model(tmp_path: Path) -> None:
     cache_path = tmp_path / "models.json"
-    # Seed disk cache 60 seconds ago with v4 only.
     cache_path.write_text(
         json.dumps({"fetched_at": time.time() - 60, "models": SAMPLE_CATALOG_V4}),
         encoding="utf-8",
@@ -133,11 +150,13 @@ async def test_stale_cache_refreshes_on_new_exact_model(tmp_path: Path) -> None:
         return list(SAMPLE_CATALOG_V5)
 
     catalog = NeonModelCatalog(fetcher=fetch, cache_path=cache_path, ttl_seconds=900)
-    # Request a brand-new v5 model that wasn't in the cached v4 catalog.
+    assert catalog.status_info()["models_status"] == "cached"
+
     res = await catalog.resolve("gemini-5-neon-xhigh")
     assert calls == 1
     assert res.resolved == "gemini-5-neon-xhigh"
     assert res.notice is None
+    assert catalog.status_info()["models_status"] == "live"
 
 
 async def test_empty_catalog_falls_back_to_cli_default(tmp_path: Path) -> None:
@@ -148,6 +167,7 @@ async def test_empty_catalog_falls_back_to_cli_default(tmp_path: Path) -> None:
     res = await catalog.resolve("neon-high")
     assert res.resolved is None
     assert res.notice is not None
+    assert catalog.status_info()["models_status"] == "unavailable"
 
 
 @pytest.mark.parametrize(

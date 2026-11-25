@@ -1,4 +1,4 @@
-"""End-to-end stdio MCP protocol test (verifies real JSON-RPC stdio framing & tool schemas)."""
+"""End-to-end stdio MCP protocol test (verifies JSON-RPC stdio framing, 8 tools, and default env timeout)."""
 
 from __future__ import annotations
 
@@ -11,10 +11,13 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
-async def test_stdio_mcp_handshake_and_tools(tmp_path: Path) -> None:
+async def test_stdio_mcp_handshake_tools_and_default_timeout(tmp_path: Path) -> None:
     env = dict(os.environ)
     env["AGENT_BRIDGE_STATE_DIR"] = str(tmp_path / "state")
     env["AGENT_BRIDGE_DEFAULT_CWD"] = str(tmp_path)
+    env["AGENT_BRIDGE_DEFAULT_TIMEOUT"] = "185"
+    env["AGENT_BRIDGE_AGY_BIN"] = str(tmp_path / "missing-agy.exe")
+    env["AGENT_BRIDGE_CODEX_BIN"] = str(tmp_path / "missing-codex.exe")
 
     server_params = StdioServerParameters(
         command=sys.executable,
@@ -42,13 +45,29 @@ async def test_stdio_mcp_handshake_and_tools(tmp_path: Path) -> None:
                 "list_backends",
             }
 
-            usage_res = await session.call_tool("get_usage", {"period": "session"})
+            usage_res = await session.call_tool(
+                "get_usage",
+                {"period": "session", "compact": True},
+            )
             assert not usage_res.is_error
             payload = json.loads(usage_res.content[0].text)
-            assert payload["period"] == "session"
-            assert payload["totals"]["runs"] == 0
+            assert payload["scope"]["period"] == "session"
+            assert payload["overview"]["runs"] == 0
+            assert payload["overview"]["in_flight"] == 0
 
             jobs_res = await session.call_tool("check_jobs", {})
             assert not jobs_res.is_error
             jobs_payload = json.loads(jobs_res.content[0].text)
             assert jobs_payload["count"] == 0
+
+            # Verify list_backends honors AGENT_BRIDGE_DEFAULT_TIMEOUT & reports invalid bins honestly!
+            lb_res = await session.call_tool("list_backends", {})
+            assert not lb_res.is_error
+            lb_payload = json.loads(lb_res.content[0].text)
+            assert lb_payload["default_timeout_seconds"] == 185
+            assert lb_payload["backends"]["neon"]["command_found"] is False
+            assert lb_payload["backends"]["neon"]["healthy"] is False
+            assert lb_payload["backends"]["neon"]["available"] is False
+            assert lb_payload["backends"]["codex"]["command_found"] is False
+            assert lb_payload["backends"]["codex"]["healthy"] is False
+            assert lb_payload["backends"]["codex"]["available"] is False
