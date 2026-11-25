@@ -17,27 +17,31 @@ from agent_bridge.jobs import JobManager
 from agent_bridge.storage import UsagePeriod
 
 SERVER_INSTRUCTIONS = """
-`agent-bridge` lets you delegate tasks, reviews, and parallel work to two external CLI subagents
-using the user's existing subscriptions:
+`agent-bridge` lets you delegate tasks, reviews, and parallel work across THREE independent
+subscription quota pools over two local CLIs:
 
-- `neon` (Antigravity CLI / Gemini Neon, Hydrogen, Flash) — great for architecture reviews,
-  second opinions, large-context codebase analysis, and debugging.
-  Prefer versionless shortcuts (`neon-medium`, `neon-high`, `neon-xhigh`, `flash`) so newer
-  model versions are picked up automatically while preserving your requested effort tier.
-- `codex` (OpenAI Codex CLI / GPT) — great for focused code reviews, targeted implementations,
-  test generation, bug fixes, and isolated worktree edits. Omit `model` for the subscription default,
-  and pass `effort` (`low` | `medium` | `high` | `xhigh`) when you want to override local Codex effort.
+1. `codex` (OpenAI Codex CLI — `codex` pool) — defaults to `gpt-6.2-sol` at `high` reasoning
+   effort (seamlessly rides newer versions / falls back if retired). Override per call with `effort`
+   (`low` | `medium` | `high` | `xhigh`). Great for focused code reviews, targeted edits, test
+   generation, and isolated pre-assigned Git worktree edits (`mode="edit"`, `worktree=True`).
+2. `neon` / `agy` Gemini Models (`agy_gemini` pool) — versionless shortcuts (`neon-medium`,
+   `neon-high`, `neon-xhigh`, `hydrogen`, `flash`) auto-upgrade while preserving effort tier.
+   Great for architecture reviews, second opinions, and large-context codebase analysis.
+3. `agy-claude` / `agy-opus` / `agy-gpt` (`agy_claude_gpt` pool inside `agy`) — SEPARATE 5h +
+   weekly quota pool from both Gemini Models and your Claude Code subscription! Use
+   `backend="agy-claude"` (Sonnet), `backend="agy-opus"` (Opus), or `backend="agy-gpt"` (GPT-OSS),
+   or pass `model="claude-sonnet-high" | "claude-opus-high" | "gpt-oss"` on `backend="neon"`.
 
-Guidelines:
-- Always pass `cwd` pointing to the repository or workspace you want the subagent to inspect.
-- Default `mode` is `"read_only"`. Only pass `mode="edit"` when the user wants file edits;
-  for Codex edits prefer `worktree=True` and inspect the returned `effective_cwd` / `worktree_path`.
-- For multi-minute work, prefer `start_agent` or `run_parallel(wait=False)` (or pass a bounded
-  `wait_seconds` separate from the overall `timeout_seconds` deadline), then follow up with `check_jobs`.
-- Turns on the same `session_id` serialize automatically; pass `job_id` or `session_id` into
-  `resume_from` to continue a conversation.
-- Call `get_usage(compact=True, cwd=..., include_quota=True)` before heavy fan-out to check
-  in-flight load, recent usage, and live subscription quota.
+Smart Quota & Weekly-Reset Routing:
+- Before substantial fan-out or heavy tasks, call `get_usage(compact=True, cwd=..., include_quota=True)`
+  to check all 3 pools (`by_quota_pool`), exact reset countdowns of all involved models
+  (`quota_advisory.upcoming_resets`), and `quota_advisory.expiring_weekly_alerts` / `recommended_order`.
+- If a pool has an `expiring_weekly_alerts` entry (`priority="use_before_reset"`), prioritize routing
+  eligible work there so unused weekly quota is leveraged before it resets!
+- Always pass `cwd`. Default `mode` is `"read_only"`. For multi-minute work prefer `start_agent`
+  or `run_parallel(wait=False)` (or a bounded `wait_seconds`), then poll via `check_jobs`.
+- Turns on the same `session_id` serialize atomically across windows via SQLite; pass `job_id` or
+  `session_id` into `resume_from` to continue a conversation.
 """.strip()
 
 
@@ -473,6 +477,7 @@ def create_server(
     async def get_usage(
         period: UsagePeriod = "today",
         backend: str | None = None,
+        quota_pool: str | None = None,
         cwd: str | None = None,
         parent_run: str | None = None,
         include_quota: bool = False,
@@ -480,16 +485,19 @@ def create_server(
         compact: bool = False,
         recent_limit: int = 10,
     ) -> dict[str, Any]:
-        """Inspect usage, in-flight load, coverage, and optional live subscription quota.
+        """Inspect usage across all 3 quota pools, in-flight load, coverage, and weekly-reset-aware quota.
 
         - `period`: `'session'`, `'today'`, `'7d'`, `'30d'`, or `'all'`.
+        - `quota_pool`: optional pool filter (`'agy_gemini'`, `'agy_claude_gpt'`, or `'codex'`).
         - `cwd` / `parent_run`: optional filters for project-scoped or workflow-scoped planning.
-        - `compact=True`: concise planning view (per-backend runs, in-flight jobs, duration, coverage).
-        - `include_quota=True`: opt-in cached live quota lookup (Codex rate limits + Antigravity `/usage`).
+        - `compact=True`: concise planning view (per-backend & per-quota-pool runs, in-flight, duration, coverage).
+        - `include_quota=True`: opt-in cached live quota lookup + `quota_advisory` with weekly-reset alerts,
+          upcoming reset times across all involved models, and smart pool `recommended_order`.
         """
         return await job_manager.get_usage_summary(
             period=period,
             backend=backend,
+            quota_pool=quota_pool,
             cwd=cwd,
             parent_run=parent_run,
             include_quota=include_quota,
@@ -505,8 +513,11 @@ def create_server(
             openWorldHint=False,
         )
     )
-    async def list_backends(refresh_models: bool = False) -> dict[str, Any]:
-        """Check CLI discovery, executable health, live/cached Neon models, Codex defaults, and usage."""
+    async def list_backends(
+        refresh_models: bool = False,
+        include_quota: bool = False,
+    ) -> dict[str, Any]:
+        """Check CLI discovery, health, live/cached agy pools (Gemini + Claude/GPT), Codex defaults, and optional quota."""
         neon_health = await job_manager.neon_runner.check_health()
         neon_info: dict[str, Any] = {
             "backend": "neon",
@@ -518,6 +529,9 @@ def create_server(
             models = await job_manager.neon_runner.list_models(refresh=refresh_models)
             neon_info.update(job_manager.neon_runner.catalog.status_info())
             neon_info["models"] = models
+            neon_info["quota_pools"] = (
+                job_manager.neon_runner.catalog.group_models_by_quota_pool()
+            )
             neon_info["resolved_shortcuts"] = (
                 job_manager.neon_runner.catalog.summarize_latest_aliases()
             )
@@ -532,12 +546,14 @@ def create_server(
         codex_info: dict[str, Any] = {
             "backend": "codex",
             "cli": "codex",
+            "default_model": cfg.default_codex_model,
+            "default_effort": cfg.default_codex_effort,
             "configured_model_override": cfg.default_codex_model,
             "configured_effort_override": cfg.default_codex_effort,
             **codex_health,
         }
 
-        return {
+        out: dict[str, Any] = {
             "owner_id": job_manager.owner_id,
             "default_cwd": str(cfg.default_cwd),
             "default_timeout_seconds": cfg.default_timeout_seconds,
@@ -549,6 +565,11 @@ def create_server(
                 "codex": codex_info,
             },
         }
+        if include_quota:
+            quota = await job_manager.get_quota(["neon", "codex"], refresh=refresh_models)
+            out["quota"] = quota
+            out["quota_advisory"] = job_manager._build_quota_advisory(quota)
+        return out
 
     return mcp, job_manager
 

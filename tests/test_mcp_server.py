@@ -71,3 +71,5 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(tmp_path: Path) -> 
             assert lb_payload["backends"]["codex"]["command_found"] is False
             assert lb_payload["backends"]["codex"]["healthy"] is False
             assert lb_payload["backends"]["codex"]["available"] is False
+            assert lb_payload["backends"]["codex"]["default_model"] == "gpt-6.2-sol"
+            assert lb_payload["backends"]["codex"]["default_effort"] == "high"

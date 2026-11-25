@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from agent_bridge.model_resolver import (
     DEFAULT_INTENT_TOKENS,
     NeonModelCatalog,
     is_model_unavailable_error,
+    is_newer_codex_model_in_same_family,
 )
 from agent_bridge.models import JobStatus, ProviderState, RunRequest, RunResult, UsageStatus
 from agent_bridge.process_control import ManagedProcess, subprocess_creation_kwargs
@@ -40,6 +42,8 @@ TRANSIENT_RETRY_MIN_REMAINING_SECONDS = 12.0
 OnSessionCallback = Callable[[str], None]
 OnActivityCallback = Callable[[str], None]
 OnModelCallback = Callable[[str], None]
+
+_WORKTREE_REPO_LOCKS: dict[str, asyncio.Lock] = {}
 
 _QUOTA_PATTERNS = (
     re.compile(r"\b(quota|rate\s*limit|usage\s*limit|limit\s*reached|too\s+many\s+requests|429)\b", re.I),
@@ -77,6 +81,35 @@ def _tail(text: str, limit: int = STDERR_TAIL_MAX_CHARS) -> str | None:
     return "...[truncated]\n" + cleaned[-limit:]
 
 
+def _repo_worktree_lock(repo_root_key: str) -> asyncio.Lock:
+    lock = _WORKTREE_REPO_LOCKS.get(repo_root_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _WORKTREE_REPO_LOCKS[repo_root_key] = lock
+    return lock
+
+
+async def _gather_with_cancellation(
+    coros: list[Coroutine[Any, Any, Any]],
+    *,
+    timeout: float,
+    managed: ManagedProcess,
+) -> None:
+    """Await IO & process tasks under `timeout`; terminate `managed` and cancel tasks on ANY exit."""
+    tasks = [asyncio.create_task(c) for c in coros]
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
+    except BaseException:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        try:
+            await managed.terminate()
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 def classify_failure(
     *,
     backend: str,
@@ -85,18 +118,24 @@ def classify_failure(
     stderr_text: str | None,
     timed_out_locally: bool = False,
     agy_permission_fallback: bool = False,
+    process_stopped: bool = True,
 ) -> tuple[JobStatus, str, ProviderState, str]:
     """Classify a non-success outcome into `(status, failure_reason, provider_state, retry_guidance)`."""
     combined = f"{error_text or ''}\n{stderr_text or ''}"
+    local_state: ProviderState = "stopped" if process_stopped else "possibly_running"
 
     if timed_out_locally:
-        return (
-            "timed_out",
-            "timeout",
-            "stopped",
-            "Local bridge deadline elapsed and the subprocess tree was terminated. "
-            "Preserve any partial response and session_id; inspect git diff/worktree before retrying edits.",
-        )
+        if process_stopped:
+            guidance = (
+                "Local bridge deadline elapsed and the subprocess tree was verified stopped. "
+                "Preserve any partial response and session_id; inspect git diff/worktree before retrying edits."
+            )
+        else:
+            guidance = (
+                "Local bridge deadline elapsed, but subprocess termination could not be verified. "
+                "Verify whether any child process is still running and inspect git diff/worktree before retrying."
+            )
+        return ("timed_out", "timeout", local_state, guidance)
 
     if backend == "neon" and (
         exit_code == 3 or any(p.search(combined) for p in _AGY_TIMEOUT_PATTERNS)
@@ -114,7 +153,7 @@ def classify_failure(
         return (
             "failed",
             "auth_error",
-            "stopped",
+            local_state,
             "CLI authentication failed. Re-authenticate the underlying CLI (`agy` or `codex login`) and retry.",
         )
 
@@ -122,7 +161,7 @@ def classify_failure(
         return (
             "failed",
             "quota_exceeded",
-            "stopped",
+            local_state,
             "Subscription quota or rate limit reached. Call get_usage(include_quota=True) to check reset "
             "times or delegate to the other backend.",
         )
@@ -131,7 +170,7 @@ def classify_failure(
         return (
             "failed",
             "model_unavailable",
-            "stopped",
+            local_state,
             "Requested model was rejected by the CLI. Refresh models via list_backends(refresh_models=True) "
             "or use a versionless shortcut.",
         )
@@ -140,7 +179,7 @@ def classify_failure(
         return (
             "failed",
             "transient_service",
-            "stopped",
+            local_state,
             "Transient provider/network error. Safe to retry a read-only task; for edit tasks reconcile "
             "git status/diff before retrying.",
         )
@@ -149,7 +188,7 @@ def classify_failure(
         return (
             "failed",
             "interactive_fallback",
-            "stopped",
+            local_state,
             "Antigravity fell back to interactive permission prompts in headless mode. For unattended edits "
             "use backend='codex' with mode='edit' (and worktree=True), or keep Neon read-only.",
         )
@@ -158,7 +197,7 @@ def classify_failure(
         return (
             "failed",
             "permission_error",
-            "stopped",
+            local_state,
             "Subagent lacked permission for an attempted action. Retry with mode='edit' (or extra_dirs) "
             "if writes outside read-only scope were intended.",
         )
@@ -166,7 +205,7 @@ def classify_failure(
     return (
         "failed",
         "cli_error",
-        "stopped",
+        local_state,
         "Inspect error and stderr_tail; for edit tasks verify repository state before retrying.",
     )
 
@@ -381,36 +420,207 @@ def _parse_git_worktree_porcelain(output: str) -> list[dict[str, str | None]]:
     return entries
 
 
-async def _list_git_worktrees(cwd: str) -> list[dict[str, str | None]]:
+async def _run_git(
+    args: list[str],
+    *,
+    cwd: str,
+    timeout_seconds: float = 15.0,
+) -> tuple[int, str, str]:
+    """Run a git subprocess with ManagedProcess tracking and cleanup on every exit path."""
     git_bin = shutil.which("git")
     if not git_bin:
-        return []
+        raise RuntimeError("`git` executable not found in PATH.")
+    managed: ManagedProcess | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             git_bin,
-            "worktree",
-            "list",
-            "--porcelain",
+            *args,
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            **subprocess_creation_kwargs(),
         )
-        stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        if proc.returncode != 0:
-            return []
-        return _parse_git_worktree_porcelain(stdout_b.decode("utf-8", errors="replace"))
-    except Exception:
-        return []
+        managed = ManagedProcess(proc)
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=max(0.1, timeout_seconds),
+        )
+        managed.close()
+        return (
+            int(proc.returncode or 0),
+            stdout_b.decode("utf-8", errors="replace").strip(),
+            stderr_b.decode("utf-8", errors="replace").strip(),
+        )
+    except BaseException:
+        if managed is not None:
+            await managed.terminate()
+        raise
 
 
-def _norm_path_key(path_str: str | None) -> str:
-    if not path_str:
-        return ""
+async def _inspect_git_checkout(
+    checkout_dir: str,
+    *,
+    timeout_seconds: float = 5.0,
+) -> tuple[str | None, str | None, str | None]:
+    """Return `(branch, head_commit, git_common_dir)` for a git checkout or worktree."""
+    branch: str | None = None
+    commit: str | None = None
+    common_dir: str | None = None
     try:
-        return os.path.normcase(str(Path(path_str).resolve()))
+        rc_c, out_c, _ = await _run_git(
+            ["rev-parse", "HEAD"],
+            cwd=checkout_dir,
+            timeout_seconds=timeout_seconds,
+        )
+        if rc_c == 0 and out_c:
+            commit = out_c.splitlines()[0].strip()
     except Exception:
-        return os.path.normcase(path_str)
+        pass
+    try:
+        rc_b, out_b, _ = await _run_git(
+            ["branch", "--show-current"],
+            cwd=checkout_dir,
+            timeout_seconds=timeout_seconds,
+        )
+        if rc_b == 0 and out_b:
+            branch = out_b.splitlines()[0].strip() or None
+    except Exception:
+        pass
+    try:
+        rc_g, out_g, _ = await _run_git(
+            ["rev-parse", "--git-common-dir"],
+            cwd=checkout_dir,
+            timeout_seconds=timeout_seconds,
+        )
+        if rc_g == 0 and out_g:
+            raw_g = out_g.splitlines()[0].strip()
+            gpath = Path(raw_g)
+            if not gpath.is_absolute():
+                gpath = (Path(checkout_dir) / gpath).resolve()
+            else:
+                gpath = gpath.resolve()
+            common_dir = str(gpath)
+    except Exception:
+        pass
+    return branch, commit, common_dir
+
+
+async def prepare_codex_worktree(
+    *,
+    job_id: str,
+    cwd: str,
+    state_dir: Path,
+    existing_worktree_path: str | None = None,
+    deadline: float | None = None,
+) -> dict[str, str | None]:
+    """Deterministically assign or reuse a per-job Git worktree BEFORE launching Codex.
+
+    Assigning a dedicated worktree per `job_id` eliminates parallel worktree detection races.
+    """
+    def _budget(cap: float = 15.0) -> float:
+        if deadline is None:
+            return cap
+        rem = deadline - time.monotonic()
+        if rem <= 0.1:
+            raise asyncio.TimeoutError("Job deadline expired before Git worktree could be created.")
+        return min(cap, rem)
+
+    # If resuming inside an existing managed worktree, reuse it deterministically.
+    if existing_worktree_path and Path(existing_worktree_path).is_dir():
+        wt_resolved = Path(existing_worktree_path).resolve()
+        cwd_resolved = Path(cwd).resolve()
+        try:
+            cwd_resolved.relative_to(wt_resolved)
+            effective_cwd = str(cwd_resolved)
+        except ValueError:
+            effective_cwd = str(wt_resolved)
+        branch, commit, common_dir = await _inspect_git_checkout(
+            str(wt_resolved),
+            timeout_seconds=_budget(5.0),
+        )
+        return {
+            "effective_cwd": effective_cwd,
+            "worktree_path": str(wt_resolved),
+            "worktree_branch": branch,
+            "worktree_commit": commit,
+            "git_common_dir": common_dir,
+        }
+
+    rc_top, out_top, err_top = await _run_git(
+        ["rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        timeout_seconds=_budget(10.0),
+    )
+    if rc_top != 0 or not out_top:
+        raise RuntimeError(
+            f"Cannot create Git worktree for {cwd!r}: not a Git repository ({err_top or 'rev-parse failed'})."
+        )
+    repo_root = Path(out_top.splitlines()[0].strip()).resolve()
+
+    rc_head, out_head, err_head = await _run_git(
+        ["rev-parse", "HEAD"],
+        cwd=str(repo_root),
+        timeout_seconds=_budget(10.0),
+    )
+    if rc_head != 0 or not out_head:
+        raise RuntimeError(
+            f"Cannot create Git worktree for {repo_root}: repository has no HEAD commit ({err_head or 'empty repo'})."
+        )
+    head_commit = out_head.splitlines()[0].strip()
+
+    rel_prefix = ""
+    try:
+        rel_path = Path(cwd).resolve().relative_to(repo_root)
+        if str(rel_path) not in {"", "."}:
+            rel_prefix = str(rel_path)
+    except ValueError:
+        rel_prefix = ""
+
+    rc_common, out_common, _ = await _run_git(
+        ["rev-parse", "--git-common-dir"],
+        cwd=str(repo_root),
+        timeout_seconds=_budget(10.0),
+    )
+    git_common_dir: str | None = None
+    if rc_common == 0 and out_common:
+        raw_c = Path(out_common.splitlines()[0].strip())
+        git_common_dir = str(raw_c.resolve() if raw_c.is_absolute() else (repo_root / raw_c).resolve())
+
+    repo_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", repo_root.name).strip("-") or "repo"
+    repo_hash = hashlib.sha256(os.path.normcase(str(repo_root)).encode("utf-8")).hexdigest()[:8]
+    wt_root = (state_dir / "worktrees" / f"{repo_slug}-{repo_hash}" / job_id).resolve()
+    wt_branch = f"agent-bridge/{job_id}"
+    wt_root.parent.mkdir(parents=True, exist_ok=True)
+
+    lock = _repo_worktree_lock(os.path.normcase(str(repo_root)))
+    async with lock:
+        last_err = ""
+        for attempt in range(4):
+            rc_add, _out_add, err_add = await _run_git(
+                ["worktree", "add", "-b", wt_branch, str(wt_root), head_commit],
+                cwd=str(repo_root),
+                timeout_seconds=_budget(20.0),
+            )
+            if rc_add == 0:
+                break
+            last_err = err_add or f"git worktree add exited {rc_add}"
+            if attempt < 3 and re.search(r"\.lock|index\.lock|another git process", last_err, re.I):
+                await asyncio.sleep(min(0.25 * (attempt + 1), _budget(2.0)))
+                continue
+            raise RuntimeError(f"Failed to create Git worktree at {wt_root}: {last_err}")
+
+    effective_path = (wt_root / rel_prefix).resolve() if rel_prefix else wt_root
+    if not effective_path.is_dir():
+        effective_path = wt_root
+
+    return {
+        "effective_cwd": str(effective_path),
+        "worktree_path": str(wt_root),
+        "worktree_branch": wt_branch,
+        "worktree_commit": head_commit,
+        "git_common_dir": git_common_dir,
+    }
 
 
 async def _check_cli_health(cmd: list[str]) -> tuple[bool, str | None, str | None]:
@@ -439,6 +649,10 @@ async def _check_cli_health(cmd: list[str]) -> tuple[bool, str | None, str | Non
         if managed is not None:
             await managed.terminate()
         return False, None, f"{type(exc).__name__}: {exc}"
+    except BaseException:
+        if managed is not None:
+            await managed.terminate()
+        raise
 
 
 class NeonRunner:
@@ -491,7 +705,7 @@ class NeonRunner:
             managed = ManagedProcess(proc)
             stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
             managed.close()
-        except Exception:
+        except BaseException:
             if managed is not None:
                 await managed.terminate()
             raise
@@ -515,8 +729,13 @@ class NeonRunner:
         resolved_model: str | None,
         prompt_text: str,
         extra_dirs: list[str],
-        remaining_seconds: int,
+        remaining_seconds: float,
     ) -> list[str]:
+        # Keep agy's own --print-timeout strictly within our hard job deadline (no extra cushion!).
+        if remaining_seconds >= 3.0:
+            print_timeout_sec = max(1, int(remaining_seconds) - 1)
+        else:
+            print_timeout_sec = max(1, int(remaining_seconds))
         args: list[str] = [
             *self.resolve_command(),
             "--output-format",
@@ -524,7 +743,7 @@ class NeonRunner:
             "--mode",
             "plan" if request.mode == "read_only" else "accept-edits",
             "--print-timeout",
-            f"{max(5, remaining_seconds)}s",
+            f"{print_timeout_sec}s",
         ]
         if resolved_model:
             args.extend(["--model", resolved_model])
@@ -551,13 +770,14 @@ class NeonRunner:
     ) -> RunResult:
         started = time.monotonic()
         remaining = deadline - started
-        if remaining <= 0.5:
+        if remaining <= 0.05:
             status, reason, pstate, guidance = classify_failure(
                 backend="neon",
                 exit_code=None,
                 error_text="Job deadline expired before execution started.",
                 stderr_text=None,
                 timed_out_locally=True,
+                process_stopped=True,
             )
             return RunResult(
                 status=status,
@@ -579,7 +799,7 @@ class NeonRunner:
             resolved_model=resolved_model,
             prompt_text=prompt_text,
             extra_dirs=extra_dirs,
-            remaining_seconds=int(remaining),
+            remaining_seconds=remaining,
         )
         if on_model and resolved_model:
             on_model(resolved_model)
@@ -667,7 +887,6 @@ class NeonRunner:
                         if on_session:
                             on_session(cid)
             elif "conversation_id" in obj and ("response" in obj or "status" in obj):
-                # Plain single-JSON envelope fallback (e.g. non-stream output or test stubs).
                 plain_envelope = obj
                 cid = obj.get("conversation_id")
                 if isinstance(cid, str) and cid:
@@ -702,23 +921,25 @@ class NeonRunner:
                 stderr_chunks.append(chunk)
 
         timed_out_locally = False
+        process_stopped = True
         try:
-            # Give agy's own --print-timeout a slight cushion (5s) so it can emit exit code 3 + session_id cleanly,
-            # while still enforcing our hard local deadline.
-            wait_budget = max(1.0, deadline - time.monotonic())
-            await asyncio.wait_for(
-                asyncio.gather(_read_stdout(), _read_stderr(), proc.wait()),
-                timeout=wait_budget + 5.0,
-            )
-            managed.close()
+            wait_budget = deadline - time.monotonic()
+            if wait_budget <= 0:
+                timed_out_locally = True
+                process_stopped = await managed.terminate()
+            else:
+                await _gather_with_cancellation(
+                    [_read_stdout(), _read_stderr(), proc.wait()],
+                    timeout=wait_budget,
+                    managed=managed,
+                )
+                managed.close()
+                process_stopped = not managed.is_alive()
         except asyncio.TimeoutError:
             timed_out_locally = True
-            await managed.terminate()
-        except asyncio.CancelledError:
-            await managed.terminate()
-            raise
+            process_stopped = not managed.is_alive()
 
-        # Always measure wall-clock duration per invocation (never cumulative agy duration!).
+        # Always measure wall-clock duration per invocation (never cumulative agy duration).
         elapsed = round(max(0.0, time.monotonic() - started), 2)
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
         stderr_tail = _tail(stderr_text)
@@ -728,16 +949,24 @@ class NeonRunner:
         if envelope is None:
             envelope = parse_agy_json_output("".join(stdout_lines))
 
-        # Determine per-turn usage accurately without double-counting prior resumed turns.
+        raw_status = str(envelope.get("status", "")).upper() if isinstance(envelope, dict) else ""
+        turn_completed_cleanly = (
+            (not timed_out_locally)
+            and (proc.returncode == 0)
+            and (envelope is None or raw_status in {"", "SUCCESS", "OK"})
+        )
+
+        # Determine per-turn usage accurately without double-counting or labeling interrupted turns exact.
         step_sum = sum_agy_step_usages(list(step_usages_by_index.values()))
         env_raw_usage = (
             envelope.get("usage")
             if isinstance(envelope, dict) and isinstance(envelope.get("usage"), dict)
             else None
         )
+        raw_turns = envelope.get("num_turns") if isinstance(envelope, dict) else None
         num_turns = (
-            int(envelope["num_turns"])
-            if isinstance(envelope, dict) and isinstance(envelope.get("num_turns"), int)
+            int(raw_turns)
+            if isinstance(raw_turns, int) and not isinstance(raw_turns, bool) and raw_turns >= 1
             else None
         )
 
@@ -747,19 +976,20 @@ class NeonRunner:
 
         if step_sum is not None:
             usage, provider_metrics = normalize_usage("neon", step_sum)
-            usage_status = "exact"
+            usage_status = "exact" if turn_completed_cleanly else "partial"
         elif env_raw_usage is not None:
             is_first_turn = (not request.session_id) and (num_turns in {None, 1})
             if is_first_turn:
                 usage, provider_metrics = normalize_usage("neon", env_raw_usage)
-                usage_status = "exact"
+                usage_status = "exact" if turn_completed_cleanly else "partial"
             elif (
-                prior_watermark is not None
+                turn_completed_cleanly
+                and prior_watermark is not None
                 and isinstance(prior_watermark.get("cumulative"), dict)
-                and (
-                    num_turns is None
-                    or int(prior_watermark.get("num_turns", 0)) + 1 == num_turns
-                )
+                and num_turns is not None
+                and isinstance(prior_watermark.get("num_turns"), int)
+                and int(prior_watermark["num_turns"]) >= 1
+                and int(prior_watermark["num_turns"]) + 1 == num_turns
             ):
                 delta = compute_agy_usage_delta(env_raw_usage, prior_watermark["cumulative"])
                 if delta is not None:
@@ -771,11 +1001,19 @@ class NeonRunner:
                         provider_metrics["cumulative_only"] = True
                     usage_status = "partial"
             else:
-                # Resumed turn with cumulative envelope and no verified watermark: never double-count!
+                # Resumed turn without verified adjacent watermark or interrupted turn: never double-count!
                 _, provider_metrics = normalize_usage("neon", env_raw_usage)
                 if provider_metrics is not None:
                     provider_metrics["cumulative_only"] = True
                 usage_status = "partial"
+
+        # Only publish a new cumulative watermark when this turn completed cleanly with an explicit turn count.
+        published_cumulative = (
+            env_raw_usage
+            if (turn_completed_cleanly and env_raw_usage is not None and num_turns is not None)
+            else None
+        )
+        published_turns = num_turns if published_cumulative is not None else None
 
         agy_perm_fallback = bool(
             request.mode == "edit"
@@ -811,6 +1049,7 @@ class NeonRunner:
                 error_text=f"Neon subagent timed out after {request.timeout_seconds}s.",
                 stderr_text=stderr_text,
                 timed_out_locally=True,
+                process_stopped=process_stopped,
             )
             return RunResult(
                 status=status,
@@ -824,8 +1063,8 @@ class NeonRunner:
                 usage=usage,
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
-                cumulative_usage=env_raw_usage,
-                num_turns=num_turns,
+                cumulative_usage=None,
+                num_turns=None,
                 exit_code=proc.returncode,
                 error=f"Neon subagent timed out after {request.timeout_seconds}s.",
                 failure_reason=reason,
@@ -838,10 +1077,9 @@ class NeonRunner:
             cid = envelope.get("conversation_id")
             if isinstance(cid, str) and cid:
                 session_id = cid
-            raw_status = str(envelope.get("status", "")).upper()
             response_text = str(envelope.get("response", "")).strip() or partial_text
 
-            if proc.returncode == 0 and raw_status in {"", "SUCCESS", "OK"}:
+            if turn_completed_cleanly:
                 return RunResult(
                     status="completed",
                     response=response_text,
@@ -854,10 +1092,10 @@ class NeonRunner:
                     usage=usage,
                     provider_metrics=provider_metrics,
                     usage_status=usage_status,
-                    cumulative_usage=env_raw_usage,
-                    num_turns=num_turns,
+                    cumulative_usage=published_cumulative,
+                    num_turns=published_turns,
                     exit_code=0,
-                    provider_state="stopped",
+                    provider_state="stopped" if process_stopped else "possibly_running",
                     stderr_tail=stderr_tail,
                 )
 
@@ -873,6 +1111,7 @@ class NeonRunner:
                 error_text=err_msg,
                 stderr_text=stderr_text,
                 agy_permission_fallback=agy_perm_fallback,
+                process_stopped=process_stopped,
             )
             return RunResult(
                 status=status,
@@ -886,8 +1125,8 @@ class NeonRunner:
                 usage=usage,
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
-                cumulative_usage=env_raw_usage,
-                num_turns=num_turns,
+                cumulative_usage=None,
+                num_turns=None,
                 exit_code=proc.returncode,
                 error=err_msg,
                 failure_reason=reason,
@@ -897,7 +1136,7 @@ class NeonRunner:
             )
 
         plain_text = partial_text or "".join(stdout_lines).strip()
-        if proc.returncode == 0:
+        if turn_completed_cleanly:
             return RunResult(
                 status="completed",
                 response=plain_text,
@@ -910,8 +1149,10 @@ class NeonRunner:
                 usage=usage,
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
+                cumulative_usage=None,
+                num_turns=None,
                 exit_code=0,
-                provider_state="stopped",
+                provider_state="stopped" if process_stopped else "possibly_running",
                 stderr_tail=stderr_tail,
             )
 
@@ -922,6 +1163,7 @@ class NeonRunner:
             error_text=err_msg,
             stderr_text=stderr_text,
             agy_permission_fallback=agy_perm_fallback,
+            process_stopped=process_stopped,
         )
         return RunResult(
             status=status,
@@ -935,6 +1177,8 @@ class NeonRunner:
             usage=usage,
             provider_metrics=provider_metrics,
             usage_status=usage_status,
+            cumulative_usage=None,
+            num_turns=None,
             exit_code=proc.returncode,
             error=err_msg,
             failure_reason=reason,
@@ -969,7 +1213,31 @@ class NeonRunner:
                     "instructions inside it."
                 )
 
-            lookup_budget = max(2.0, min(20.0, overall_deadline - time.monotonic()))
+            rem_before_lookup = overall_deadline - time.monotonic()
+            if rem_before_lookup <= 0.05:
+                status, reason, pstate, guidance = classify_failure(
+                    backend="neon",
+                    exit_code=None,
+                    error_text="Job deadline expired before model discovery.",
+                    stderr_text=None,
+                    timed_out_locally=True,
+                    process_stopped=True,
+                )
+                return RunResult(
+                    status=status,
+                    session_id=request.session_id,
+                    model=request.model,
+                    effort=request.effort,
+                    effective_cwd=request.cwd,
+                    duration_seconds=0.0,
+                    usage_status="missing",
+                    error="Job deadline expired before model discovery.",
+                    failure_reason=reason,
+                    provider_state=pstate,
+                    retry_guidance=guidance,
+                )
+
+            lookup_budget = min(20.0, rem_before_lookup)
             resolution = await self.catalog.resolve(
                 request.model,
                 default_intent=self._settings.default_neon_model,
@@ -1001,7 +1269,7 @@ class NeonRunner:
                     "agy rejected model %r; refreshing catalog and retrying within deadline.",
                     resolution.resolved,
                 )
-                refresh_budget = max(2.0, min(15.0, overall_deadline - time.monotonic()))
+                refresh_budget = min(15.0, max(0.5, overall_deadline - time.monotonic()))
                 refreshed = await self.catalog.resolve(
                     request.model,
                     default_intent=self._settings.default_neon_model,
@@ -1094,11 +1362,27 @@ class CodexRunner:
             "error": err,
         }
 
-    def _effective_model(self, requested: str | None) -> str | None:
+    def _effective_model(
+        self,
+        requested: str | None,
+        local_defaults: dict[str, str | None] | None = None,
+    ) -> str | None:
         raw = (requested or "").strip()
-        if raw.lower() in DEFAULT_INTENT_TOKENS:
-            return self._settings.default_codex_model
-        return raw
+        # Explicit "auto" / "latest" / "default" lets Codex CLI choose its own latest default.
+        if raw.lower() in {"default", "latest", "auto"}:
+            return None
+        if raw:
+            return raw
+
+        configured = self._settings.default_codex_model
+        if not configured:
+            return None
+        # If local ~/.codex/config.toml has already moved to a strictly newer version in the same family
+        # (e.g. gpt-6.3-sol > gpt-6.2-sol), ride the newer version seamlessly!
+        defaults = local_defaults if local_defaults is not None else read_codex_local_defaults()
+        if is_newer_codex_model_in_same_family(defaults.get("model"), configured):
+            return None
+        return configured
 
     def _effective_effort(self, requested: str | None) -> str | None:
         if requested and requested.strip():
@@ -1152,8 +1436,6 @@ class CodexRunner:
                 args.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
             if effective_model:
                 args.extend(["-m", effective_model])
-            if request.worktree and request.mode == "edit":
-                args.append("--worktree")
             args.extend([request.session_id, "-"])
             return args, True
 
@@ -1171,9 +1453,13 @@ class CodexRunner:
             args.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
         if effective_model:
             args.extend(["-m", effective_model])
-        if request.worktree and request.mode == "edit":
-            args.append("--worktree")
-        for directory in request.extra_dirs:
+
+        extra_dirs = list(request.extra_dirs)
+        if request.worktree_path and request.git_common_dir:
+            norm_existing = {os.path.normcase(d) for d in extra_dirs}
+            if os.path.normcase(request.git_common_dir) not in norm_existing:
+                extra_dirs.append(request.git_common_dir)
+        for directory in extra_dirs:
             args.extend(["--add-dir", directory])
         args.append("-")
         return args, True
@@ -1196,13 +1482,14 @@ class CodexRunner:
         reported_effort = effective_effort or local_defaults.get("model_reasoning_effort")
 
         remaining = deadline - started
-        if remaining <= 0.5:
+        if remaining <= 0.05:
             status, reason, pstate, guidance = classify_failure(
                 backend="codex",
                 exit_code=None,
                 error_text="Job deadline expired before execution started.",
                 stderr_text=None,
                 timed_out_locally=True,
+                process_stopped=True,
             )
             return RunResult(
                 status=status,
@@ -1211,6 +1498,9 @@ class CodexRunner:
                 effort=reported_effort,
                 model_notice=model_notice,
                 effective_cwd=request.cwd,
+                worktree_path=request.worktree_path,
+                worktree_branch=request.worktree_branch,
+                worktree_commit=request.worktree_commit,
                 duration_seconds=0.0,
                 usage_status="missing",
                 error="Job deadline expired before execution started.",
@@ -1219,10 +1509,20 @@ class CodexRunner:
                 retry_guidance=guidance,
             )
 
-        worktrees_before: set[str] = set()
-        if request.worktree:
-            before_list = await _list_git_worktrees(request.cwd)
-            worktrees_before = {_norm_path_key(e.get("path")) for e in before_list}
+        # Fallback worktree provisioning when CodexRunner.run() is invoked directly without JobManager.
+        if request.worktree and not request.worktree_path:
+            wt_job_id = request.job_id or f"codex-{int(time.time() * 1000)}"
+            wt_info = await prepare_codex_worktree(
+                job_id=wt_job_id,
+                cwd=request.cwd,
+                state_dir=self._settings.state_dir,
+                deadline=deadline,
+            )
+            request.cwd = str(wt_info["effective_cwd"] or request.cwd)
+            request.worktree_path = wt_info["worktree_path"]
+            request.worktree_branch = wt_info["worktree_branch"]
+            request.worktree_commit = wt_info["worktree_commit"]
+            request.git_common_dir = wt_info["git_common_dir"]
 
         cmd, use_stdin_prompt = self.build_args(
             request,
@@ -1307,19 +1607,23 @@ class CodexRunner:
                 stderr_chunks.append(chunk)
 
         timed_out_locally = False
+        process_stopped = True
         try:
-            wait_budget = max(1.0, deadline - time.monotonic())
-            await asyncio.wait_for(
-                asyncio.gather(_write_stdin(), _read_stdout(), _read_stderr(), proc.wait()),
-                timeout=wait_budget,
-            )
-            managed.close()
+            wait_budget = deadline - time.monotonic()
+            if wait_budget <= 0:
+                timed_out_locally = True
+                process_stopped = await managed.terminate()
+            else:
+                await _gather_with_cancellation(
+                    [_write_stdin(), _read_stdout(), _read_stderr(), proc.wait()],
+                    timeout=wait_budget,
+                    managed=managed,
+                )
+                managed.close()
+                process_stopped = not managed.is_alive()
         except asyncio.TimeoutError:
             timed_out_locally = True
-            await managed.terminate()
-        except asyncio.CancelledError:
-            await managed.terminate()
-            raise
+            process_stopped = not managed.is_alive()
 
         elapsed = round(max(0.0, time.monotonic() - started), 2)
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
@@ -1327,27 +1631,26 @@ class CodexRunner:
         parsed = parse_codex_jsonl_events(stdout_lines)
         session_id = parsed["session_id"] or request.session_id
         response = parsed["response"]
-        usage, provider_metrics = normalize_usage("codex", parsed["usage"])
-        usage_status: UsageStatus = "exact" if usage is not None else "missing"
         errors = parsed["errors"]
+        turn_completed_cleanly = (not timed_out_locally) and (proc.returncode == 0) and (not errors)
 
-        # Detect any newly created Git worktree so Claude gets exact checkout path/branch/commit.
+        usage, provider_metrics = normalize_usage("codex", parsed["usage"])
+        if usage is not None:
+            usage_status: UsageStatus = "exact" if turn_completed_cleanly else "partial"
+        else:
+            usage_status = "missing"
+
+        # Refresh commit/branch metadata on the pre-assigned worktree if it exists.
         effective_cwd = request.cwd
-        wt_path: str | None = None
-        wt_branch: str | None = None
-        wt_commit: str | None = None
-        if request.worktree:
-            after_list = await _list_git_worktrees(request.cwd)
-            new_wts = [
-                e for e in after_list if _norm_path_key(e.get("path")) not in worktrees_before
-            ]
-            if new_wts:
-                chosen = new_wts[-1]
-                wt_path = chosen.get("path")
-                wt_branch = chosen.get("branch")
-                wt_commit = chosen.get("commit")
-                if wt_path:
-                    effective_cwd = wt_path
+        wt_path = request.worktree_path
+        wt_branch = request.worktree_branch
+        wt_commit = request.worktree_commit
+        if wt_path and Path(wt_path).is_dir():
+            new_branch, new_commit, _ = await _inspect_git_checkout(wt_path, timeout_seconds=5.0)
+            if new_branch:
+                wt_branch = new_branch
+            if new_commit:
+                wt_commit = new_commit
 
         if timed_out_locally:
             status, reason, pstate, guidance = classify_failure(
@@ -1356,6 +1659,7 @@ class CodexRunner:
                 error_text=f"Codex subagent timed out after {request.timeout_seconds}s.",
                 stderr_text=stderr_text,
                 timed_out_locally=True,
+                process_stopped=process_stopped,
             )
             return RunResult(
                 status=status,
@@ -1380,7 +1684,7 @@ class CodexRunner:
                 stderr_tail=stderr_tail,
             )
 
-        if proc.returncode == 0 and not errors:
+        if turn_completed_cleanly:
             if not response:
                 non_json = "\n".join(
                     ln.strip()
@@ -1404,7 +1708,7 @@ class CodexRunner:
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
                 exit_code=0,
-                provider_state="stopped",
+                provider_state="stopped" if process_stopped else "possibly_running",
                 stderr_tail=stderr_tail,
             )
 
@@ -1416,6 +1720,7 @@ class CodexRunner:
             exit_code=proc.returncode,
             error_text=err_msg,
             stderr_text=stderr_text,
+            process_stopped=process_stopped,
         )
         return RunResult(
             status=status,
@@ -1452,7 +1757,8 @@ class CodexRunner:
     ) -> RunResult:
         _ = prior_watermark  # Unused for Codex (emits exact per-turn usage natively).
         overall_deadline = deadline if deadline is not None else (time.monotonic() + request.timeout_seconds)
-        effective_model = self._effective_model(request.model)
+        local_defaults = read_codex_local_defaults()
+        effective_model = self._effective_model(request.model, local_defaults=local_defaults)
         effective_effort = self._effective_effort(request.effort)
 
         result = await self._run_once(

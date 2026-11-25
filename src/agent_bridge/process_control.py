@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import ctypes
 import logging
 import os
@@ -113,20 +114,72 @@ def subprocess_creation_kwargs() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
-class ManagedProcess:
-    """Single-owner subprocess wrapper that guarantees descendant cleanup even after leader exit."""
+class ProcessTracker:
+    """Tracks every subprocess spawned for one job so cleanup and stop verification are airtight."""
 
-    def __init__(self, proc: asyncio.subprocess.Process) -> None:
+    def __init__(self) -> None:
+        self._active: set[ManagedProcess] = set()
+        self._unverified_stop: bool = False
+
+    def register(self, managed: ManagedProcess) -> None:
+        self._active.add(managed)
+
+    def unregister(self, managed: ManagedProcess, *, verified_stopped: bool = True) -> None:
+        self._active.discard(managed)
+        if not verified_stopped:
+            self._unverified_stop = True
+
+    def has_alive_processes(self) -> bool:
+        return any(m.is_alive() for m in list(self._active))
+
+    def terminate_all_sync(self) -> None:
+        for managed in list(self._active):
+            managed.terminate_sync()
+
+    async def terminate_all_and_verify(self) -> bool:
+        """Terminate all remaining tracked processes and return True only if all are verified stopped."""
+        all_stopped = True
+        for managed in list(self._active):
+            try:
+                stopped = await managed.terminate()
+            except BaseException:
+                managed.terminate_sync()
+                stopped = not managed.is_alive()
+            if not stopped:
+                all_stopped = False
+        return all_stopped and not self._unverified_stop and not self.has_alive_processes()
+
+
+CURRENT_PROCESS_TRACKER: contextvars.ContextVar[ProcessTracker | None] = contextvars.ContextVar(
+    "agent_bridge_process_tracker",
+    default=None,
+)
+
+
+class ManagedProcess:
+    """Single-owner subprocess wrapper that guarantees descendant cleanup and verifies exit."""
+
+    def __init__(
+        self,
+        proc: asyncio.subprocess.Process,
+        *,
+        tracker: ProcessTracker | None = None,
+    ) -> None:
         self.proc = proc
         self._job_handle: int | None = None
         self._pgid: int | None = None
-        self._cleaned_up = False
+        self._closed_cleanly = False
+        self._terminated_verified = False
+        self._tracker = tracker if tracker is not None else CURRENT_PROCESS_TRACKER.get()
 
         if sys.platform == "win32":
             self._attach_windows_job_object(proc.pid)
         else:
             # With start_new_session=True, pgid equals child's pid.
             self._pgid = proc.pid
+
+        if self._tracker is not None:
+            self._tracker.register(self)
 
     def _attach_windows_job_object(self, pid: int) -> None:
         try:
@@ -162,12 +215,16 @@ class ManagedProcess:
         except Exception as exc:
             logger.debug("Could not attach Windows Job Object to pid %s: %s", pid, exc)
 
-    async def terminate(self) -> None:
-        """Terminate the process and all descendants cleanly (idempotent)."""
-        if self._cleaned_up:
-            return
-        self._cleaned_up = True
+    def is_alive(self) -> bool:
+        """Return True if the child process has not yet been confirmed exited."""
+        if self.proc.returncode is not None:
+            return False
+        if self.proc.pid is None:
+            return False
+        return is_pid_alive(self.proc.pid)
 
+    def terminate_sync(self) -> None:
+        """Best-effort synchronous kill safe to call even during nested cancellation."""
         if sys.platform == "win32":
             if self._job_handle is not None:
                 try:
@@ -180,62 +237,137 @@ class ManagedProcess:
                     except Exception:
                         pass
                     self._job_handle = None
-            elif self.proc.returncode is None:
+            if self.proc.returncode is None:
                 try:
-                    killer = await asyncio.create_subprocess_exec(
-                        "taskkill",
-                        "/PID",
-                        str(self.proc.pid),
-                        "/T",
-                        "/F",
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await asyncio.wait_for(killer.wait(), timeout=5.0)
+                    self.proc.kill()
+                except ProcessLookupError:
+                    pass
                 except Exception:
-                    try:
-                        self.proc.kill()
-                    except ProcessLookupError:
-                        pass
+                    pass
         else:
             pgid = self._pgid or self.proc.pid
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except Exception:
-                if self.proc.returncode is None:
-                    try:
-                        self.proc.terminate()
-                    except ProcessLookupError:
-                        pass
-            try:
-                await asyncio.wait_for(self.proc.wait(), timeout=2.5)
-            except asyncio.TimeoutError:
+            if pgid:
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 except Exception:
-                    if self.proc.returncode is None:
+                    pass
+            if self.proc.returncode is None:
+                try:
+                    self.proc.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+
+    async def terminate(self) -> bool:
+        """Terminate the process and all descendants cleanly, returning True only if verified stopped."""
+        if self._terminated_verified or (self._closed_cleanly and not self.is_alive()):
+            if self._tracker is not None:
+                self._tracker.unregister(self, verified_stopped=True)
+            return True
+
+        try:
+            if sys.platform == "win32":
+                if self._job_handle is not None:
+                    try:
+                        _kernel32.TerminateJobObject(wintypes.HANDLE(self._job_handle), 1)
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            _kernel32.CloseHandle(wintypes.HANDLE(self._job_handle))
+                        except Exception:
+                            pass
+                        self._job_handle = None
+
+                if self.proc.returncode is None:
+                    try:
+                        await asyncio.wait_for(self.proc.wait(), timeout=1.5)
+                    except asyncio.TimeoutError:
+                        pass
+
+                if self.proc.returncode is None and self.proc.pid:
+                    try:
+                        killer = await asyncio.create_subprocess_exec(
+                            "taskkill",
+                            "/PID",
+                            str(self.proc.pid),
+                            "/T",
+                            "/F",
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await asyncio.wait_for(killer.wait(), timeout=5.0)
+                    except Exception:
                         try:
                             self.proc.kill()
                         except ProcessLookupError:
                             pass
+                        except Exception:
+                            pass
+            else:
+                pgid = self._pgid or self.proc.pid
+                if pgid:
+                    try:
+                        os.killpg(pgid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    except Exception:
+                        if self.proc.returncode is None:
+                            try:
+                                self.proc.terminate()
+                            except ProcessLookupError:
+                                pass
+                if self.proc.returncode is None:
+                    try:
+                        await asyncio.wait_for(self.proc.wait(), timeout=2.5)
+                    except asyncio.TimeoutError:
+                        if pgid:
+                            try:
+                                os.killpg(pgid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            except Exception:
+                                if self.proc.returncode is None:
+                                    try:
+                                        self.proc.kill()
+                                    except ProcessLookupError:
+                                        pass
 
-        try:
-            await asyncio.wait_for(self.proc.wait(), timeout=3.0)
-        except Exception:
-            pass
+            if self.proc.returncode is None:
+                try:
+                    await asyncio.wait_for(self.proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    pass
+        except BaseException:
+            # Even if terminate() itself is cancelled mid-await, synchronously force-kill the tree.
+            self.terminate_sync()
+            stopped_now = not self.is_alive()
+            self._terminated_verified = stopped_now
+            if self._tracker is not None:
+                self._tracker.unregister(self, verified_stopped=stopped_now)
+            raise
+
+        stopped = not self.is_alive()
+        self._terminated_verified = stopped
+        if self._tracker is not None:
+            self._tracker.unregister(self, verified_stopped=stopped)
+        return stopped
 
     def close(self) -> None:
         """Release kernel handles after a normal exit (also reaps lingering descendants on Windows)."""
-        if self._cleaned_up:
+        if self._closed_cleanly:
             return
-        self._cleaned_up = True
+        self._closed_cleanly = True
         if sys.platform == "win32" and self._job_handle is not None:
             try:
                 _kernel32.CloseHandle(wintypes.HANDLE(self._job_handle))
             except Exception:
                 pass
             self._job_handle = None
+        if self._tracker is not None:
+            self._tracker.unregister(self, verified_stopped=not self.is_alive())

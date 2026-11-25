@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from agent_bridge.config import BackendName, EffortLevel, ExecutionMode
+from agent_bridge.config import BackendName, EffortLevel, ExecutionMode, QuotaPool, classify_quota_pool
 
 JobStatus = Literal[
     "queued",
@@ -34,7 +34,13 @@ class RunRequest:
     model: str | None = None
     effort: EffortLevel | None = None
     session_id: str | None = None
+    resume_from_job_id: str | None = None
+    explicit_cwd: bool = False
     worktree: bool = False
+    worktree_path: str | None = None
+    worktree_branch: str | None = None
+    worktree_commit: str | None = None
+    git_common_dir: str | None = None
     extra_dirs: list[str] = field(default_factory=list)
     timeout_seconds: int = 300
     label: str | None = None
@@ -42,6 +48,7 @@ class RunRequest:
     review_scope: Literal["uncommitted", "base", "commit"] | None = None
     review_base: str | None = None
     review_commit: str | None = None
+    job_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -80,6 +87,7 @@ class JobRecord:
     requested_model: str | None
     model: str | None
     prompt_preview: str
+    quota_pool: QuotaPool | None = None
     effective_cwd: str | None = None
     effort: str | None = None
     label: str | None = None
@@ -121,10 +129,12 @@ class JobRecord:
         return 0.0
 
     def to_summary(self) -> dict[str, Any]:
+        pool = self.quota_pool or classify_quota_pool(self.backend, self.model or self.requested_model)
         out: dict[str, Any] = {
             "job_id": self.job_id,
             "owner_id": self.owner_id,
             "backend": self.backend,
+            "quota_pool": pool,
             "status": self.status,
             "mode": self.mode,
             "model": self.model or self.requested_model or f"{self.backend}-default",
@@ -167,10 +177,12 @@ class JobRecord:
             response = response[:max_response_chars] + "\n...[truncated]"
             truncated = True
 
+        pool = self.quota_pool or classify_quota_pool(self.backend, self.model or self.requested_model)
         out: dict[str, Any] = {
             "job_id": self.job_id,
             "owner_id": self.owner_id,
             "backend": self.backend,
+            "quota_pool": pool,
             "status": self.status,
             "mode": self.mode,
             "model": self.model or self.requested_model or f"{self.backend}-default",
@@ -188,8 +200,9 @@ class JobRecord:
             out["label"] = self.label
         if self.parent_run:
             out["parent_run"] = self.parent_run
-        if self.worktree:
-            out["worktree"] = True
+        if self.worktree or self.worktree_path:
+            if self.worktree:
+                out["worktree"] = True
             if self.worktree_path:
                 out["worktree_path"] = self.worktree_path
             if self.worktree_branch:

@@ -11,6 +11,7 @@ import pytest
 from agent_bridge.model_resolver import (
     NeonModelCatalog,
     is_model_unavailable_error,
+    is_newer_codex_model_in_same_family,
     parse_agy_model_id,
 )
 
@@ -183,3 +184,58 @@ async def test_empty_catalog_falls_back_to_cli_default(tmp_path: Path) -> None:
 )
 def test_is_model_unavailable_error(text: str, expected: bool) -> None:
     assert is_model_unavailable_error(text) is expected
+
+
+async def test_agy_claude_and_gpt_pool_resolution_and_future_upgrades(tmp_path: Path) -> None:
+    full_catalog = [
+        *SAMPLE_CATALOG_V4,
+        {"id": "claude-opus-5-5-low", "label": "Claude Opus 5.5 (Low)"},
+        {"id": "claude-opus-5-5-medium", "label": "Claude Opus 5.5 (Medium)"},
+        {"id": "claude-opus-5-5-high", "label": "Claude Opus 5.5 (High)"},
+        {"id": "claude-sonnet-5-5-low", "label": "Claude Sonnet 5.5 (Low)"},
+        {"id": "claude-sonnet-5-5-medium", "label": "Claude Sonnet 5.5 (Medium)"},
+        {"id": "claude-sonnet-5-5-high", "label": "Claude Sonnet 5.5 (High)"},
+        {"id": "gpt-oss-120b-medium", "label": "GPT-OSS 120B (Medium)"},
+    ]
+
+    async def fetch() -> list[dict[str, str]]:
+        return list(full_catalog)
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models_3p.json")
+
+    assert (await catalog.resolve("claude")).resolved == "claude-sonnet-5-5-high"
+    assert (await catalog.resolve("claude-sonnet-medium")).resolved == "claude-sonnet-5-5-medium"
+    assert (await catalog.resolve("claude-opus")).resolved == "claude-opus-5-5-high"
+    assert (await catalog.resolve("opus-low")).resolved == "claude-opus-5-5-low"
+    assert (await catalog.resolve("agy-opus")).resolved == "claude-opus-5-5-high"
+    assert (await catalog.resolve("gpt-oss")).resolved == "gpt-oss-120b-medium"
+    assert (await catalog.resolve("agy-gpt")).resolved == "gpt-oss-120b-medium"
+
+    pools = catalog.group_models_by_quota_pool()
+    assert "gemini-4-neon-high" in pools["agy_gemini"]
+    assert "claude-opus-5-5-high" in pools["agy_claude_gpt"]
+    assert "claude-sonnet-5-5-high" in pools["agy_claude_gpt"]
+    assert "gpt-oss-120b-medium" in pools["agy_claude_gpt"]
+    assert "claude-opus-5-5-high" not in pools["agy_gemini"]
+
+    # Future versions of Claude / GPT-OSS auto-upgrade seamlessly.
+    upgraded = [
+        *full_catalog,
+        {"id": "claude-sonnet-6-high", "label": "Claude Sonnet 6 (High)"},
+        {"id": "gpt-oss-240b-medium", "label": "GPT-OSS 240B (Medium)"},
+    ]
+
+    async def fetch_v2() -> list[dict[str, str]]:
+        return list(upgraded)
+
+    cat2 = NeonModelCatalog(fetcher=fetch_v2, cache_path=tmp_path / "models_3p_v2.json")
+    assert (await cat2.resolve("claude-sonnet-high")).resolved == "claude-sonnet-6-high"
+    assert (await cat2.resolve("gpt-oss")).resolved == "gpt-oss-240b-medium"
+
+
+def test_codex_same_family_version_comparison() -> None:
+    assert is_newer_codex_model_in_same_family("gpt-6.3-sol", "gpt-6.2-sol") is True
+    assert is_newer_codex_model_in_same_family("gpt-7-sol", "gpt-6.2-sol") is True
+    assert is_newer_codex_model_in_same_family("gpt-6.2-sol", "gpt-6.2-sol") is False
+    assert is_newer_codex_model_in_same_family("gpt-6.1-sol", "gpt-6.2-sol") is False
+    assert is_newer_codex_model_in_same_family("o4-mini", "gpt-6.2-sol") is False

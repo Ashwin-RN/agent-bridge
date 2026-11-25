@@ -1,7 +1,8 @@
-"""Dynamic, effort-preserving, self-healing model resolution for Neon (`agy`) and Codex."""
+"""Dynamic, effort-preserving, provider-aware, self-healing model resolution for `agy` and Codex."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from agent_bridge.config import classify_quota_pool
 
 logger = logging.getLogger("agent_bridge.model_resolver")
 
@@ -37,6 +40,9 @@ TIER_FALLBACK_ORDER: dict[str, tuple[str, ...]] = {
 }
 DEFAULT_INTENT_TOKENS: frozenset[str] = frozenset({"", "default", "latest", "auto"})
 
+_CLAUDE_FAMILIES: frozenset[str] = frozenset({"opus", "sonnet", "haiku"})
+_GPT_FAMILIES: frozenset[str] = frozenset({"oss"})
+
 MODEL_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(unknown|invalid|unsupported|unavailable|deprecated|retired)\s+model\b", re.I),
     re.compile(
@@ -53,6 +59,32 @@ def is_model_unavailable_error(text: str | None) -> bool:
     if not text:
         return False
     return any(pattern.search(text) for pattern in MODEL_ERROR_PATTERNS)
+
+
+def parse_codex_model_family_version(model_id: str | None) -> tuple[str, tuple[int, ...]] | None:
+    """Extract `(family_key, version_tuple)` from Codex model IDs like `gpt-6.2-sol` -> `('gpt-sol', (6, 2))`."""
+    if not model_id or not model_id.strip():
+        return None
+    tokens = [t for t in model_id.strip().lower().split("-") if t]
+    ver: list[int] = []
+    family_parts: list[str] = []
+    for tok in tokens:
+        if re.fullmatch(r"\d+(?:\.\d+)*", tok):
+            ver.extend(int(piece) for piece in tok.split("."))
+        else:
+            family_parts.append(tok)
+    if not ver or not family_parts:
+        return None
+    return "-".join(family_parts), tuple(ver)
+
+
+def is_newer_codex_model_in_same_family(candidate: str | None, baseline: str | None) -> bool:
+    """Return True if `candidate` is a strictly newer version of the same Codex model family as `baseline`."""
+    p_cand = parse_codex_model_family_version(candidate)
+    p_base = parse_codex_model_family_version(baseline)
+    if p_cand is None or p_base is None:
+        return False
+    return p_cand[0] == p_base[0] and p_cand[1] > p_base[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +106,7 @@ class ResolvedModel:
 
 
 def parse_agy_model_id(model_id: str, label: str = "") -> ParsedModel:
-    """Parse an `agy` model ID like `gemini-4-neon-xhigh` or `gemini-3.8-flash-high`."""
+    """Parse an `agy` model ID like `gemini-4-neon-xhigh`, `claude-opus-5-5-high`, or `gpt-oss-120b-medium`."""
     lower = model_id.strip().lower()
     tokens = [t for t in lower.split("-") if t]
 
@@ -92,6 +124,9 @@ def parse_agy_model_id(model_id: str, label: str = "") -> ParsedModel:
     for tok in rest:
         if re.fullmatch(r"\d+(?:\.\d+)*", tok):
             version_parts.extend(int(piece) for piece in tok.split("."))
+        elif re.fullmatch(r"\d+b", tok):
+            # Parameter count token such as `120b` in `gpt-oss-120b-medium`.
+            version_parts.append(int(tok[:-1]))
         else:
             family_parts.append(tok)
 
@@ -111,25 +146,32 @@ def _parse_intent(
     requested: str,
     *,
     effort_override: str | None = None,
-) -> tuple[str | None, str | None, bool, bool]:
-    """Return `(family, desired_tier, tier_explicit, is_versioned_literal)`."""
+) -> tuple[str | None, str | None, str | None, bool, bool]:
+    """Return `(desired_provider, family, desired_tier, tier_explicit, is_versioned_literal)`."""
     raw = requested.strip().lower()
     norm_effort = TIER_ALIASES.get(effort_override.strip().lower()) if effort_override else None
 
     if raw in DEFAULT_INTENT_TOKENS:
         if norm_effort:
-            return ("neon", norm_effort, True, False)
-        return ("neon", "high", False, False)
+            return ("gemini", "neon", norm_effort, True, False)
+        return ("gemini", "neon", "high", False, False)
 
     if raw in TIER_ALIASES:
         tier = norm_effort or TIER_ALIASES[raw]
-        return ("neon", tier, True, False)
+        return ("gemini", "neon", tier, True, False)
 
-    has_version = bool(re.search(r"(?:^|-)(\d+(?:\.\d+)?)(?:-|$)", raw))
+    # Convenience pool/provider shortcuts like `agy-claude`, `agy-opus`, `agy-sonnet`, `agy-gpt`.
+    if raw.startswith("agy-"):
+        raw = raw[4:]
+    elif raw.startswith("agy_"):
+        raw = raw[4:]
+
+    has_version = bool(re.search(r"(?:^|-)(\d+(?:\.\d+)?b?)(?:-|$)", raw))
     if has_version:
         parsed = parse_agy_model_id(raw)
         tier = norm_effort or parsed.tier
-        return (parsed.family, tier, bool(tier), True)
+        prov = parsed.provider if parsed.provider in {"gemini", "claude", "gpt"} else None
+        return (prov, parsed.family, tier, bool(tier), True)
 
     tokens = [t for t in raw.split("-") if t]
     tier: str | None = None
@@ -138,16 +180,35 @@ def _parse_intent(
         tier = TIER_ALIASES[tokens.pop()]
         tier_explicit = True
 
-    if tokens and tokens[0] == "gemini" and len(tokens) > 1:
-        tokens = tokens[1:]
+    desired_provider: str | None = None
+    if tokens and tokens[0] in {"gemini", "claude", "gpt"}:
+        desired_provider = tokens[0]
+        if len(tokens) > 1:
+            tokens = tokens[1:]
+        else:
+            # Bare provider shortcut: `claude` -> claude/sonnet, `gpt` -> gpt/oss, `gemini` -> gemini/neon
+            if desired_provider == "claude":
+                tokens = ["sonnet"]
+            elif desired_provider == "gpt":
+                tokens = ["oss"]
+            else:
+                tokens = ["neon"]
 
     family = "-".join(tokens) if tokens else "neon"
+    if desired_provider is None:
+        if family in _CLAUDE_FAMILIES or any(f in family.split("-") for f in _CLAUDE_FAMILIES):
+            desired_provider = "claude"
+        elif family in _GPT_FAMILIES or "oss" in family.split("-"):
+            desired_provider = "gpt"
+        else:
+            desired_provider = "gemini"
+
     if norm_effort:
         tier = norm_effort
         tier_explicit = True
     elif tier is None:
-        tier = "high"
-    return (family, tier, tier_explicit, False)
+        tier = "high" if desired_provider != "gpt" else "medium"
+    return (desired_provider, family, tier, tier_explicit, False)
 
 
 def _select_from_catalog(
@@ -158,9 +219,9 @@ def _select_from_catalog(
 ) -> ResolvedModel | None:
     """Resolve `requested` against a non-empty `agy models` catalog.
 
-    Preserves the requested effort tier by default (selecting the newest model version that
-    offers that tier), and always attaches a `notice` when substituting a different tier,
-    upgrading a retired versioned ID, or falling back to another family.
+    Preserves both the requested provider/pool (`gemini`, `claude`, `gpt`) and effort tier by default,
+    and always attaches a `notice` when substituting a tier, upgrading a retired versioned ID,
+    or falling back to another family.
     """
     if not catalog:
         return None
@@ -183,7 +244,7 @@ def _select_from_catalog(
     if not parsed_catalog:
         return None
 
-    family, desired_tier, tier_explicit, is_versioned_literal = _parse_intent(
+    desired_provider, family, desired_tier, tier_explicit, is_versioned_literal = _parse_intent(
         req_clean,
         effort_override=effort_override,
     )
@@ -194,26 +255,40 @@ def _select_from_catalog(
         if want_orchestrator or not m.is_orchestrator
     ] or parsed_catalog
 
-    family_matches = [m for m in pool if family and m.family == family]
+    provider_pool = (
+        [m for m in pool if m.provider == desired_provider]
+        if desired_provider
+        else pool
+    )
+    active_pool = provider_pool or pool
+
+    family_matches = [m for m in active_pool if family and m.family == family]
     if not family_matches and family:
         family_matches = [
-            m for m in pool
+            m for m in active_pool
             if family in m.family or m.family in family
         ]
 
     used_family_fallback = False
     candidates = family_matches
     if not candidates:
-        used_family_fallback = True
-        gemini_pool = [m for m in pool if m.provider == "gemini"]
-        candidates = gemini_pool or pool
+        if provider_pool:
+            # Stay inside requested provider (e.g., claude or gpt) before ever falling back cross-provider!
+            candidates = provider_pool
+            used_family_fallback = req_lower not in {"claude", "gpt", "agy-claude", "agy-gpt"}
+        else:
+            used_family_fallback = True
+            gemini_pool = [m for m in pool if m.provider == "gemini"]
+            candidates = gemini_pool or pool
 
     tier_order = TIER_FALLBACK_ORDER.get(desired_tier or "high", ("high", "xhigh", "medium", "low"))
 
     def _sort_key(m: ParsedModel) -> tuple[int, tuple[int, ...], int]:
         tier_score = len(tier_order) - tier_order.index(m.tier) if m.tier in tier_order else 0
-        prefer_gemini = 1 if m.provider == "gemini" else 0
-        return (prefer_gemini, m.version, tier_score)
+        prefer_provider = 1 if (desired_provider and m.provider == desired_provider) else (
+            1 if (desired_provider is None and m.provider == "gemini") else 0
+        )
+        return (prefer_provider, m.version, tier_score)
 
     tier_substituted = False
     if desired_tier:
@@ -366,7 +441,7 @@ class NeonModelCatalog:
 
         catalog = await self.get_models(refresh=force_refresh, timeout_seconds=timeout_seconds)
         if not catalog:
-            _, _, _, is_versioned = _parse_intent(effective, effort_override=effort_override)
+            _, _, _, _, is_versioned = _parse_intent(effective, effort_override=effort_override)
             if is_versioned and not effort_override:
                 return ResolvedModel(requested=requested or effective, resolved=effective)
             return ResolvedModel(
@@ -421,6 +496,14 @@ class NeonModelCatalog:
             "argon",
             "flash",
             "flash-low",
+            "claude",
+            "claude-sonnet",
+            "claude-sonnet-high",
+            "claude-sonnet-medium",
+            "claude-opus",
+            "claude-opus-high",
+            "claude-opus-medium",
+            "gpt-oss",
         )
         mapping: dict[str, str] = {}
         for alias in shortcuts:
@@ -429,5 +512,13 @@ class NeonModelCatalog:
                 mapping[alias] = res.resolved
         return mapping
 
-
-import asyncio  # noqa: E402
+    def group_models_by_quota_pool(self) -> dict[str, list[str]]:
+        """Group cached `agy` model IDs by their independent Antigravity quota pool."""
+        grouped: dict[str, list[str]] = {"agy_gemini": [], "agy_claude_gpt": []}
+        for entry in self._models:
+            mid = entry.get("id")
+            if not mid:
+                continue
+            pool = classify_quota_pool("neon", mid)
+            grouped.setdefault(pool, []).append(mid)
+        return grouped
