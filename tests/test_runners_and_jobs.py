@@ -2405,3 +2405,484 @@ print(json.dumps({{
     assert res_opt.status == "completed"
     assert "RAN:CLI_DEFAULT_SONNET" in res_opt.response
     assert res_opt.model_notice is not None
+
+
+async def test_worktree_resume_preserves_worktree_when_parent_cwd_passed_unless_relocate_cwd(
+    tmp_path: Path,
+) -> None:
+    """Audit High #1: passing parent checkout `cwd` on a worktree resume preserves the recorded
+    worktree unless `relocate_cwd=True` is explicitly supplied."""
+    import subprocess
+
+    repo = tmp_path / "wt_preserve_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    fake_codex = tmp_path / "fake_codex_wt_resume.py"
+    fake_codex.write_text(
+        """
+import json, os, sys
+
+_ = sys.stdin.read()
+print(json.dumps({"type": "thread.started", "thread_id": "thr-wt-preserve"}), flush=True)
+print(json.dumps({"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": f"CWD={os.getcwd()}"}}), flush=True)
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path, default_cwd=repo)
+    mgr = JobManager(settings, codex_runner=StubCodexRunner(settings, fake_codex))
+
+    t1 = await mgr.run(
+        mgr.prepare_request(
+            backend="codex",
+            prompt="edit in worktree",
+            cwd=str(repo),
+            mode="edit",
+            worktree=True,
+        )
+    )
+    assert t1.status == "completed"
+    assert t1.worktree_path is not None
+    wt_resolved = str(Path(t1.worktree_path).resolve())
+    assert t1.effective_cwd == wt_resolved
+    assert f"CWD={wt_resolved}" in t1.response
+
+    # Resume passing the PARENT checkout `cwd=str(repo)` WITHOUT `relocate_cwd=True`:
+    # MUST stay inside the worktree and preserve worktree metadata!
+    t2 = await mgr.run(
+        mgr.prepare_request(
+            backend="codex",
+            prompt="follow up with parent cwd",
+            cwd=str(repo),
+            mode="edit",
+            resume_from=t1.job_id,
+        )
+    )
+    assert t2.status == "completed"
+    assert t2.worktree_path == wt_resolved
+    assert t2.effective_cwd == wt_resolved
+    assert f"CWD={wt_resolved}" in t2.response
+
+    # Explicit `relocate_cwd=True` moves the session back to `repo` and drops worktree_path.
+    t3 = await mgr.run(
+        mgr.prepare_request(
+            backend="codex",
+            prompt="explicitly relocate",
+            cwd=str(repo),
+            mode="edit",
+            resume_from=t1.job_id,
+            relocate_cwd=True,
+        )
+    )
+    assert t3.status == "completed"
+    assert t3.worktree_path is None
+    assert t3.effective_cwd == str(repo.resolve())
+    assert f"CWD={repo.resolve()}" in t3.response
+    await mgr.shutdown()
+
+
+async def test_sqlite_write_lock_keeps_event_loop_responsive_and_commits_finalization_durably(
+    tmp_path: Path,
+) -> None:
+    """Audit High #2: holding a real SQLite write lock does NOT freeze the MCP event loop and
+    terminal finalization retries idempotently (preserving response, usage, and session claim
+    until SQLite commits)."""
+    import sqlite3
+
+    fake_codex = tmp_path / "fake_codex_lock.py"
+    fake_codex.write_text(
+        """
+import json, sys, time
+
+_ = sys.stdin.read()
+time.sleep(0.15)
+print(json.dumps({"type": "thread.started", "thread_id": "thr-lock-safe"}), flush=True)
+print(json.dumps({"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": "LOCK_SURVIVED_RESULT"}}), flush=True)
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 30, "output_tokens": 12}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(settings, codex_runner=StubCodexRunner(settings, fake_codex))
+    mgr._finalize_retry_seconds = 6.0
+
+    # Launch the job before acquiring the external write lock.
+    job = await mgr.start_async(mgr.prepare_request(backend="codex", prompt="finish under lock"))
+    await asyncio.sleep(0.05)
+
+    # Hold a real external SQLite write lock for 2.2 seconds!
+    locker = sqlite3.connect(str(mgr.store.db_path), isolation_level=None, timeout=1.0)
+    locker.execute("BEGIN IMMEDIATE")
+
+    ticks = 0
+    stop_ticker = False
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop_ticker:
+            ticks += 1
+            await asyncio.sleep(0.05)
+
+    tick_task = asyncio.create_task(ticker())
+    try:
+        # Let worker complete while lock is held, proving event loop stays responsive AND WAL reads work!
+        wait_dl = time.monotonic() + 2.0
+        during_lock = None
+        while time.monotonic() < wait_dl:
+            during_lock = await mgr.get_async(job.job_id)
+            if during_lock.status == "completed":
+                break
+            await asyncio.sleep(0.05)
+        assert ticks >= 6, f"Event loop stalled during SQLite write lock (only {ticks} ticks)"
+        assert during_lock is not None and during_lock.status == "completed"
+        assert "LOCK_SURVIVED_RESULT" in during_lock.response
+        # WAL-concurrent read-only query succeeds immediately while write lock is held!
+        summaries = await mgr.list_jobs_async(limit=5)
+        assert any(s["job_id"] == job.job_id and s["status"] == "completed" for s in summaries)
+
+        await asyncio.sleep(0.8)
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+        stop_ticker = True
+        await tick_task
+
+    # Once the write lock releases, finalization commits cleanly to SQLite with full response + usage!
+    dl = time.monotonic() + 5.0
+    persisted = None
+    while time.monotonic() < dl:
+        persisted = mgr.store.get_job(job.job_id)
+        if persisted is not None and persisted.status == "completed":
+            break
+        await asyncio.sleep(0.05)
+
+    assert persisted is not None
+    assert persisted.status == "completed"
+    assert "LOCK_SURVIVED_RESULT" in persisted.response
+    assert persisted.usage is not None and persisted.usage["total_tokens"] == 42
+    summary = await mgr.get_usage_summary(period="session", compact=True)
+    assert summary["by_backend"]["codex"]["tokens"]["total_tokens"] == 42
+    await mgr.shutdown()
+
+
+async def test_retry_guards_uncertain_and_resumed_turns_and_preserves_attempt_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit High #3: automatic retries never replace an uncertain (`possibly_running`) attempt or
+    a resumed transient error, and valid retries preserve duration + available/partial usage for
+    every attempt."""
+    from agent_bridge.models import RunResult
+
+    settings = _make_settings(tmp_path)
+
+    # Part A: Uncertain attempt (`provider_state="possibly_running"`) MUST NOT trigger retry!
+    calls_a = 0
+    runner_a = CodexRunner(settings)
+
+    async def fake_run_once_uncertain(*_args, **_kwargs) -> RunResult:
+        nonlocal calls_a
+        calls_a += 1
+        return RunResult(
+            status="failed",
+            session_id="thr-unc",
+            model="gpt-6.2-sol",
+            duration_seconds=1.1,
+            usage={"input_tokens": 50, "output_tokens": 10, "total_tokens": 60},
+            usage_status="partial",
+            error="HTTP 503 Service Unavailable",
+            failure_reason="transient_service",
+            provider_state="possibly_running",
+            provider_invoked=True,
+        )
+
+    monkeypatch.setattr(runner_a, "_run_once", fake_run_once_uncertain)
+    res_a = await runner_a.run(
+        RunRequest(backend="codex", prompt="check", cwd=str(tmp_path), mode="read_only")
+    )
+    assert calls_a == 1
+    assert res_a.status == "failed"
+    assert res_a.provider_state == "possibly_running"
+
+    # Part B: Resumed turn hitting `transient_service` (even with `stopped`) MUST NOT auto-retry!
+    calls_b = 0
+    runner_b = CodexRunner(settings)
+
+    async def fake_run_once_resumed_transient(*_args, **_kwargs) -> RunResult:
+        nonlocal calls_b
+        calls_b += 1
+        return RunResult(
+            status="failed",
+            session_id="thr-existing",
+            model="gpt-6.2-sol",
+            duration_seconds=0.9,
+            usage_status="missing",
+            error="HTTP 503 Service Unavailable",
+            failure_reason="transient_service",
+            provider_state="stopped",
+            provider_invoked=True,
+        )
+
+    monkeypatch.setattr(runner_b, "_run_once", fake_run_once_resumed_transient)
+    res_b = await runner_b.run(
+        RunRequest(
+            backend="codex",
+            prompt="follow-up",
+            cwd=str(tmp_path),
+            mode="read_only",
+            session_id="thr-existing",
+        )
+    )
+    assert calls_b == 1
+    assert res_b.status == "failed"
+    assert res_b.failure_reason == "transient_service"
+
+    # Part C: New read-only turn where Attempt 1 fails with partial usage (50 tokens, 1.2s) and
+    # Attempt 2 succeeds with exact usage (25 tokens, 0.8s) -> BOTH attempts preserved in detail & SQLite!
+    from agent_bridge import runners as runners_mod
+
+    monkeypatch.setattr(runners_mod, "TRANSIENT_RETRY_BACKOFF_SECONDS", 0.01)
+    runner_c = CodexRunner(settings)
+    attempt_num = 0
+
+    async def fake_run_once_two_attempts(*_args, **_kwargs) -> RunResult:
+        nonlocal attempt_num
+        attempt_num += 1
+        if attempt_num == 1:
+            return RunResult(
+                status="failed",
+                model="gpt-6.2-sol",
+                duration_seconds=1.2,
+                usage={"input_tokens": 40, "output_tokens": 10, "total_tokens": 50},
+                usage_status="partial",
+                error="HTTP 503 Service Unavailable",
+                failure_reason="transient_service",
+                provider_state="stopped",
+                provider_invoked=True,
+            )
+        return RunResult(
+            status="completed",
+            response="ATTEMPT_2_OK",
+            session_id="thr-retry-ok",
+            model="gpt-6.2-sol",
+            duration_seconds=0.8,
+            usage={"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+            usage_status="exact",
+            provider_state="stopped",
+            provider_invoked=True,
+        )
+
+    monkeypatch.setattr(runner_c, "_run_once", fake_run_once_two_attempts)
+    mgr = JobManager(settings, codex_runner=runner_c)
+    rec = await mgr.run(
+        mgr.prepare_request(backend="codex", prompt="new ro", mode="read_only", parent_run="retry-wf")
+    )
+    assert rec.status == "completed"
+    assert rec.duration_seconds == 2.0  # 1.2 + 0.8!
+    detail = rec.to_detail()
+    assert len(detail["attempts"]) == 2
+    assert detail["attempts"][0]["usage"]["total_tokens"] == 50
+    assert detail["attempts"][0]["usage_status"] == "partial"
+    assert detail["attempts"][1]["usage"]["total_tokens"] == 25
+    assert detail["attempts"][1]["usage_status"] == "exact"
+
+    usage_sum = await mgr.get_usage_summary(period="session", parent_run="retry-wf", compact=False)
+    codex_bucket = usage_sum["by_backend"]["codex"]
+    assert codex_bucket["duration_seconds"] == 2.0
+    assert codex_bucket["tokens"]["total_tokens"] == 25
+    assert codex_bucket["partial_total_tokens"] == 50
+    assert codex_bucket["usage_coverage"]["exact"] == 1
+    assert codex_bucket["usage_coverage"]["partial"] == 1
+    await mgr.shutdown()
+
+
+async def test_agy_resume_inherits_model_effort_parent_run_and_discloses_pool_change(
+    tmp_path: Path,
+) -> None:
+    """Audit Medium #4: resuming by job_id inherits prior model intent, effort, and parent_run
+    instead of silently switching from Sonnet to Gemini or disappearing from workflow rollups;
+    explicit cross-pool override is surfaced in `model_notice`."""
+    fake_agy = tmp_path / "fake_agy_inherit.py"
+    fake_agy.write_text(
+        """
+import json, sys
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-low\\tGemini 4 Neon (Low)")
+    print("gemini-4-neon-high\\tGemini 4 Neon (High)")
+    print("claude-sonnet-5-5-medium\\tClaude Sonnet 5.5 (Medium)")
+    print("claude-sonnet-5-5-high\\tClaude Sonnet 5.5 (High)")
+    sys.exit(0)
+
+model = args[args.index("--model") + 1] if "--model" in args else "UNKNOWN"
+prompt = [a for a in args if a.startswith("--print=")][0][len("--print="):]
+cid = "conv-inherit-pool"
+print(json.dumps({"event": "init", "conversation_id": cid, "init": {"model": model}}), flush=True)
+print(json.dumps({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": 1, "state": "DONE", "step_type": "agent_response", "text_delta": f"RAN:{model}:{prompt}", "usage": {"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}}}), flush=True)
+print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": f"RAN:{model}:{prompt}", "num_turns": 1, "usage": {"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(settings, neon_runner=StubAgyRunner(settings, fake_agy))
+
+    # Turn 1: agy-claude (Sonnet) with effort=medium and parent_run="wf-pool"
+    t1 = await mgr.run(
+        mgr.prepare_request(
+            backend="agy-claude",
+            prompt="turn1",
+            effort="medium",
+            parent_run="wf-pool",
+        )
+    )
+    assert t1.status == "completed"
+    assert t1.model == "claude-sonnet-5-5-medium"
+    assert t1.quota_pool == "agy_claude_gpt"
+    assert t1.parent_run == "wf-pool"
+
+    # Turn 2: resume with generic `backend="neon"`, omitting `model`, `effort`, and `parent_run`!
+    t2 = await mgr.run(
+        mgr.prepare_request(
+            backend="neon",
+            prompt="turn2",
+            resume_from=t1.job_id,
+        )
+    )
+    assert t2.status == "completed"
+    assert t2.model == "claude-sonnet-5-5-medium"
+    assert t2.quota_pool == "agy_claude_gpt"
+    assert t2.effort == "medium"
+    assert t2.parent_run == "wf-pool"
+    assert t2.model_notice is None
+
+    # Turn 3: explicitly override model to `neon-low` (agy_gemini) -> MUST disclose pool change!
+    t3 = await mgr.run(
+        mgr.prepare_request(
+            backend="neon",
+            model="neon-low",
+            prompt="turn3",
+            resume_from=t2.job_id,
+        )
+    )
+    assert t3.status == "completed"
+    assert t3.model == "gemini-4-neon-low"
+    assert t3.quota_pool == "agy_gemini"
+    assert t3.parent_run == "wf-pool"
+    assert t3.model_notice is not None
+    assert "agy_claude_gpt" in t3.model_notice and "agy_gemini" in t3.model_notice
+
+    # All 3 turns appear under `parent_run="wf-pool"`!
+    rollup = await mgr.get_usage_summary(period="session", parent_run="wf-pool", compact=True)
+    assert rollup["overview"]["runs"] == 3
+    assert rollup["by_quota_pool"]["agy_claude_gpt"]["runs"] == 2
+    assert rollup["by_quota_pool"]["agy_gemini"]["runs"] == 1
+    await mgr.shutdown()
+
+
+async def test_startup_deadline_enforced_on_git_probe_and_cleanup_seconds_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit Medium #5: startup honors the execution deadline (delayed spawn cannot let a 50ms git
+    probe succeed after 400ms+), and cleanup time is reported separately from work duration."""
+    from agent_bridge import process_control as pc
+    from agent_bridge import runners as runners_mod
+
+    # Part A: Delayed startup against a 60ms Git probe MUST time out quickly!
+    orig_create = pc.asyncio.create_subprocess_exec
+
+    async def slow_create(*args, **kwargs):
+        await asyncio.sleep(0.45)
+        return await orig_create(*args, **kwargs)
+
+    monkeypatch.setattr(pc.asyncio, "create_subprocess_exec", slow_create)
+    t0 = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        await runners_mod._run_git(["--version"], cwd=str(tmp_path), timeout_seconds=0.06)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.3, f"Delayed startup bypassed 60ms git timeout (took {elapsed:.3f}s)"
+    monkeypatch.setattr(pc.asyncio, "create_subprocess_exec", orig_create)
+
+    # Part B: Timed-out job reports `cleanup_seconds` separately in `to_detail()`!
+    sleeper = tmp_path / "sleeper_cleanup.py"
+    sleeper.write_text("import sys, time; _ = sys.stdin.read(); time.sleep(30)\n", encoding="utf-8")
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(settings, codex_runner=StubCodexRunner(settings, sleeper))
+    req = mgr.prepare_request(backend="codex", prompt="timeout", timeout_seconds=10)
+    res = await mgr.codex_runner.run(req, deadline=time.monotonic() + 0.35)
+    assert res.status == "timed_out"
+    assert res.cleanup_seconds is not None and res.cleanup_seconds >= 0.0
+    assert res.duration_seconds is not None and res.duration_seconds < 1.0
+    await mgr.shutdown()
+
+
+async def test_list_backends_isolates_empty_agy_catalog_and_returns_codex_health(
+    tmp_path: Path,
+) -> None:
+    """Audit Medium #6: an empty/failing Antigravity model catalog does NOT break `list_backends`;
+    it reports the catalog failure as an Antigravity diagnostic while returning healthy Codex info."""
+    healthy_empty_agy = tmp_path / "agy_empty_cat.py"
+    healthy_empty_agy.write_text(
+        """
+import sys
+
+args = sys.argv[1:]
+if "--version" in args:
+    print("agy 1.2.3")
+    sys.exit(0)
+if args and args[0] == "models":
+    sys.stderr.write("catalog outage\\n")
+    sys.exit(1)
+sys.exit(0)
+""".strip(),
+        encoding="utf-8",
+    )
+    healthy_codex = tmp_path / "codex_ok.py"
+    healthy_codex.write_text(
+        """
+import sys
+
+if "--version" in sys.argv[1:]:
+    print("codex-cli 0.99.0")
+    sys.exit(0)
+sys.exit(0)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(
+        settings,
+        neon_runner=StubAgyRunner(settings, healthy_empty_agy),
+        codex_runner=StubCodexRunner(settings, healthy_codex),
+    )
+    mcp, _ = create_server(settings=settings, manager=mgr)
+    raw = await mcp.call_tool("list_backends", {"refresh_models": True})
+    # FastMCP returns either (content, structured_dict) or content list with JSON text
+    if isinstance(raw, tuple) and len(raw) == 2 and isinstance(raw[1], dict):
+        data = raw[1]
+    elif isinstance(raw, dict):
+        data = raw
+    else:
+        content_list = raw.content if hasattr(raw, "content") else raw
+        data = json.loads(content_list[0].text)
+
+    assert data["backends"]["codex"]["healthy"] is True
+    assert data["backends"]["codex"]["available"] is True
+    assert "0.99.0" in (data["backends"]["codex"]["version"] or "")
+    assert data["backends"]["neon"]["healthy"] is True
+    assert data["backends"]["neon"]["available"] is False
+    assert data["backends"]["neon"]["resolved_default_model"] is None
+    assert data["backends"]["neon"]["models_status"] == "unavailable"
+    assert data["backends"]["neon"].get("catalog_error")
+    await mgr.shutdown()

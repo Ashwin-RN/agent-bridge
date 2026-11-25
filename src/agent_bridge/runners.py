@@ -114,6 +114,118 @@ _AGY_TIMEOUT_PATTERNS = (
 )
 
 
+def _make_attempt_summary(attempt_num: int, res: RunResult, *, backend: str) -> dict[str, Any]:
+    return {
+        "attempt": attempt_num,
+        "backend": backend,
+        "model": res.model,
+        "quota_pool": classify_quota_pool(backend, res.model),
+        "effort": res.effort,
+        "status": res.status,
+        "failure_reason": res.failure_reason,
+        "provider_state": res.provider_state,
+        "duration_seconds": round(float(res.duration_seconds or 0.0), 2),
+        "cleanup_seconds": round(float(res.cleanup_seconds or 0.0), 2) if res.cleanup_seconds else 0.0,
+        "usage": res.usage,
+        "usage_status": res.usage_status,
+        "provider_metrics": res.provider_metrics,
+        "exit_code": res.exit_code,
+        "error": res.error,
+    }
+
+
+def _sum_usage_dicts(first: dict[str, Any] | None, second: dict[str, Any] | None) -> dict[str, Any] | None:
+    if first is None:
+        return dict(second) if isinstance(second, dict) else None
+    if second is None:
+        return dict(first)
+    merged: dict[str, Any] = {}
+    keys = set(first.keys()) | set(second.keys())
+    for k in keys:
+        v1 = first.get(k)
+        v2 = second.get(k)
+        n1 = int(v1) if isinstance(v1, (int, float)) and not isinstance(v1, bool) else None
+        n2 = int(v2) if isinstance(v2, (int, float)) and not isinstance(v2, bool) else None
+        if n1 is not None and n2 is not None:
+            merged[k] = n1 + n2
+        elif n1 is not None:
+            merged[k] = n1
+        elif n2 is not None:
+            merged[k] = n2
+    return merged or None
+
+
+def _can_auto_retry_attempt(
+    request: RunRequest,
+    result: RunResult,
+    *,
+    kind: str,
+    prior_watermark: dict[str, Any] | None = None,
+) -> bool:
+    """Only retry after verifying the prior attempt stopped AND did not advance a resumed session."""
+    if result.provider_state != "stopped":
+        return False
+
+    has_turn_progress = bool(
+        (result.response and result.response.strip())
+        or result.usage is not None
+        or (
+            prior_watermark is not None
+            and isinstance(prior_watermark.get("num_turns"), int)
+            and isinstance(result.num_turns, int)
+            and result.num_turns > int(prior_watermark["num_turns"])
+        )
+    )
+
+    if request.session_id is not None:
+        # On a resumed session, a transient network/service error may have already been applied
+        # server-side, and any turn progress means the session may have advanced.
+        if kind == "transient":
+            return False
+        if has_turn_progress:
+            return False
+        return True
+
+    if kind == "model_unavailable" and has_turn_progress:
+        return False
+    return True
+
+
+def _merge_retry_results(
+    first: RunResult,
+    second: RunResult,
+    *,
+    backend: str,
+) -> RunResult:
+    """Preserve per-attempt duration, cleanup time, and usage (including partial usage) across retries."""
+    attempts = [
+        _make_attempt_summary(1, first, backend=backend),
+        _make_attempt_summary(2, second, backend=backend),
+    ]
+    second.attempts = attempts
+    second.duration_seconds = round(
+        float(first.duration_seconds or 0.0) + float(second.duration_seconds or 0.0),
+        2,
+    )
+    if first.cleanup_seconds is not None or second.cleanup_seconds is not None:
+        second.cleanup_seconds = round(
+            float(first.cleanup_seconds or 0.0) + float(second.cleanup_seconds or 0.0),
+            2,
+        )
+    if first.usage is not None:
+        second.usage = _sum_usage_dicts(first.usage, second.usage)
+        if first.usage_status in {"partial", "missing"} or second.usage_status == "partial":
+            second.usage_status = "partial"
+    elif first.failure_reason == "transient_service" and second.usage_status == "exact":
+        # Attempt 1 was a transient failure with unknown/missing usage; keep Attempt 2's usage
+        # on the final result while preserving Attempt 1 as a separate missing-usage row in SQLite.
+        pass
+    pm = dict(second.provider_metrics) if isinstance(second.provider_metrics, dict) else {}
+    pm["attempts"] = attempts
+    second.provider_metrics = pm
+    return second
+
+
 def _tail(text: str, limit: int = STDERR_TAIL_MAX_CHARS) -> str | None:
     cleaned = text.strip()
     if not cleaned:
@@ -447,12 +559,16 @@ async def _run_git(
     cwd: str,
     timeout_seconds: float = 15.0,
 ) -> tuple[int, str, str]:
-    """Run a git subprocess with ManagedProcess tracking and cleanup on every exit path."""
+    """Run a git subprocess with ManagedProcess tracking and a single deadline covering startup + IO."""
     git_bin = shutil.which("git")
     if not git_bin:
         raise RuntimeError("`git` executable not found in PATH.")
+    deadline = time.monotonic() + max(0.01, timeout_seconds)
     managed: ManagedProcess | None = None
     try:
+        spawn_rem = deadline - time.monotonic()
+        if spawn_rem <= 0:
+            raise asyncio.TimeoutError("Git probe deadline expired before spawn.")
         proc, managed = await spawn_managed_process(
             git_bin,
             *args,
@@ -460,11 +576,15 @@ async def _run_git(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            timeout=spawn_rem,
         )
+        io_rem = deadline - time.monotonic()
+        if io_rem <= 0:
+            raise asyncio.TimeoutError("Git probe deadline expired during startup.")
         stdout_b, stderr_b, _ = await communicate_managed(
             proc,
             managed,
-            timeout=max(0.01, timeout_seconds),
+            timeout=io_rem,
         )
         return (
             int(proc.returncode or 0),
@@ -710,6 +830,7 @@ async def prepare_codex_worktree(
 
 async def _check_cli_health(cmd: list[str]) -> tuple[bool, str | None, str | None]:
     """Run `<cmd> --version` and return `(healthy, version_line, error_msg)`."""
+    deadline = time.monotonic() + 10.0
     managed: ManagedProcess | None = None
     try:
         proc, managed = await spawn_managed_process(
@@ -718,8 +839,12 @@ async def _check_cli_health(cmd: list[str]) -> tuple[bool, str | None, str | Non
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            timeout=max(0.1, deadline - time.monotonic()),
         )
-        stdout_b, stderr_b, _ = await communicate_managed(proc, managed, timeout=10.0)
+        io_rem = deadline - time.monotonic()
+        if io_rem <= 0:
+            raise asyncio.TimeoutError("--version deadline expired during startup.")
+        stdout_b, stderr_b, _ = await communicate_managed(proc, managed, timeout=io_rem)
         out = stdout_b.decode("utf-8", errors="replace").strip()
         err = stderr_b.decode("utf-8", errors="replace").strip()
         text = out or err
@@ -775,6 +900,7 @@ class NeonRunner:
 
     async def _fetch_live_models(self) -> list[dict[str, str]]:
         cmd = [*self.resolve_command(), "models"]
+        deadline = time.monotonic() + 20.0
         managed: ManagedProcess | None = None
         try:
             proc, managed = await spawn_managed_process(
@@ -782,8 +908,12 @@ class NeonRunner:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                timeout=max(0.1, deadline - time.monotonic()),
             )
-            stdout, _stderr, _ = await communicate_managed(proc, managed, timeout=20.0)
+            io_rem = deadline - time.monotonic()
+            if io_rem <= 0:
+                raise asyncio.TimeoutError("agy models deadline expired during startup.")
+            stdout, _stderr, _ = await communicate_managed(proc, managed, timeout=io_rem)
         except BaseException:
             if managed is not None:
                 await managed.terminate()
@@ -893,6 +1023,31 @@ class NeonRunner:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                timeout=max(0.05, deadline - time.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            status, reason, pstate, guidance = classify_failure(
+                backend="neon",
+                exit_code=None,
+                error_text=f"Neon subagent timed out during startup after {request.timeout_seconds}s.",
+                stderr_text=None,
+                timed_out_locally=True,
+                process_stopped=True,
+            )
+            return RunResult(
+                status=status,
+                session_id=request.session_id,
+                model=resolved_model,
+                effort=request.effort,
+                model_notice=model_notice,
+                effective_cwd=request.cwd,
+                duration_seconds=round(max(0.0, time.monotonic() - started), 2),
+                usage_status="missing",
+                error=f"Neon subagent timed out during startup after {request.timeout_seconds}s.",
+                failure_reason=reason,
+                provider_state=pstate,
+                retry_guidance=guidance,
+                provider_invoked=False,
             )
         except ProcessContainmentError as exc:
             return RunResult(
@@ -1033,6 +1188,7 @@ class NeonRunner:
             wait_budget = deadline - time.monotonic()
             if wait_budget <= 0:
                 timed_out_locally = True
+                managed.work_stopped_at = time.monotonic()
                 process_stopped = await managed.terminate()
             else:
                 process_stopped = await run_managed_process_io(
@@ -1046,8 +1202,12 @@ class NeonRunner:
             timed_out_locally = True
             process_stopped = managed.verified_stopped and (not managed.is_alive())
 
-        # Always measure wall-clock duration per invocation (never cumulative agy duration).
-        elapsed = round(max(0.0, time.monotonic() - started), 2)
+        # Measure work duration separately from process-tree cleanup time!
+        work_end = managed.work_stopped_at if managed.work_stopped_at is not None else time.monotonic()
+        elapsed = round(max(0.0, work_end - started), 2)
+        cleanup_secs = round(managed.last_cleanup_seconds, 2) if managed.last_cleanup_seconds > 0 else (
+            0.0 if timed_out_locally else None
+        )
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
         stderr_tail = _tail(stderr_text)
         partial_text = "".join(partial_text_parts).strip()
@@ -1177,6 +1337,7 @@ class NeonRunner:
                 model_notice=combined_notice,
                 effective_cwd=request.cwd,
                 duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
                 usage=usage,
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
@@ -1206,6 +1367,7 @@ class NeonRunner:
                     model_notice=combined_notice,
                     effective_cwd=request.cwd,
                     duration_seconds=elapsed,
+                    cleanup_seconds=cleanup_secs,
                     usage=usage,
                     provider_metrics=provider_metrics,
                     usage_status=usage_status,
@@ -1239,6 +1401,7 @@ class NeonRunner:
                 model_notice=combined_notice,
                 effective_cwd=request.cwd,
                 duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
                 usage=usage,
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
@@ -1263,6 +1426,7 @@ class NeonRunner:
                 model_notice=combined_notice,
                 effective_cwd=request.cwd,
                 duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
                 usage=usage,
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
@@ -1291,6 +1455,7 @@ class NeonRunner:
             model_notice=combined_notice,
             effective_cwd=request.cwd,
             duration_seconds=elapsed,
+            cleanup_seconds=cleanup_secs,
             usage=usage,
             provider_metrics=provider_metrics,
             usage_status=usage_status,
@@ -1397,11 +1562,17 @@ class NeonRunner:
                 on_provider_start=on_provider_start,
             )
 
-            # Seamless self-healing retry if selected model was retired/rejected.
+            # Seamless self-healing retry ONLY if Attempt 1 is verified stopped and didn't advance a session.
             if (
                 result.status == "failed"
                 and result.failure_reason == "model_unavailable"
                 and resolution.resolved is not None
+                and _can_auto_retry_attempt(
+                    request,
+                    result,
+                    kind="model_unavailable",
+                    prior_watermark=prior_watermark,
+                )
                 and (overall_deadline - time.monotonic()) > 8.0
             ):
                 logger.info(
@@ -1426,7 +1597,10 @@ class NeonRunner:
                         effort=request.effort,
                         effective_cwd=request.cwd,
                         duration_seconds=result.duration_seconds,
-                        usage_status="missing",
+                        cleanup_seconds=result.cleanup_seconds,
+                        usage=result.usage,
+                        provider_metrics=result.provider_metrics,
+                        usage_status=result.usage_status,
                         error=str(exc),
                         failure_reason="model_unavailable",
                         provider_state="stopped",
@@ -1454,6 +1628,9 @@ class NeonRunner:
                         effort=request.effort,
                         effective_cwd=request.cwd,
                         duration_seconds=result.duration_seconds,
+                        cleanup_seconds=result.cleanup_seconds,
+                        usage=result.usage,
+                        provider_metrics=result.provider_metrics,
                         usage_status=result.usage_status,
                         exit_code=result.exit_code,
                         error=(
@@ -1476,7 +1653,7 @@ class NeonRunner:
                     f"Model {resolution.resolved!r} was unavailable; seamlessly refreshed and retried with "
                     f"{retry_model or 'agy default'}."
                 )
-                return await self._run_once(
+                second = await self._run_once(
                     request,
                     resolved_model=retry_model,
                     model_notice=notice,
@@ -1489,18 +1666,25 @@ class NeonRunner:
                     on_model=on_model,
                     on_provider_start=on_provider_start,
                 )
+                return _merge_retry_results(result, second, backend="neon")
 
-            # One bounded retry for transient service errors on read-only tasks only.
+            # One bounded retry for transient service errors on NEW read-only tasks only (never on uncertain/resumed turns).
             if (
                 request.mode == "read_only"
                 and result.status == "failed"
                 and result.failure_reason == "transient_service"
+                and _can_auto_retry_attempt(
+                    request,
+                    result,
+                    kind="transient",
+                    prior_watermark=prior_watermark,
+                )
                 and (overall_deadline - time.monotonic()) > TRANSIENT_RETRY_MIN_REMAINING_SECONDS
             ):
                 if on_activity:
                     on_activity("transient service error; retrying once")
                 await asyncio.sleep(TRANSIENT_RETRY_BACKOFF_SECONDS)
-                return await self._run_once(
+                second = await self._run_once(
                     request,
                     resolved_model=resolution.resolved,
                     model_notice=resolution.notice,
@@ -1513,6 +1697,7 @@ class NeonRunner:
                     on_model=on_model,
                     on_provider_start=on_provider_start,
                 )
+                return _merge_retry_results(result, second, backend="neon")
 
             return result
         finally:
@@ -1734,6 +1919,34 @@ class CodexRunner:
                 stdin=asyncio.subprocess.PIPE if use_stdin_prompt else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                timeout=max(0.05, deadline - time.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            status, reason, pstate, guidance = classify_failure(
+                backend="codex",
+                exit_code=None,
+                error_text=f"Codex subagent timed out during startup after {request.timeout_seconds}s.",
+                stderr_text=None,
+                timed_out_locally=True,
+                process_stopped=True,
+            )
+            return RunResult(
+                status=status,
+                session_id=request.session_id,
+                model=reported_model,
+                effort=reported_effort,
+                model_notice=model_notice,
+                effective_cwd=request.cwd,
+                worktree_path=request.worktree_path,
+                worktree_branch=request.worktree_branch,
+                worktree_commit=request.worktree_commit,
+                duration_seconds=round(max(0.0, time.monotonic() - started), 2),
+                usage_status="missing",
+                error=f"Codex subagent timed out during startup after {request.timeout_seconds}s.",
+                failure_reason=reason,
+                provider_state=pstate,
+                retry_guidance=guidance,
+                provider_invoked=False,
             )
         except ProcessContainmentError as exc:
             return RunResult(
@@ -1835,6 +2048,7 @@ class CodexRunner:
             wait_budget = deadline - time.monotonic()
             if wait_budget <= 0:
                 timed_out_locally = True
+                managed.work_stopped_at = time.monotonic()
                 process_stopped = await managed.terminate()
             else:
                 process_stopped = await run_managed_process_io(
@@ -1849,7 +2063,11 @@ class CodexRunner:
             timed_out_locally = True
             process_stopped = managed.verified_stopped and (not managed.is_alive())
 
-        elapsed = round(max(0.0, time.monotonic() - started), 2)
+        work_end = managed.work_stopped_at if managed.work_stopped_at is not None else time.monotonic()
+        elapsed = round(max(0.0, work_end - started), 2)
+        cleanup_secs = round(managed.last_cleanup_seconds, 2) if managed.last_cleanup_seconds > 0 else (
+            0.0 if timed_out_locally else None
+        )
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
         stderr_tail = _tail(stderr_text)
         parsed = parse_codex_jsonl_events(stdout_lines)
@@ -1902,6 +2120,7 @@ class CodexRunner:
                 worktree_branch=wt_branch,
                 worktree_commit=wt_commit,
                 duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
                 usage=usage,
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
@@ -1933,6 +2152,7 @@ class CodexRunner:
                 worktree_branch=wt_branch,
                 worktree_commit=wt_commit,
                 duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
                 usage=usage,
                 provider_metrics=provider_metrics,
                 usage_status=usage_status,
@@ -1963,6 +2183,7 @@ class CodexRunner:
             worktree_branch=wt_branch,
             worktree_commit=wt_commit,
             duration_seconds=elapsed,
+            cleanup_seconds=cleanup_secs,
             usage=usage,
             provider_metrics=provider_metrics,
             usage_status=usage_status,
@@ -2003,11 +2224,12 @@ class CodexRunner:
             on_provider_start=on_provider_start,
         )
 
-        # Seamless fallback if an explicit/pinned Codex model is rejected/retired.
+        # Seamless fallback ONLY if Attempt 1 is verified stopped and did not advance a resumed session.
         if (
             result.status == "failed"
             and result.failure_reason == "model_unavailable"
             and effective_model is not None
+            and _can_auto_retry_attempt(request, result, kind="model_unavailable")
             and (overall_deadline - time.monotonic()) > 8.0
         ):
             logger.info(
@@ -2018,7 +2240,7 @@ class CodexRunner:
                 f"Requested Codex model {effective_model!r} was unavailable; "
                 "seamlessly fell back to Codex's current default model."
             )
-            return await self._run_once(
+            second = await self._run_once(
                 request,
                 effective_model=None,
                 effective_effort=effective_effort,
@@ -2029,18 +2251,20 @@ class CodexRunner:
                 on_model=on_model,
                 on_provider_start=on_provider_start,
             )
+            return _merge_retry_results(result, second, backend="codex")
 
-        # One bounded retry for transient service errors on read-only tasks only.
+        # One bounded retry for transient service errors on NEW read-only tasks only (never on uncertain/resumed turns).
         if (
             request.mode == "read_only"
             and result.status == "failed"
             and result.failure_reason == "transient_service"
+            and _can_auto_retry_attempt(request, result, kind="transient")
             and (overall_deadline - time.monotonic()) > TRANSIENT_RETRY_MIN_REMAINING_SECONDS
         ):
             if on_activity:
                 on_activity("transient service error; retrying once")
             await asyncio.sleep(TRANSIENT_RETRY_BACKOFF_SECONDS)
-            return await self._run_once(
+            second = await self._run_once(
                 request,
                 effective_model=effective_model,
                 effective_effort=effective_effort,
@@ -2051,5 +2275,6 @@ class CodexRunner:
                 on_model=on_model,
                 on_provider_start=on_provider_start,
             )
+            return _merge_retry_results(result, second, backend="codex")
 
         return result

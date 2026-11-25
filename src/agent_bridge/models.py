@@ -36,6 +36,7 @@ class RunRequest:
     session_id: str | None = None
     resume_from_job_id: str | None = None
     explicit_cwd: bool = False
+    relocate_cwd: bool = False
     worktree: bool = False
     worktree_path: str | None = None
     worktree_branch: str | None = None
@@ -52,6 +53,9 @@ class RunRequest:
     confirm_prior_stopped: bool = False
     confirm_prior_job_id: str | None = None
     allow_cross_pool_fallback: bool = False
+    prior_quota_pool: QuotaPool | None = None
+    prior_model: str | None = None
+    resume_notice: str | None = None
 
 
 @dataclass(slots=True)
@@ -67,6 +71,7 @@ class RunResult:
     worktree_branch: str | None = None
     worktree_commit: str | None = None
     duration_seconds: float | None = None
+    cleanup_seconds: float | None = None
     usage: dict[str, Any] | None = None
     provider_metrics: dict[str, Any] | None = None
     usage_status: UsageStatus = "missing"
@@ -79,6 +84,7 @@ class RunResult:
     retry_guidance: str | None = None
     stderr_tail: str | None = None
     provider_invoked: bool = False
+    attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -111,6 +117,7 @@ class JobRecord:
     started_at: float | None = None
     finished_at: float | None = None
     duration_seconds: float | None = None
+    cleanup_seconds: float | None = None
     response: str = ""
     usage: dict[str, Any] | None = None
     provider_metrics: dict[str, Any] | None = None
@@ -120,6 +127,7 @@ class JobRecord:
     stderr_tail: str | None = None
     last_activity: str | None = None
     provider_invoked: bool = False
+    attempts: list[dict[str, Any]] | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -195,6 +203,10 @@ class JobRecord:
             "effective_cwd": self.effective_cwd or self.cwd,
             "elapsed_seconds": self.elapsed_seconds(),
         }
+        if self.cleanup_seconds is not None and (
+            self.cleanup_seconds > 0 or self.status in {"timed_out", "cancelled"}
+        ):
+            out["cleanup_seconds"] = round(self.cleanup_seconds, 2)
         if self.effort:
             out["effort"] = self.effort
         if self.requested_model and self.requested_model != self.model:
@@ -226,6 +238,13 @@ class JobRecord:
             out["usage"] = self.usage
         if self.provider_metrics:
             out["provider_metrics"] = self.provider_metrics
+        attempts_list = self.attempts
+        if not attempts_list and isinstance(self.provider_metrics, dict):
+            raw_att = self.provider_metrics.get("attempts")
+            if isinstance(raw_att, list) and len(raw_att) > 1:
+                attempts_list = raw_att
+        if attempts_list and len(attempts_list) > 1:
+            out["attempts"] = attempts_list
         if self.is_terminal:
             out["usage_status"] = self.usage_status
         if self.exit_code is not None and self.exit_code != 0:

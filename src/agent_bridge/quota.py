@@ -665,6 +665,7 @@ async def fetch_codex_quota(codex_cmd: list[str], *, timeout_seconds: float = 12
     """Perform a short-lived one-shot `codex app-server` `account/rateLimits/read` RPC."""
     ts = _iso_now()
     managed: ManagedProcess | None = None
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
     try:
         proc, managed = await spawn_managed_process(
             *codex_cmd,
@@ -672,6 +673,7 @@ async def fetch_codex_quota(codex_cmd: list[str], *, timeout_seconds: float = 12
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            timeout=max(0.05, deadline - time.monotonic()),
         )
         assert proc.stdin is not None and proc.stdout is not None
 
@@ -690,9 +692,8 @@ async def fetch_codex_quota(codex_cmd: list[str], *, timeout_seconds: float = 12
         ]
         payload = "".join(json.dumps(m) + "\n" for m in messages).encode("utf-8")
         proc.stdin.write(payload)
-        await proc.stdin.drain()
+        await asyncio.wait_for(proc.stdin.drain(), timeout=max(0.05, deadline - time.monotonic()))
 
-        deadline = time.monotonic() + timeout_seconds
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -749,6 +750,7 @@ async def fetch_neon_quota(agy_cmd: list[str], *, timeout_seconds: float = 15.0)
     """Perform a short-lived one-shot `agy --output-format json --print=/usage` probe."""
     ts = _iso_now()
     managed: ManagedProcess | None = None
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
     try:
         proc, managed = await spawn_managed_process(
             *agy_cmd,
@@ -762,8 +764,12 @@ async def fetch_neon_quota(agy_cmd: list[str], *, timeout_seconds: float = 15.0)
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            timeout=max(0.05, deadline - time.monotonic()),
         )
-        stdout_b, stderr_b, _ = await communicate_managed(proc, managed, timeout=timeout_seconds)
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise asyncio.TimeoutError("Timed out launching agy /usage probe.")
+        stdout_b, stderr_b, _ = await communicate_managed(proc, managed, timeout=rem)
 
         stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0 or not stdout_text:

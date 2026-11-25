@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio.base_subprocess as _base_subprocess
 import contextvars
 import ctypes
 import logging
@@ -18,6 +19,39 @@ from typing import Any
 logger = logging.getLogger("agent_bridge.process_control")
 
 _LAUNCH_CANCEL_WAIT_SECONDS = 3.0
+_LAUNCH_CAPTURED_GRACE_SECONDS = 0.4
+
+_SPAWN_CAPTURE: contextvars.ContextVar[Callable[[Any], None] | None] = contextvars.ContextVar(
+    "agent_bridge_spawn_capture",
+    default=None,
+)
+_BASE_SUBPROCESS_HOOKED = False
+
+
+def _ensure_spawn_capture_hook() -> None:
+    """Install a lightweight ContextVar-scoped observer on BaseSubprocessTransport.__init__.
+
+    Captures the underlying `Popen` object (POSIX `pid`/`pgid`, Windows suspended `pid`/`_handle`)
+    synchronously right after process creation, BEFORE asyncio's async pipe setup runs.
+    """
+    global _BASE_SUBPROCESS_HOOKED
+    if _BASE_SUBPROCESS_HOOKED:
+        return
+    orig_init = _base_subprocess.BaseSubprocessTransport.__init__
+
+    def _wrapped_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        orig_init(self, *args, **kwargs)
+        cb = _SPAWN_CAPTURE.get()
+        if cb is not None:
+            proc_obj = getattr(self, "_proc", None)
+            if proc_obj is not None:
+                try:
+                    cb(proc_obj)
+                except Exception:
+                    pass
+
+    _base_subprocess.BaseSubprocessTransport.__init__ = _wrapped_init  # type: ignore[method-assign]
+    _BASE_SUBPROCESS_HOOKED = True
 
 
 class ProcessContainmentError(RuntimeError):
@@ -246,6 +280,7 @@ class ProcessTracker:
     def __init__(self) -> None:
         self._active: set[ManagedProcess] = set()
         self._unverified_stop: bool = False
+        self.total_cleanup_seconds: float = 0.0
 
     def register(self, managed: ManagedProcess) -> None:
         self._active.add(managed)
@@ -257,6 +292,10 @@ class ProcessTracker:
 
     def mark_unverified_stop(self) -> None:
         self._unverified_stop = True
+
+    def add_cleanup_seconds(self, seconds: float) -> None:
+        if seconds > 0:
+            self.total_cleanup_seconds = round(self.total_cleanup_seconds + seconds, 3)
 
     def has_alive_processes(self) -> bool:
         return any(m.is_alive() for m in list(self._active))
@@ -305,6 +344,8 @@ class ManagedProcess:
         self._pgid: int | None = None
         self._closed_cleanly = False
         self._terminated_verified = False
+        self.last_cleanup_seconds: float = 0.0
+        self.work_stopped_at: float | None = None
         self._tracker = tracker if tracker is not None else CURRENT_PROCESS_TRACKER.get()
         enforce_containment = resume_suspended if require_containment is None else require_containment
 
@@ -519,6 +560,7 @@ class ManagedProcess:
                 self._tracker.unregister(self, verified_stopped=True)
             return True
 
+        cleanup_started = time.monotonic()
         win_job_drained = True
         try:
             if sys.platform == "win32":
@@ -644,13 +686,20 @@ class ManagedProcess:
             self.terminate_sync()
             stopped_now = not self.is_alive()
             self._terminated_verified = stopped_now
-            if self._tracker is not None and stopped_now:
-                self._tracker.unregister(self, verified_stopped=True)
+            elapsed_c = round(max(0.0, time.monotonic() - cleanup_started), 3)
+            self.last_cleanup_seconds = round(self.last_cleanup_seconds + elapsed_c, 3)
+            if self._tracker is not None:
+                self._tracker.add_cleanup_seconds(elapsed_c)
+                if stopped_now:
+                    self._tracker.unregister(self, verified_stopped=True)
             raise
 
         stopped = win_job_drained and (not self.is_alive())
         self._terminated_verified = stopped
+        elapsed_c = round(max(0.0, time.monotonic() - cleanup_started), 3)
+        self.last_cleanup_seconds = round(self.last_cleanup_seconds + elapsed_c, 3)
         if self._tracker is not None:
+            self._tracker.add_cleanup_seconds(elapsed_c)
             if stopped:
                 self._tracker.unregister(self, verified_stopped=True)
             else:
@@ -685,6 +734,88 @@ class ManagedProcess:
             self._tracker._unverified_stop = True
 
 
+async def _terminate_posix_pgid(
+    pgid: int,
+    *,
+    grace_seconds: float | None = None,
+    kill_wait_seconds: float | None = None,
+) -> bool:
+    """Terminate a POSIX process group by PGID directly (safe even before ManagedProcess exists)."""
+    if sys.platform == "win32" or pgid <= 0:
+        return True
+    grace = ManagedProcess._POSIX_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    kill_wait = ManagedProcess._POSIX_KILL_WAIT_SECONDS if kill_wait_seconds is None else kill_wait_seconds
+    sigkill = getattr(signal, "SIGKILL", 9)
+    try:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        except Exception:
+            pass
+
+        grace_dl = time.monotonic() + max(0.0, grace)
+        while is_pgid_alive(pgid) and time.monotonic() < grace_dl:
+            await asyncio.sleep(min(0.05, max(0.0, grace_dl - time.monotonic())))
+
+        if is_pgid_alive(pgid):
+            try:
+                os.killpg(pgid, sigkill)
+            except ProcessLookupError:
+                return True
+            except Exception:
+                pass
+            kill_dl = time.monotonic() + max(0.0, kill_wait)
+            while is_pgid_alive(pgid) and time.monotonic() < kill_dl:
+                await asyncio.sleep(min(0.05, max(0.0, kill_dl - time.monotonic())))
+
+        return not is_pgid_alive(pgid)
+    except BaseException:
+        try:
+            os.killpg(pgid, sigkill)
+        except Exception:
+            pass
+        raise
+
+
+async def _terminate_windows_early(popen_obj: Any) -> bool:
+    """Terminate an early-captured (still-suspended) Windows Popen before pipe setup completes."""
+    pid = getattr(popen_obj, "pid", None)
+    handle = getattr(popen_obj, "_handle", None)
+    if sys.platform == "win32" and handle:
+        try:
+            _kernel32.TerminateProcess(wintypes.HANDLE(int(handle)), 1)
+        except Exception:
+            pass
+    try:
+        popen_obj.kill()
+    except Exception:
+        pass
+    if pid and is_pid_alive(int(pid)):
+        dl = time.monotonic() + 1.5
+        while is_pid_alive(int(pid)) and time.monotonic() < dl:
+            await asyncio.sleep(min(0.05, max(0.0, dl - time.monotonic())))
+    if pid and is_pid_alive(int(pid)):
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(int(pid)),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(killer.wait(), timeout=5.0)
+        except Exception:
+            pass
+    try:
+        popen_obj.poll()
+    except Exception:
+        pass
+    return not (pid and is_pid_alive(int(pid)))
+
+
 async def spawn_managed_process(
     *cmd: str,
     cwd: str | None = None,
@@ -692,17 +823,32 @@ async def spawn_managed_process(
     stdout: int | None = asyncio.subprocess.PIPE,
     stderr: int | None = asyncio.subprocess.PIPE,
     tracker: ProcessTracker | None = None,
+    timeout: float | None = None,
 ) -> tuple[asyncio.subprocess.Process, ManagedProcess]:
-    """Spawn and register a contained subprocess as one cancellation-safe operation.
+    """Spawn and register a contained subprocess as one deadline-bounded, cancellation-safe operation.
 
-    - Windows: spawns `CREATE_SUSPENDED`, attaches a Job Object before executing any instruction,
-      and fails closed (terminating the still-suspended worker) if containment fails.
-    - POSIX: runs `create_subprocess_exec` + `ManagedProcess` registration inside an uncancelled
-      task so cancellation during asyncio pipe setup still captures and terminates the process group.
+    - Retains the OS process handle / PGID synchronously as soon as `Popen` creates the child
+      (before asyncio pipe setup completes), so cancellation or timeout during slow pipe setup
+      still kills and verifies the full process group (POSIX) or suspended process (Windows).
+    - Applies `timeout` to startup itself so delayed launches cannot overrun a short deadline.
     """
+    _ensure_spawn_capture_hook()
     use_suspended = sys.platform == "win32"
     resolved_tracker = tracker if tracker is not None else CURRENT_PROCESS_TRACKER.get()
     caller_cancelled = False
+    early_popen: Any = None
+    early_pid: int | None = None
+
+    if timeout is not None and timeout <= 0:
+        raise asyncio.TimeoutError("Execution deadline expired before subprocess launch.")
+
+    def _capture_popen(popen_obj: Any) -> None:
+        nonlocal early_popen, early_pid
+        if early_popen is None:
+            early_popen = popen_obj
+            pid = getattr(popen_obj, "pid", None)
+            if isinstance(pid, int) and pid > 0:
+                early_pid = pid
 
     async def _reap_failed_windows_proc(proc: asyncio.subprocess.Process) -> bool:
         if proc.returncode is None:
@@ -741,18 +887,36 @@ async def spawn_managed_process(
             resolved_tracker.mark_unverified_stop()
         return still_alive
 
+    async def _cleanup_early_captured() -> bool:
+        c0 = time.monotonic()
+        try:
+            if sys.platform == "win32":
+                if early_popen is not None:
+                    return await _terminate_windows_early(early_popen)
+                return True
+            if early_pid is not None:
+                return await _terminate_posix_pgid(early_pid)
+            return True
+        finally:
+            if resolved_tracker is not None:
+                resolved_tracker.add_cleanup_seconds(time.monotonic() - c0)
+
     async def _launch() -> tuple[asyncio.subprocess.Process, ManagedProcess] | None:
         if caller_cancelled:
             return None
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=cwd,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            **subprocess_creation_kwargs(suspended=use_suspended),
-        )
-        # If caller cancelled while Windows process was still suspended, kill it without resuming.
+        tok = _SPAWN_CAPTURE.set(_capture_popen)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                **subprocess_creation_kwargs(suspended=use_suspended),
+            )
+        finally:
+            _SPAWN_CAPTURE.reset(tok)
+
         if caller_cancelled and use_suspended:
             await _reap_failed_windows_proc(proc)
             return None
@@ -773,25 +937,38 @@ async def spawn_managed_process(
     launch_task: asyncio.Task[tuple[asyncio.subprocess.Process, ManagedProcess] | None] = (
         asyncio.create_task(_launch())
     )
+    timed_out_during_spawn = False
     try:
-        result = await asyncio.shield(launch_task)
+        if timeout is None:
+            result = await asyncio.shield(launch_task)
+        else:
+            done, _ = await asyncio.wait({launch_task}, timeout=max(0.0, timeout))
+            if launch_task not in done:
+                timed_out_during_spawn = True
+                raise asyncio.TimeoutError("Execution deadline expired during subprocess startup.")
+            result = launch_task.result()
     except BaseException:
         caller_cancelled = True
-        # Wait briefly (shielded) so POSIX pipe setup + process-group registration finish atomically.
-        wait_deadline = time.monotonic() + _LAUNCH_CANCEL_WAIT_SECONDS
-        while not launch_task.done():
-            rem = wait_deadline - time.monotonic()
-            if rem <= 0:
-                break
-            try:
-                await asyncio.wait({launch_task}, timeout=rem)
-            except asyncio.CancelledError:
-                continue
+
+        # On timeout, cancel immediately; on cancellation, wait briefly for atomic registration
+        # (short grace if OS handle/PGID was already captured, longer fallback if mocked).
+        if not timed_out_during_spawn and not launch_task.done():
+            grace = (
+                _LAUNCH_CAPTURED_GRACE_SECONDS
+                if (early_popen is not None or early_pid is not None)
+                else _LAUNCH_CANCEL_WAIT_SECONDS
+            )
+            wait_deadline = time.monotonic() + grace
+            while not launch_task.done():
+                rem = wait_deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                try:
+                    await asyncio.wait({launch_task}, timeout=rem)
+                except asyncio.CancelledError:
+                    continue
 
         if not launch_task.done():
-            if resolved_tracker is not None:
-                resolved_tracker.mark_unverified_stop()
-
             def _late_cleanup(t: asyncio.Task[Any]) -> None:
                 if t.cancelled():
                     return
@@ -805,9 +982,17 @@ async def spawn_managed_process(
             launch_task.add_done_callback(_late_cleanup)
             launch_task.cancel()
             try:
-                await asyncio.wait({launch_task}, timeout=1.0)
+                await asyncio.wait({launch_task}, timeout=0.5)
             except BaseException:
                 pass
+
+            if early_popen is not None or early_pid is not None:
+                stopped_early = await _cleanup_early_captured()
+                if not stopped_early and resolved_tracker is not None:
+                    resolved_tracker.mark_unverified_stop()
+            elif not launch_task.done() or not launch_task.cancelled():
+                if resolved_tracker is not None:
+                    resolved_tracker.mark_unverified_stop()
             raise
 
         if not launch_task.cancelled():
@@ -822,12 +1007,20 @@ async def spawn_managed_process(
                         managed.terminate_sync()
                         if managed.is_alive() and resolved_tracker is not None:
                             resolved_tracker.mark_unverified_stop()
+            elif early_popen is not None or early_pid is not None:
+                stopped_early = await _cleanup_early_captured()
+                if not stopped_early and resolved_tracker is not None:
+                    resolved_tracker.mark_unverified_stop()
             elif not isinstance(
                 launch_exc,
                 (FileNotFoundError, PermissionError, NotADirectoryError, ProcessContainmentError),
             ):
                 if resolved_tracker is not None:
                     resolved_tracker.mark_unverified_stop()
+        elif early_popen is not None or early_pid is not None:
+            stopped_early = await _cleanup_early_captured()
+            if not stopped_early and resolved_tracker is not None:
+                resolved_tracker.mark_unverified_stop()
         raise
 
     if result is None:
@@ -922,7 +1115,8 @@ async def run_managed_process_io(
                     if exc is not None:
                         raise exc
 
-        # Phase 2: Leader exited — stop stdin writer if still pending.
+        # Phase 2: Leader exited — record work stop time before any descendant cleanup!
+        managed.work_stopped_at = time.monotonic()
         if stdin_task is not None and not stdin_task.done():
             stdin_task.cancel()
             await asyncio.gather(stdin_task, return_exceptions=True)
@@ -964,6 +1158,8 @@ async def run_managed_process_io(
 
         return process_stopped
     except BaseException:
+        if managed.work_stopped_at is None:
+            managed.work_stopped_at = time.monotonic()
         for t in all_tasks:
             if not t.done():
                 t.cancel()

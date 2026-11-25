@@ -65,6 +65,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         started_at REAL,
         finished_at REAL,
         duration_seconds REAL,
+        cleanup_seconds REAL,
         response TEXT NOT NULL DEFAULT '',
         usage_json TEXT,
         provider_metrics_json TEXT,
@@ -194,10 +195,21 @@ def _is_owner_row_alive(
     return bool(is_pid_alive_fn(int(pid)))
 
 
+def is_sqlite_lock_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
 def _row_to_job(row: sqlite3.Row) -> JobRecord:
     keys = row.keys()
     raw_pool = row["quota_pool"] if "quota_pool" in keys else None
     pool = raw_pool or classify_quota_pool(row["backend"], row["model"] or row["requested_model"])
+    provider_metrics = _loads_opt(row["provider_metrics_json"])
+    attempts_val = None
+    if isinstance(provider_metrics, dict) and isinstance(provider_metrics.get("attempts"), list):
+        attempts_val = provider_metrics["attempts"]
     return JobRecord(
         job_id=row["job_id"],
         owner_id=row["owner_id"],
@@ -227,27 +239,46 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         duration_seconds=row["duration_seconds"],
+        cleanup_seconds=row["cleanup_seconds"] if "cleanup_seconds" in keys else None,
         response=row["response"] or "",
         usage=_loads_opt(row["usage_json"]),
-        provider_metrics=_loads_opt(row["provider_metrics_json"]),
+        provider_metrics=provider_metrics,
         usage_status=row["usage_status"] or "missing",
         exit_code=row["exit_code"],
         error=row["error"],
         stderr_tail=row["stderr_tail"],
         last_activity=row["last_activity"],
         provider_invoked=bool(row["provider_invoked"]) if "provider_invoked" in keys else (row["started_at"] is not None),
+        attempts=attempts_val,
     )
 
 
-def _insert_usage_event_cur(cur: sqlite3.Cursor, record: JobRecord) -> None:
-    usage = record.usage if isinstance(record.usage, dict) else {}
-    now_ts = record.finished_at or time.time()
+def _insert_usage_event_row_cur(
+    cur: sqlite3.Cursor,
+    *,
+    job_id: str,
+    owner_id: str,
+    now_ts: float,
+    backend: str,
+    quota_pool: str,
+    model_name: str,
+    effort: str | None,
+    mode: str,
+    status: str,
+    duration_seconds: float,
+    cwd: str,
+    parent_run: str | None,
+    label: str | None,
+    session_id: str | None,
+    usage_status: str,
+    usage: dict[str, Any] | None,
+    provider_metrics: dict[str, Any] | None,
+) -> None:
+    u = usage if isinstance(usage, dict) else {}
     iso_time = datetime.fromtimestamp(now_ts).astimezone().isoformat(timespec="seconds")
-    model_name = record.model or record.requested_model or f"{record.backend}-default"
-    quota_pool = record.quota_pool or classify_quota_pool(record.backend, model_name)
 
     def _opt_int(key: str) -> int | None:
-        v = usage.get(key)
+        v = u.get(key)
         return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
     cur.execute(
@@ -260,32 +291,99 @@ def _insert_usage_event_cur(cur: sqlite3.Cursor, record: JobRecord) -> None:
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            record.job_id,
-            record.owner_id,
+            job_id,
+            owner_id,
             round(now_ts, 3),
             iso_time,
-            record.backend,
+            backend,
             quota_pool,
             model_name,
-            record.effort,
-            record.mode,
-            record.status,
-            round(float(record.duration_seconds or 0.0), 2),
-            record.cwd,
-            record.parent_run,
-            record.label,
-            record.session_id,
-            record.usage_status,
+            effort,
+            mode,
+            status,
+            round(float(duration_seconds or 0.0), 2),
+            cwd,
+            parent_run,
+            label,
+            session_id,
+            usage_status,
             _opt_int("input_tokens"),
             _opt_int("output_tokens"),
             _opt_int("cached_tokens"),
             _opt_int("cache_write_tokens"),
             _opt_int("reasoning_tokens"),
             _opt_int("total_tokens"),
-            json.dumps(record.provider_metrics, separators=(",", ":"))
-            if record.provider_metrics
-            else None,
+            json.dumps(provider_metrics, separators=(",", ":")) if provider_metrics else None,
         ),
+    )
+
+
+def _insert_usage_event_cur(
+    cur: sqlite3.Cursor,
+    record: JobRecord,
+    *,
+    attempts: list[dict[str, Any]] | None = None,
+) -> None:
+    now_ts = record.finished_at or time.time()
+    att_list = attempts if attempts and len(attempts) > 1 else None
+    if att_list is None and record.attempts and len(record.attempts) > 1:
+        att_list = record.attempts
+
+    if att_list is not None:
+        total_att = len(att_list)
+        for idx, att in enumerate(att_list, start=1):
+            is_last = idx == total_att
+            att_model = att.get("model") or record.model or record.requested_model or f"{record.backend}-default"
+            att_pool = att.get("quota_pool") or classify_quota_pool(record.backend, att_model)
+            att_status = str(att.get("status") or (record.status if is_last else "failed"))
+            att_dur = float(att.get("duration_seconds") or 0.0)
+            att_ustatus = str(att.get("usage_status") or "missing")
+            att_usage = att.get("usage") if isinstance(att.get("usage"), dict) else None
+            att_pm = att.get("provider_metrics") if isinstance(att.get("provider_metrics"), dict) else None
+            row_job_id = record.job_id if is_last else f"{record.job_id}#attempt-{idx}"
+            _insert_usage_event_row_cur(
+                cur,
+                job_id=row_job_id,
+                owner_id=record.owner_id,
+                now_ts=now_ts - ((total_att - idx) * 0.001),
+                backend=record.backend,
+                quota_pool=str(att_pool),
+                model_name=str(att_model),
+                effort=att.get("effort") or record.effort,
+                mode=record.mode,
+                status=att_status,
+                duration_seconds=att_dur,
+                cwd=record.cwd,
+                parent_run=record.parent_run,
+                label=record.label,
+                session_id=record.session_id,
+                usage_status=att_ustatus,
+                usage=att_usage,
+                provider_metrics=att_pm,
+            )
+        return
+
+    model_name = record.model or record.requested_model or f"{record.backend}-default"
+    quota_pool = record.quota_pool or classify_quota_pool(record.backend, model_name)
+    _insert_usage_event_row_cur(
+        cur,
+        job_id=record.job_id,
+        owner_id=record.owner_id,
+        now_ts=now_ts,
+        backend=record.backend,
+        quota_pool=str(quota_pool),
+        model_name=model_name,
+        effort=record.effort,
+        mode=record.mode,
+        status=record.status,
+        duration_seconds=float(record.duration_seconds or 0.0),
+        cwd=record.cwd,
+        parent_run=record.parent_run,
+        label=record.label,
+        session_id=record.session_id,
+        usage_status=record.usage_status,
+        usage=record.usage,
+        provider_metrics=record.provider_metrics,
     )
 
 
@@ -455,20 +553,20 @@ class BridgeStore:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, busy_timeout_ms: int = 1000) -> sqlite3.Connection:
         conn = sqlite3.connect(
             str(self.db_path),
-            timeout=10.0,
+            timeout=max(1.0, busy_timeout_ms / 1000.0),
             isolation_level=None,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={max(50, int(busy_timeout_ms))}")
         for attempt in range(6):
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
                 break
             except sqlite3.OperationalError as exc:
-                if "locked" in str(exc).lower() and attempt < 5:
+                if is_sqlite_lock_error(exc) and attempt < 5:
                     time.sleep(0.05 * (attempt + 1))
                     continue
                 raise
@@ -498,6 +596,8 @@ class BridgeStore:
             if "provider_invoked" not in job_cols:
                 cur.execute("ALTER TABLE jobs ADD COLUMN provider_invoked INTEGER NOT NULL DEFAULT 0")
                 cur.execute("UPDATE jobs SET provider_invoked = 1 WHERE started_at IS NOT NULL")
+            if "cleanup_seconds" not in job_cols:
+                cur.execute("ALTER TABLE jobs ADD COLUMN cleanup_seconds REAL")
 
             # Always backfill any NULL quota_pool rows atomically (recovers interrupted prior migrations too).
             if cur.execute("SELECT 1 FROM jobs WHERE quota_pool IS NULL LIMIT 1").fetchone() is not None:
@@ -864,12 +964,29 @@ class BridgeStore:
             logger.info("Imported %d legacy usage events from %s into %s", imported, path, self.db_path)
 
     @contextmanager
-    def _tx(self, *, write: bool = True) -> Iterator[sqlite3.Cursor]:
-        conn = self._connect()
+    def _tx(
+        self,
+        *,
+        write: bool = True,
+        lock_timeout: float = 5.0,
+    ) -> Iterator[sqlite3.Cursor]:
+        busy_ms = max(50, min(1000, int(lock_timeout * 1000)))
+        conn = self._connect(busy_timeout_ms=busy_ms)
         try:
             cur = conn.cursor()
             if write:
-                cur.execute("BEGIN IMMEDIATE")
+                deadline = time.monotonic() + max(0.05, lock_timeout)
+                attempt = 0
+                while True:
+                    try:
+                        cur.execute("BEGIN IMMEDIATE")
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if is_sqlite_lock_error(exc) and time.monotonic() < deadline:
+                            attempt += 1
+                            time.sleep(min(0.15, 0.02 * attempt, max(0.0, deadline - time.monotonic())))
+                            continue
+                        raise
             yield cur
             if write:
                 conn.execute("COMMIT")
@@ -1143,18 +1260,19 @@ class BridgeStore:
         resume_from_job_id: str | None = None,
         exclude_job_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Return the latest committed working directory & worktree metadata from a job that actually executed."""
+        """Return latest committed cwd, worktree, model intent, effort, and parent_run from an executed turn."""
         with self._tx(write=False) as cur:
             if exclude_job_id:
                 rows = cur.execute(
                     """
-                    SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit
+                    SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit,
+                           requested_model, model, quota_pool, effort, parent_run
                     FROM jobs
                     WHERE backend = ? AND session_id = ?
                       AND provider_invoked = 1
                       AND status IN ('completed', 'failed', 'cancelled', 'timed_out')
                       AND job_id != ?
-                    ORDER BY COALESCE(finished_at, created_at) DESC
+                    ORDER BY COALESCE(finished_at, created_at) DESC, rowid DESC
                     LIMIT 10
                     """,
                     (backend, session_id, exclude_job_id),
@@ -1162,12 +1280,13 @@ class BridgeStore:
             else:
                 rows = cur.execute(
                     """
-                    SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit
+                    SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit,
+                           requested_model, model, quota_pool, effort, parent_run
                     FROM jobs
                     WHERE backend = ? AND session_id = ?
                       AND provider_invoked = 1
                       AND status IN ('completed', 'failed', 'cancelled', 'timed_out')
-                    ORDER BY COALESCE(finished_at, created_at) DESC
+                    ORDER BY COALESCE(finished_at, created_at) DESC, rowid DESC
                     LIMIT 10
                     """,
                     (backend, session_id),
@@ -1185,7 +1304,8 @@ class BridgeStore:
             if chosen is None and resume_from_job_id:
                 chosen = cur.execute(
                     """
-                    SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit
+                    SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit,
+                           requested_model, model, quota_pool, effort, parent_run
                     FROM jobs
                     WHERE job_id = ?
                     """,
@@ -1200,6 +1320,14 @@ class BridgeStore:
                 "worktree_path": chosen["worktree_path"],
                 "worktree_branch": chosen["worktree_branch"],
                 "worktree_commit": chosen["worktree_commit"],
+                "requested_model": chosen["requested_model"],
+                "model": chosen["model"],
+                "quota_pool": chosen["quota_pool"] or classify_quota_pool(
+                    backend,
+                    chosen["model"] or chosen["requested_model"],
+                ),
+                "effort": chosen["effort"],
+                "parent_run": chosen["parent_run"],
             }
 
     # --- Per-job CRUD ---
@@ -1291,6 +1419,7 @@ class BridgeStore:
         worktree_commit: str | None = None,
         last_activity: str | None = None,
         provider_invoked: bool | None = None,
+        lock_timeout: float = 2.0,
     ) -> None:
         sets: list[str] = []
         vals: list[Any] = []
@@ -1331,8 +1460,12 @@ class BridgeStore:
             return
         vals.append(job_id)
         now = time.time()
-        with self._tx(write=True) as cur:
-            cur.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?", vals)
+        with self._tx(write=True, lock_timeout=lock_timeout) as cur:
+            cur.execute(
+                f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ? "
+                "AND status NOT IN ('completed', 'failed', 'cancelled', 'timed_out')",
+                vals,
+            )
             # Atomically claim a newly discovered session_id in the SAME transaction that publishes it!
             if session_id is not None:
                 resolved_backend = backend
@@ -1383,8 +1516,10 @@ class BridgeStore:
         watermark_cumulative: dict[str, Any] | None = None,
         watermark_turns: int | None = None,
         touched_provider: bool | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+        lock_timeout: float = 5.0,
     ) -> None:
-        """Atomically persist terminal status, usage event, session claim release, and watermark update/invalidation."""
+        """Atomically and idempotently persist terminal status, per-attempt usage, claim release, and safety state."""
         now = time.time()
         pool = record.quota_pool or classify_quota_pool(
             record.backend,
@@ -1397,7 +1532,13 @@ class BridgeStore:
             else (record.provider_invoked or record.started_at is not None)
         )
         record.provider_invoked = invoked
-        with self._tx(write=True) as cur:
+        att_list = attempts if attempts and len(attempts) > 1 else record.attempts
+        if att_list and len(att_list) > 1:
+            record.attempts = att_list
+            pm = dict(record.provider_metrics) if isinstance(record.provider_metrics, dict) else {}
+            pm["attempts"] = att_list
+            record.provider_metrics = pm
+        with self._tx(write=True, lock_timeout=lock_timeout) as cur:
             cur.execute(
                 """
                 UPDATE jobs SET
@@ -1405,8 +1546,8 @@ class BridgeStore:
                     worktree_path = ?, worktree_branch = ?, worktree_commit = ?,
                     session_id = ?, status = ?, failure_reason = ?, provider_state = ?,
                     retry_guidance = ?, started_at = ?, finished_at = ?, duration_seconds = ?,
-                    response = ?, usage_json = ?, provider_metrics_json = ?, usage_status = ?,
-                    exit_code = ?, error = ?, stderr_tail = ?, last_activity = ?,
+                    cleanup_seconds = ?, response = ?, usage_json = ?, provider_metrics_json = ?,
+                    usage_status = ?, exit_code = ?, error = ?, stderr_tail = ?, last_activity = ?,
                     provider_invoked = ?
                 WHERE job_id = ?
                 """,
@@ -1427,6 +1568,7 @@ class BridgeStore:
                     record.started_at,
                     record.finished_at,
                     record.duration_seconds,
+                    record.cleanup_seconds,
                     record.response[:200_000],
                     json.dumps(record.usage, separators=(",", ":")) if record.usage else None,
                     json.dumps(record.provider_metrics, separators=(",", ":"))
@@ -1441,7 +1583,7 @@ class BridgeStore:
                     record.job_id,
                 ),
             )
-            _insert_usage_event_cur(cur, record)
+            _insert_usage_event_cur(cur, record, attempts=att_list)
 
             # Watermark hygiene for Neon sessions: ONLY touch the checkpoint if the provider was actually
             # invoked! Pre-launch cancellations/timeouts never executed on the session and must preserve
@@ -1787,7 +1929,8 @@ class BridgeStore:
                     SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(cached_tokens, 0) ELSE 0 END) AS cached_tokens,
                     SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(cache_write_tokens, 0) ELSE 0 END) AS cache_write_tokens,
                     SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(reasoning_tokens, 0) ELSE 0 END) AS reasoning_tokens,
-                    SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens
+                    SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
+                    SUM(CASE WHEN usage_status = 'partial' THEN COALESCE(total_tokens, 0) ELSE 0 END) AS partial_total_tokens
                 FROM usage_events
                 {where}
                 GROUP BY backend
@@ -1814,7 +1957,8 @@ class BridgeStore:
                     SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(cached_tokens, 0) ELSE 0 END) AS cached_tokens,
                     SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(cache_write_tokens, 0) ELSE 0 END) AS cache_write_tokens,
                     SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(reasoning_tokens, 0) ELSE 0 END) AS reasoning_tokens,
-                    SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens
+                    SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
+                    SUM(CASE WHEN usage_status = 'partial' THEN COALESCE(total_tokens, 0) ELSE 0 END) AS partial_total_tokens
                 FROM usage_events
                 {where}
                 GROUP BY pool
@@ -1885,7 +2029,7 @@ class BridgeStore:
             }
 
         def _row_to_bucket(r: sqlite3.Row, in_flight_cnt: int) -> dict[str, Any]:
-            return {
+            bucket: dict[str, Any] = {
                 "runs": int(r["runs"] or 0),
                 "completed": int(r["completed"] or 0),
                 "failed": int(r["failed"] or 0),
@@ -1908,6 +2052,10 @@ class BridgeStore:
                     "missing": int(r["cov_missing"] or 0),
                 },
             }
+            partial_total = int(r["partial_total_tokens"] or 0)
+            if partial_total > 0:
+                bucket["partial_total_tokens"] = partial_total
+            return bucket
 
         overall_runs = 0
         overall_completed = 0

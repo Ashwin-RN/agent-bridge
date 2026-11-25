@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from collections.abc import AsyncIterator
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from agent_bridge.config import EffortLevel, Settings, normalize_backend
 from agent_bridge.jobs import JobManager
+from agent_bridge.model_resolver import ModelPoolUnavailableError
 from agent_bridge.storage import UsagePeriod
 
 SERVER_INSTRUCTIONS = """
@@ -39,10 +41,15 @@ Smart Quota & Weekly-Reset Routing:
   (`quota_advisory.upcoming_resets`), and `quota_advisory.expiring_weekly_alerts` / `recommended_order`.
 - If a pool has an `expiring_weekly_alerts` entry (`priority="use_before_reset"`), prioritize routing
   eligible work there so unused weekly quota is leveraged before it resets!
-- Always pass `cwd`. Default `mode` is `"read_only"`. For multi-minute work prefer `start_agent`
-  or `run_parallel(wait=False)` (or a bounded `wait_seconds`), then poll via `check_jobs`.
+- Pass `cwd` on new jobs; omit `cwd` on `resume_from` so the bridge inherits the session's recorded
+  working directory / worktree (pass `relocate_cwd=True` only to intentionally move a resumed session).
+- Default `mode` is `"read_only"`. For multi-minute work prefer `start_agent` or
+  `run_parallel(wait=False)` (or a bounded `wait_seconds`), then poll via `check_jobs`.
 - Turns on the same `session_id` serialize atomically across windows via SQLite; pass `job_id` or
-  `session_id` into `resume_from` to continue a conversation.
+  `session_id` into `resume_from` to continue a conversation (model intent, effort, worktree, and
+  `parent_run` are inherited automatically unless overridden).
+- Treat `status="completed"` as a lifecycle status and still verify that `response` contains the
+  requested deliverable.
 """.strip()
 
 
@@ -73,6 +80,10 @@ class ParallelTaskSpec(BaseModel):
     resume_from: str | None = Field(
         default=None,
         description="Optional prior job_id or session_id to continue.",
+    )
+    relocate_cwd: bool = Field(
+        default=False,
+        description="Set True to intentionally move a resumed session out of its recorded worktree/cwd.",
     )
     worktree: bool = Field(
         default=False,
@@ -183,6 +194,7 @@ def create_server(
         model: str | None = None,
         effort: EffortLevel | None = None,
         resume_from: str | None = None,
+        relocate_cwd: bool = False,
         worktree: bool = False,
         extra_dirs: list[str] | None = None,
         timeout_seconds: int | None = None,
@@ -199,12 +211,14 @@ def create_server(
         - `wait_seconds`: optional shorter MCP wait window; if it expires while the job is still
           running, returns the live `job_id` so you can poll via `check_jobs` without stopping the job.
         - `effort`: optional reasoning effort override (`low`, `medium`, `high`, `xhigh`).
-        - `resume_from`: prior `job_id` or `session_id` to continue (turns on the same session serialize).
+        - `resume_from`: prior `job_id` or `session_id` to continue (inherits worktree/cwd, model intent,
+          effort, and `parent_run` unless overridden; turns on the same session serialize).
+        - `relocate_cwd`: set `True` only to intentionally move a resumed session out of its recorded worktree.
         - `confirm_prior_job_id` / `confirm_prior_stopped`: confirm the specific prior blocking turn
           has stopped before resuming a session whose prior turn ended `possibly_running` / `unknown`.
         - `allow_cross_pool_fallback`: opt in (`True`) to allow falling back across Antigravity quota pools.
         """
-        req = job_manager.prepare_request(
+        req = await job_manager.prepare_request_async(
             backend=backend,
             prompt=prompt,
             cwd=cwd,
@@ -212,6 +226,7 @@ def create_server(
             model=model,
             effort=effort,
             resume_from=resume_from,
+            relocate_cwd=relocate_cwd,
             worktree=worktree,
             extra_dirs=extra_dirs,
             timeout_seconds=timeout_seconds,
@@ -223,7 +238,7 @@ def create_server(
         )
         record = await job_manager.run(req, wait_seconds=wait_seconds)
         detail = record.to_detail()
-        detail["session_usage"] = job_manager.store.session_compact_summary(job_manager.owner_id)
+        detail["session_usage"] = await job_manager.session_compact_summary_async()
         return detail
 
     @mcp.tool(
@@ -241,6 +256,7 @@ def create_server(
         model: str | None = None,
         effort: EffortLevel | None = None,
         resume_from: str | None = None,
+        relocate_cwd: bool = False,
         worktree: bool = False,
         extra_dirs: list[str] | None = None,
         timeout_seconds: int | None = None,
@@ -254,7 +270,7 @@ def create_server(
 
         Use `check_jobs(job_ids=[job_id], wait_seconds=60)` to collect results or monitor progress.
         """
-        req = job_manager.prepare_request(
+        req = await job_manager.prepare_request_async(
             backend=backend,
             prompt=prompt,
             cwd=cwd,
@@ -262,6 +278,7 @@ def create_server(
             model=model,
             effort=effort,
             resume_from=resume_from,
+            relocate_cwd=relocate_cwd,
             worktree=worktree,
             extra_dirs=extra_dirs,
             timeout_seconds=timeout_seconds,
@@ -271,7 +288,7 @@ def create_server(
             confirm_prior_job_id=confirm_prior_job_id,
             allow_cross_pool_fallback=allow_cross_pool_fallback,
         )
-        record = job_manager.start(req)
+        record = await job_manager.start_async(req)
         return {
             "job_id": record.job_id,
             "owner_id": record.owner_id,
@@ -315,7 +332,7 @@ def create_server(
             raise ValueError("At most 10 parallel tasks may be launched in a single call.")
 
         requests = [
-            job_manager.prepare_request(
+            await job_manager.prepare_request_async(
                 backend=spec.backend,
                 prompt=spec.prompt,
                 cwd=spec.cwd or cwd,
@@ -323,6 +340,7 @@ def create_server(
                 model=spec.model,
                 effort=spec.effort,
                 resume_from=spec.resume_from,
+                relocate_cwd=spec.relocate_cwd,
                 worktree=spec.worktree,
                 extra_dirs=spec.extra_dirs,
                 timeout_seconds=timeout_seconds,
@@ -346,7 +364,7 @@ def create_server(
             "count": len(records),
             "all_done": all(r.is_terminal for r in records),
             "results": [r.to_detail() if wait else r.to_summary() for r in records],
-            "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
+            "session_usage": await job_manager.session_compact_summary_async(),
         }
 
     @mcp.tool(
@@ -384,10 +402,10 @@ def create_server(
                 "all_done": all(r.is_terminal for r in records),
                 "any_done": any(r.is_terminal for r in records),
                 "jobs": [r.to_detail() for r in records],
-                "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
+                "session_usage": await job_manager.session_compact_summary_async(),
             }
 
-        summaries = job_manager.list_jobs(
+        summaries = await job_manager.list_jobs_async(
             limit=limit,
             status=status,
             backend=backend,
@@ -397,7 +415,7 @@ def create_server(
         return {
             "count": len(summaries),
             "jobs": summaries,
-            "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
+            "session_usage": await job_manager.session_compact_summary_async(),
         }
 
     @mcp.tool(
@@ -456,7 +474,7 @@ def create_server(
         requests = []
         for backend in normalized_backends:
             if backend == "codex" and not (focus and focus.strip()):
-                req = job_manager.prepare_request(
+                req = await job_manager.prepare_request_async(
                     backend="codex",
                     prompt="",
                     cwd=cwd,
@@ -471,7 +489,7 @@ def create_server(
                     review_commit=commit,
                 )
             else:
-                req = job_manager.prepare_request(
+                req = await job_manager.prepare_request_async(
                     backend=backend,
                     prompt=prompt_for_custom,
                     cwd=cwd,
@@ -498,7 +516,7 @@ def create_server(
             "commit": commit,
             "all_done": all(r.is_terminal for r in records),
             "reviews": [r.to_detail() if wait else r.to_summary() for r in records],
-            "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
+            "session_usage": await job_manager.session_compact_summary_async(),
         }
 
     @mcp.tool(
@@ -552,40 +570,75 @@ def create_server(
         include_quota: bool = False,
     ) -> dict[str, Any]:
         """Check CLI discovery, health, live/cached agy pools (Gemini + Claude/GPT), Codex defaults, and optional quota."""
-        neon_health = await job_manager.neon_runner.check_health()
-        neon_info: dict[str, Any] = {
-            "backend": "neon",
-            "cli": "agy",
-            "default_intent": cfg.default_neon_model,
-            **neon_health,
-        }
-        if neon_health["healthy"]:
-            models = await job_manager.neon_runner.list_models(refresh=refresh_models)
-            neon_info.update(job_manager.neon_runner.catalog.status_info())
-            neon_info["models"] = models
-            neon_info["quota_pools"] = (
-                job_manager.neon_runner.catalog.group_models_by_quota_pool()
-            )
-            neon_info["resolved_shortcuts"] = (
-                job_manager.neon_runner.catalog.summarize_latest_aliases()
-            )
-            default_res = await job_manager.neon_runner.catalog.resolve(
-                None, default_intent=cfg.default_neon_model
-            )
-            neon_info["resolved_default_model"] = default_res.resolved
-        else:
-            neon_info.update(job_manager.neon_runner.catalog.status_info())
+        async def _probe_neon() -> dict[str, Any]:
+            try:
+                neon_health = await job_manager.neon_runner.check_health()
+            except Exception as exc:
+                neon_health = {
+                    "command_found": False,
+                    "healthy": False,
+                    "available": False,
+                    "command": None,
+                    "version": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            info: dict[str, Any] = {
+                "backend": "neon",
+                "cli": "agy",
+                "default_intent": cfg.default_neon_model,
+                **neon_health,
+            }
+            if neon_health.get("healthy"):
+                try:
+                    models = await job_manager.neon_runner.list_models(refresh=refresh_models)
+                except Exception as exc:
+                    models = []
+                    info["catalog_error"] = f"{type(exc).__name__}: {exc}"
+                info.update(job_manager.neon_runner.catalog.status_info())
+                info["models"] = models
+                info["quota_pools"] = job_manager.neon_runner.catalog.group_models_by_quota_pool()
+                info["resolved_shortcuts"] = job_manager.neon_runner.catalog.summarize_latest_aliases()
+                try:
+                    default_res = await job_manager.neon_runner.catalog.resolve(
+                        None,
+                        default_intent=cfg.default_neon_model,
+                    )
+                    info["resolved_default_model"] = default_res.resolved
+                except ModelPoolUnavailableError as exc:
+                    info["resolved_default_model"] = None
+                    info["catalog_error"] = str(exc)
+                    info["available"] = False
+                except Exception as exc:
+                    info["resolved_default_model"] = None
+                    info["catalog_error"] = f"{type(exc).__name__}: {exc}"
+                    info["available"] = False
+            else:
+                info.update(job_manager.neon_runner.catalog.status_info())
+            return info
 
-        codex_health = await job_manager.codex_runner.check_health()
-        codex_info: dict[str, Any] = {
-            "backend": "codex",
-            "cli": "codex",
-            "default_model": cfg.default_codex_model,
-            "default_effort": cfg.default_codex_effort,
-            "configured_model_override": cfg.default_codex_model,
-            "configured_effort_override": cfg.default_codex_effort,
-            **codex_health,
-        }
+        async def _probe_codex() -> dict[str, Any]:
+            try:
+                codex_health = await job_manager.codex_runner.check_health()
+            except Exception as exc:
+                codex_health = {
+                    "command_found": False,
+                    "healthy": False,
+                    "available": False,
+                    "command": None,
+                    "version": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            return {
+                "backend": "codex",
+                "cli": "codex",
+                "default_model": cfg.default_codex_model,
+                "default_effort": cfg.default_codex_effort,
+                "configured_model_override": cfg.default_codex_model,
+                "configured_effort_override": cfg.default_codex_effort,
+                **codex_health,
+            }
+
+        neon_info, codex_info = await asyncio.gather(_probe_neon(), _probe_codex())
 
         out: dict[str, Any] = {
             "owner_id": job_manager.owner_id,
@@ -593,7 +646,7 @@ def create_server(
             "default_timeout_seconds": cfg.default_timeout_seconds,
             "max_concurrent_jobs_per_process": cfg.max_concurrent_jobs,
             "db_path": str(job_manager.store.db_path),
-            "session_usage": job_manager.store.session_compact_summary(job_manager.owner_id),
+            "session_usage": await job_manager.session_compact_summary_async(),
             "backends": {
                 "neon": neon_info,
                 "codex": codex_info,
