@@ -395,7 +395,7 @@ A bad argument (an unknown backend, a folder that does not exist, `worktree=True
 | `model_unavailable` | The model was rejected, or the pool has no model to offer | `list_backends` with `refresh_models=True`, or name another model |
 | `transient_service` | A network or server error | Try again. For an edit job, look at `git diff` first |
 | `interactive_fallback` | `agy` wanted an approval that nobody can give | Use Codex in `edit` mode with a worktree |
-| `permission_error` | The sandbox refused something | Use `edit`, or add the folder with `extra_dirs`, if you meant to allow it |
+| `permission_error` | The sandbox refused something, or `agy` denied an action it could not ask about and ended the turn with no reply | Use `edit` or `extra_dirs` if you meant to allow it. For `agy`, resume and tell it to use its file tools, or add an allow rule in `agy`'s `settings.json` |
 | `cli_error` | Anything else, a missing CLI included | Read `error` and `stderr_tail`; run `list_backends` |
 | `launch_error` | The subprocess could not be started safely | Read `error` |
 | `cancelled` | Cancelled | For an edit job, look at `git diff` |
@@ -425,14 +425,16 @@ The bridge does not sandbox anything itself. It asks each CLI to, and the CLI's 
 | `codex`, `edit` | Sandbox `workspace-write` on `cwd` and each `extra_dirs` folder | Codex may change files there |
 | `codex`, `edit`, `worktree=True` | The same, on the new worktree, plus the repository's `.git` folder | Codex may change the worktree and commit to its branch. The `.git` folder is the main repository's, so its refs are writable too |
 | `codex`, review with no `focus` | Sandbox `read-only` | Read only |
-| `agy`, `read_only` | `--mode plan` | `agy`'s own plan mode: it reads and plans rather than edits. It still writes its own notes and reports in its own data folder under your home directory |
-| `agy`, `edit` | `--mode accept-edits` | `agy` may edit files in `cwd` and `extra_dirs`. If it stops to ask for an approval, the job fails with `interactive_fallback` |
+| `agy`, `read_only` | No mode flag, and an instruction at the top of the prompt: this is a read-only run, change no file, say at the end whether you changed one | Read-only by instruction, not by a sandbox. `agy` is able to write files here, so check `git status` after a run that matters. Shell commands run in `agy`'s own sandbox |
+| `agy`, `edit` | No mode flag | `agy`'s default headless mode: it may edit files in `cwd` and `extra_dirs`, and shell commands run in its own sandbox |
 
 Also true in every mode:
 
 - The subprocess runs in `cwd` and inherits the environment of Claude Code, variables and all.
 - The bridge never commits, pushes or merges.
 - Your prompt and the files the subagent reads go to that CLI's provider, under your account there.
+- `agy` cannot ask for an approval when run this way. An action that needs one is denied, the turn ends with no reply, and the job fails with `permission_error`.
+- The bridge starts `agy` with no `--mode` on purpose. With `--mode plan` or `--mode accept-edits`, every shell command needs an approval, so most jobs ended empty.
 - For unattended edits, prefer Codex with `mode="edit"` and `worktree=True`. `agy` has no worktree option.
 
 ## Edits in a worktree
@@ -640,7 +642,7 @@ Then remove any worktrees you no longer need (`git worktree remove`, from each r
 | Claude Code does not list the bridge's tools | It was registered after Claude Code started. Restart, or reconnect from `/mcp`. Check the path with `claude mcp get agent-bridge` |
 | `command_found: false` for a backend | That CLI is not on `PATH`. Install it, or set `AGENT_BRIDGE_AGY_BIN` or `AGENT_BRIDGE_CODEX_BIN` |
 | `auth_error` | Sign in to that CLI in a terminal, then try again |
-| A job is `completed` but the reply is one line such as "I'll start by reading the files", or empty | The model ended its turn early. Resume the job and tell it to finish in one turn and put the whole answer in its reply. Asking for this in the first prompt helps |
+| An `agy` job comes back with one line such as "I'll start by reading the files", or with no reply | `agy` denied an action it could not ask about, most often a shell command, and ended the turn. With no reply the job now fails with `permission_error`; with a line of text it still reads `completed`. Resume it and tell it to use its file tools |
 | The reply points to a report file instead of holding the answer | `agy` wrote its answer to a file in its own data folder. Open that file, or ask for the answer in the reply itself |
 | `timed_out` on a job that was doing fine | The 300 second default. Pass a larger `timeout_seconds` |
 | `timed_out` after a few seconds, with `provider_timeout_still_running` and an `error` about quota | The pool is out of quota; `agy` sometimes reports it this way. The `error` text gives the reset time. Use another pool until then |

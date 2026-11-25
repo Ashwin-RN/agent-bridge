@@ -43,6 +43,11 @@ from agent_bridge.usage import (
 logger = logging.getLogger("agent_bridge.runners")
 
 AGY_MAX_INLINE_PROMPT_CHARS = 20_000
+AGY_READ_ONLY_GUARD = (
+    "This is a read-only run. Do not create, edit, move or delete any file, and do not run any command "
+    "that changes anything. Put your whole answer in your final reply, and end it with one line saying "
+    "whether you changed any file.\n\n"
+)
 STDERR_TAIL_MAX_CHARS = 4_000
 TRANSIENT_RETRY_BACKOFF_SECONDS = 2.0
 TRANSIENT_RETRY_MIN_REMAINING_SECONDS = 12.0
@@ -960,6 +965,9 @@ class NeonRunner:
     async def list_models(self, *, refresh: bool = False) -> list[dict[str, str]]:
         return await self.catalog.get_models(refresh=refresh)
 
+    # Put before every read_only prompt. A subclass may blank it.
+    read_only_guard: str = AGY_READ_ONLY_GUARD
+
     def build_args(
         self,
         request: RunRequest,
@@ -978,8 +986,10 @@ class NeonRunner:
             *self.resolve_command(),
             "--output-format",
             "stream-json",
-            "--mode",
-            "plan" if request.mode == "read_only" else "accept-edits",
+            # No --mode: headless agy then runs in its own default (auto where available), where shell
+            # commands run in its sandbox. `--mode plan` and `--mode accept-edits` make every shell command
+            # need an approval nobody can give headless, and the denial ends the turn with an empty reply.
+            # A read_only job is kept read-only by AGY_READ_ONLY_GUARD in the prompt, not by a flag.
             "--print-timeout",
             f"{print_timeout_sec}s",
         ]
@@ -1391,6 +1401,51 @@ class NeonRunner:
                 session_id = cid
             response_text = str(envelope.get("response", "")).strip() or partial_text
 
+            # Headless agy cannot ask for an approval: it denies the action, ends the turn with no reply,
+            # and still exits 0 with status SUCCESS. That is not a completed job.
+            denied_actions = envelope.get("denied_actions")
+            if turn_completed_cleanly and not response_text and isinstance(denied_actions, list) and denied_actions:
+                denied_names = ", ".join(
+                    sorted(
+                        {
+                            str(d.get("action") or d.get("display_name") or "unknown")
+                            for d in denied_actions
+                            if isinstance(d, dict)
+                        }
+                    )
+                ) or "unknown"
+                return RunResult(
+                    status="failed",
+                    response="",
+                    session_id=session_id,
+                    model=actual_model,
+                    effort=request.effort,
+                    model_notice=combined_notice,
+                    effective_cwd=request.cwd,
+                    duration_seconds=elapsed,
+                    cleanup_seconds=cleanup_secs,
+                    usage=usage,
+                    provider_metrics=provider_metrics,
+                    usage_status=usage_status,
+                    cumulative_usage=published_cumulative,
+                    num_turns=published_turns,
+                    observed_num_turns=num_turns,
+                    observed_turn_progress=observed_progress,
+                    exit_code=0,
+                    error=(
+                        f"agy denied an action it could not ask about in headless mode ({denied_names}) "
+                        "and ended the turn with no reply."
+                    ),
+                    failure_reason="permission_error",
+                    provider_state="stopped" if process_stopped else "possibly_running",
+                    retry_guidance=(
+                        "Resume the session and tell the subagent to use its file tools instead of the denied "
+                        "action, or add an allow rule for it in agy's settings.json."
+                    ),
+                    stderr_tail=stderr_tail,
+                    provider_invoked=True,
+                )
+
             if turn_completed_cleanly:
                 return RunResult(
                     status="completed",
@@ -1542,6 +1597,9 @@ class NeonRunner:
                     f"Read the file {prompt_file} completely and follow all "
                     "instructions inside it."
                 )
+
+            if request.mode == "read_only" and self.read_only_guard:
+                prompt_text = self.read_only_guard + prompt_text
 
             rem_before_lookup = overall_deadline - time.monotonic()
             if rem_before_lookup <= 0.05:

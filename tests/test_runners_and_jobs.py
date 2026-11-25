@@ -44,6 +44,9 @@ def _make_settings(tmp_path: Path, **overrides: object) -> Settings:
 
 
 class StubAgyRunner(NeonRunner):
+    # The stand-in scripts match prompts word for word, so the read-only guard is off here.
+    read_only_guard = ""
+
     def __init__(self, settings: Settings, script_path: Path) -> None:
         self._script_path = script_path
         super().__init__(settings)
@@ -3523,3 +3526,76 @@ async def test_cancel_during_retry_backoff_preserves_attempt1_usage_and_real_job
         assert "#attempt-" not in entry["job_id"]
         assert mgr.get(entry["job_id"]).job_id == job.job_id
     await mgr.shutdown()
+
+
+async def test_agy_runs_without_mode_flag_and_read_only_gets_the_guard(tmp_path: Path) -> None:
+    """agy is started with no --mode; a read_only prompt carries the guard, an edit prompt does not."""
+    fake_agy = tmp_path / "fake_agy_args.py"
+    fake_agy.write_text(
+        """
+import json, sys
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+prompt = next(a for a in args if a.startswith("--print="))[len("--print="):]
+reply = json.dumps({"has_mode": "--mode" in args, "prompt": prompt})
+print(json.dumps({"event": "init", "conversation_id": "conv-args", "init": {"model": "gemini-4-neon-medium"}}), flush=True)
+print(json.dumps({"event": "result", "result": {"conversation_id": "conv-args", "status": "SUCCESS", "response": reply, "num_turns": 1}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+    from agent_bridge.runners import AGY_READ_ONLY_GUARD
+
+    class GuardedStub(StubAgyRunner):
+        read_only_guard = AGY_READ_ONLY_GUARD
+
+    settings = _make_settings(tmp_path)
+    manager = JobManager(settings, neon_runner=GuardedStub(settings, fake_agy))
+
+    ro = await manager.run(manager.prepare_request(backend="neon", model="neon-medium", prompt="look around"))
+    assert ro.status == "completed"
+    seen = json.loads(ro.response)
+    assert seen["has_mode"] is False
+    assert seen["prompt"] == AGY_READ_ONLY_GUARD + "look around"
+
+    ed = await manager.run(
+        manager.prepare_request(backend="neon", model="neon-medium", prompt="fix it", mode="edit")
+    )
+    assert ed.status == "completed"
+    seen = json.loads(ed.response)
+    assert seen["has_mode"] is False
+    assert seen["prompt"] == "fix it"
+    await manager.shutdown()
+
+
+async def test_agy_denied_action_with_empty_reply_is_a_permission_failure(tmp_path: Path) -> None:
+    """Headless agy exits 0 with SUCCESS and no reply after a denied action: that is failed, not completed."""
+    fake_agy = tmp_path / "fake_agy_denied.py"
+    fake_agy.write_text(
+        """
+import json, sys
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+cid = "conv-denied"
+print(json.dumps({"event": "init", "conversation_id": cid, "init": {"model": "gemini-4-neon-medium"}}), flush=True)
+print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": "", "num_turns": 1, "denied_actions": [{"action": "command", "display_name": "Bash"}]}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+    settings = _make_settings(tmp_path)
+    manager = JobManager(settings, neon_runner=StubAgyRunner(settings, fake_agy))
+
+    rec = await manager.run(manager.prepare_request(backend="neon", model="neon-medium", prompt="look around"))
+    assert rec.status == "failed"
+    assert rec.failure_reason == "permission_error"
+    assert rec.provider_state == "stopped"
+    assert "command" in (rec.error or "")
+    assert rec.session_id == "conv-denied"
+    await manager.shutdown()
