@@ -1,0 +1,165 @@
+"""Tests for dynamic, self-healing model resolution."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import pytest
+
+from agent_bridge.model_resolver import (
+    NeonModelCatalog,
+    is_model_unavailable_error,
+    parse_agy_model_id,
+)
+
+SAMPLE_CATALOG_V4 = [
+    {"id": "gemini-4-neon-high", "label": "Gemini 4 Neon (High)"},
+    {"id": "gemini-4-neon-xhigh", "label": "Gemini 4 Neon (XHigh)"},
+    {"id": "gemini-4-neon-medium", "label": "Gemini 4 Neon (Medium)"},
+    {"id": "gemini-4-neon-low", "label": "Gemini 4 Neon (Low)"},
+    {"id": "gemini-4-hydrogen-high", "label": "Gemini 4 Hydrogen (High)"},
+    {"id": "gemini-4-hydrogen-xhigh", "label": "Gemini 4 Hydrogen (XHigh)"},
+    {"id": "gemini-pro-orchestrator-neon", "label": "Orchestrator (Neon)"},
+    {"id": "gemini-3.8-flash-high", "label": "Gemini 3.8 Flash (High)"},
+    {"id": "gemini-3.8-flash-low", "label": "Gemini 3.8 Flash (Low)"},
+]
+
+SAMPLE_CATALOG_V5 = [
+    *SAMPLE_CATALOG_V4,
+    {"id": "gemini-4.5-neon-high", "label": "Gemini 4.5 Neon (High)"},
+    {"id": "gemini-5-neon-high", "label": "Gemini 5 Neon (High)"},
+    {"id": "gemini-5-neon-xhigh", "label": "Gemini 5 Neon (XHigh)"},
+    {"id": "gemini-5-neon-medium", "label": "Gemini 5 Neon (Medium)"},
+    {"id": "gemini-4.2-flash-high", "label": "Gemini 4.2 Flash (High)"},
+]
+
+
+def test_parse_agy_model_id() -> None:
+    p = parse_agy_model_id("gemini-4-neon-xhigh")
+    assert p.provider == "gemini"
+    assert p.version == (4,)
+    assert p.family == "neon"
+    assert p.tier == "xhigh"
+    assert not p.is_orchestrator
+
+    p2 = parse_agy_model_id("gemini-3.8-flash-low")
+    assert p2.version == (3, 8)
+    assert p2.family == "flash"
+    assert p2.tier == "low"
+
+    p3 = parse_agy_model_id("gemini-pro-orchestrator-neon")
+    assert p3.is_orchestrator
+
+
+async def test_versionless_intent_picks_highest_version(tmp_path: Path) -> None:
+    async def fetch() -> list[dict[str, str]]:
+        return list(SAMPLE_CATALOG_V5)
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
+
+    res_default = await catalog.resolve(None, default_intent="neon-high")
+    assert res_default.resolved == "gemini-5-neon-high"
+    assert res_default.notice is None
+
+    res_xhigh = await catalog.resolve("neon-xhigh")
+    assert res_xhigh.resolved == "gemini-5-neon-xhigh"
+    assert res_xhigh.notice is None
+
+    res_flash = await catalog.resolve("flash")
+    assert res_flash.resolved == "gemini-4.2-flash-high"
+    assert res_flash.notice is None
+
+
+async def test_retired_exact_model_auto_upgrades_seamlessly(tmp_path: Path) -> None:
+    # Catalog only has Gemini 5 Neon; caller passed retired gemini-4-neon-high.
+    only_v5 = [
+        {"id": "gemini-5-neon-high", "label": "Gemini 5 Neon (High)"},
+        {"id": "gemini-5-neon-medium", "label": "Gemini 5 Neon (Medium)"},
+        {"id": "gemini-5-neon-xhigh", "label": "Gemini 5 Neon (XHigh)"},
+    ]
+
+    async def fetch() -> list[dict[str, str]]:
+        return list(only_v5)
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
+    res = await catalog.resolve("gemini-4-neon-high")
+    assert res.resolved == "gemini-5-neon-high"
+    assert res.notice is not None
+    assert "gemini-5-neon-high" in res.notice
+
+
+async def test_tier_fallback_when_tier_missing(tmp_path: Path) -> None:
+    only_medium_high = [
+        {"id": "gemini-5-neon-high", "label": "Gemini 5 Neon (High)"},
+        {"id": "gemini-5-neon-medium", "label": "Gemini 5 Neon (Medium)"},
+    ]
+
+    async def fetch() -> list[dict[str, str]]:
+        return list(only_medium_high)
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
+    res = await catalog.resolve("neon-xhigh")
+    assert res.resolved == "gemini-5-neon-high"
+
+
+async def test_newer_version_wins_over_older_exact_tier(tmp_path: Path) -> None:
+    mixed = [
+        {"id": "gemini-4-neon-high", "label": "Gemini 4 Neon (High)"},
+        {"id": "gemini-5-neon-medium", "label": "Gemini 5 Neon (Medium)"},
+    ]
+
+    async def fetch() -> list[dict[str, str]]:
+        return list(mixed)
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
+    res = await catalog.resolve("neon-high")
+    assert res.resolved == "gemini-5-neon-medium"
+
+
+async def test_stale_cache_refreshes_on_new_exact_model(tmp_path: Path) -> None:
+    cache_path = tmp_path / "models.json"
+    # Seed disk cache 60 seconds ago with v4 only.
+    cache_path.write_text(
+        json.dumps({"fetched_at": time.time() - 60, "models": SAMPLE_CATALOG_V4}),
+        encoding="utf-8",
+    )
+    calls = 0
+
+    async def fetch() -> list[dict[str, str]]:
+        nonlocal calls
+        calls += 1
+        return list(SAMPLE_CATALOG_V5)
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=cache_path, ttl_seconds=900)
+    # Request a brand-new v5 model that wasn't in the cached v4 catalog.
+    res = await catalog.resolve("gemini-5-neon-xhigh")
+    assert calls == 1
+    assert res.resolved == "gemini-5-neon-xhigh"
+    assert res.notice is None
+
+
+async def test_empty_catalog_falls_back_to_cli_default(tmp_path: Path) -> None:
+    async def fetch() -> list[dict[str, str]]:
+        raise RuntimeError("offline")
+
+    catalog = NeonModelCatalog(fetcher=fetch, cache_path=tmp_path / "models.json")
+    res = await catalog.resolve("neon-high")
+    assert res.resolved is None
+    assert res.notice is not None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Error: unknown model 'gemini-3-neon-high'", True),
+        ("model `gpt-4.9-old` not found", True),
+        ("Unsupported model specified", True),
+        ("API returned model_not_found", True),
+        ("SyntaxError: unexpected token in foo.py", False),
+        ("Permission denied reading file", False),
+    ],
+)
+def test_is_model_unavailable_error(text: str, expected: bool) -> None:
+    assert is_model_unavailable_error(text) is expected
