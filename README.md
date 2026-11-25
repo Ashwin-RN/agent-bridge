@@ -49,7 +49,7 @@ What you can do with it:
 | Python 3.12 or newer and [`uv`](https://docs.astral.sh/uv/) | To install and run the bridge |
 | Claude Code (`claude`) | The client that calls the bridge. Any MCP client that runs a stdio server works too |
 | `codex` CLI, installed and signed in | For the `codex` backend |
-| `agy` CLI, installed and signed in | For the Gemini, Claude and GPT models that Antigravity offers |
+| `agy` CLI 1.5.7 or newer, installed and signed in | For the Gemini, Claude and GPT models that Antigravity offers. From 1.5.7 a headless run lets shell commands through in `agy`'s own sandbox; the bridge relies on that |
 | `git` | Only for worktree edits and code review |
 
 You need at least one of `codex` and `agy`. With only one, the other backend shows `command_found: false` in `list_backends` and its jobs fail; everything else works.
@@ -423,7 +423,7 @@ The bridge does not sandbox anything itself. It asks each CLI to, and the CLI's 
 |---|---|---|
 | `codex`, `read_only` | Sandbox `read-only` | Codex's own read-only sandbox: reading, no writes |
 | `codex`, `edit` | Sandbox `workspace-write` on `cwd` and each `extra_dirs` folder | Codex may change files there |
-| `codex`, `edit`, `worktree=True` | The same, on the new worktree, plus the repository's `.git` folder | Codex may change the worktree and commit to its branch. The `.git` folder is the main repository's, so its refs are writable too |
+| `codex`, `edit`, `worktree=True` | The same, on the new worktree, plus the repository's `.git` folder | Codex may change files in the worktree. The bridge also offers it the main repository's `.git` folder so that it can commit, but on Windows Codex's sandbox still refused the commit in testing (`index.lock`, access denied). Expect the edits uncommitted, and commit them yourself |
 | `codex`, review with no `focus` | Sandbox `read-only` | Read only |
 | `agy`, `read_only` | No mode flag, and an instruction at the top of the prompt: this is a read-only run, change no file, say at the end whether you changed one | Read-only by instruction, not by a sandbox. `agy` is able to write files here, so check `git status` after a run that matters. Shell commands run in `agy`'s own sandbox |
 | `agy`, `edit` | No mode flag | `agy`'s default headless mode: it may edit files in `cwd` and `extra_dirs`, and shell commands run in its own sandbox |
@@ -443,7 +443,7 @@ Also true in every mode:
 
 1. Before the job starts, the bridge makes a worktree from the repository's current `HEAD` commit. Uncommitted changes in your checkout are not in it.
 2. It lives at `<state dir>/worktrees/<repo name>-<hash>/<job_id>`, on a new branch `agent-bridge/<job_id>`. If `cwd` was a subfolder, the job runs in the same subfolder of the worktree.
-3. The result gives `worktree_path`, `worktree_branch` and `worktree_commit`.
+3. The result gives `worktree_path`, `worktree_branch` and `worktree_commit`. `worktree_commit` is the commit the worktree stands on; if it is the one it started from, the edits are there but not committed.
 4. A resume of that session goes back to the same worktree.
 
 Getting the work out is yours to do:
@@ -458,7 +458,7 @@ git merge agent-bridge/<job_id>                                           # from
 The bridge never deletes a worktree or its branch. When you are done:
 
 ```
-git worktree remove <worktree_path>
+git worktree remove <worktree_path>          # add --force if it still holds uncommitted changes you do not want
 git branch -D agent-bridge/<job_id>
 ```
 
@@ -537,6 +537,7 @@ Without `include_quota`, `get_usage` reports only what the bridge itself ran: ru
 - `exact` and `delta` counts go into the token totals. `partial` counts are shown apart, and `missing` means the CLI gave no figure.
 - A job that was retried counts as one run with two attempts.
 - Work you do in `codex` or `agy` outside the bridge is not in these counts. It does show in the quota reading.
+- Codex's built-in review (`review_code` with no `focus`) reports no token counts, so it shows as 0 tokens.
 
 ## Optional CLAUDE.md snippet
 
@@ -570,6 +571,7 @@ Limits: the name is fixed when the agent starts, so it shows no progress; the ag
 To make it the habit, add this beside the snippet above:
 
 ```markdown
+- Routing: quick checks go to `hydrogen-medium`. Claude models through `agy` use that pool's quota fast (seven Opus reading jobs took 45% of a week in one test): keep them for when that pool is about to reset with quota unused, or when your Claude plan is running low.
 - Make each `agent-bridge` job visible: start one Haiku agent per job, named `<model>: <task>` (for example `neon-high: review auth`). It only makes the bridge call, waits with `check_jobs(wait_seconds=90)` until the job ends, and replies with `job_id`, `status`, `model`, `elapsed_seconds`, `total_tokens`, `failure_reason` and whether `response` is empty. It never relays or rewords the response: read that yourself with `check_jobs(job_ids=[...])`. If you stop the agent, cancel its job by id too.
 ```
 
@@ -618,16 +620,37 @@ What to know about the database:
 
 ## Update and uninstall
 
-Update:
+### Update an existing install
 
-```
-git pull
-uv sync
-```
+These steps are written so that you can hand them to an agent on the machine: "pull and update agent-bridge as its README says".
 
-Then restart Claude Code, or reconnect `agent-bridge` from `/mcp`. A running Claude Code keeps the old code until then.
+1. In the cloned folder:
 
-Uninstall:
+   ```
+   git pull
+   uv sync
+   uv run pytest
+   ```
+
+   Every test should pass. They spend no quota.
+
+2. Check the CLIs: `agy --version` is 1.5.7 or newer, `codex --version` answers, and both are signed in. Update a CLI that is older.
+
+3. Check the registration still points at this folder: `claude mcp get agent-bridge`. If it is missing, register it as in [Install](#install).
+
+4. Restart Claude Code, or reconnect `agent-bridge` from `/mcp`. A running Claude Code keeps the old code until then. An agent cannot do this step for the chat it is running in: do it yourself, then open a new chat.
+
+5. In the new chat, confirm the new code is live. Ask Claude to run this through the bridge on `backend="neon"`, `model="hydrogen-medium"`, read only, in the cloned folder:
+
+   > Run the shell command `git log --oneline -1` and tell me what it prints, in one line.
+
+   A current install answers with the commit line and ends with a sentence saying no file was changed. An old install comes back with no reply.
+
+6. Optional, per project: add the lines from [Optional CLAUDE.md snippet](#optional-claudemd-snippet) and [Optional: see each job as an agent](#optional-see-each-job-as-an-agent) to the project's `CLAUDE.md`, or to a `CLAUDE.local.md` beside it if you want them kept out of Git.
+
+Nothing in `~/.agent-bridge` needs changing on an update. The database is brought up to date by the bridge itself.
+
+### Uninstall
 
 ```
 claude mcp remove agent-bridge
@@ -652,6 +675,8 @@ Then remove any worktrees you no longer need (`git worktree remove`, from each r
 | "must be cancelled from that window" | The job belongs to another open Claude Code. Cancel it there |
 | `owner_exited` | The window that ran the job closed. For an edit job, check what it left, then run it again |
 | `interactive_fallback` | `agy` wanted an approval. Use Codex with `mode="edit"` and `worktree=True` |
+| `agy` jobs fail with `permission_error` on ordinary shell commands | `agy` is older than 1.5.7, or its `settings.json` pins a mode with `agentMode`. Update `agy`, or remove `agentMode`, so a headless run uses its default mode |
+| A Codex worktree job says it could not commit (`index.lock`, access denied) | Codex's sandbox refused the write to Git's own folder. The edits are in the worktree: commit them yourself |
 
 ## How it works inside
 
