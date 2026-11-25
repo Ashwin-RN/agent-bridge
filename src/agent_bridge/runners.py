@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -49,8 +50,17 @@ TRANSIENT_RETRY_MIN_REMAINING_SECONDS = 12.0
 OnSessionCallback = Callable[[str], None]
 OnActivityCallback = Callable[[str], None]
 OnModelCallback = Callable[[str], None]
-OnProviderStartCallback = Callable[[], None]
+OnProviderStartCallback = Callable[[], Awaitable[None] | None]
+OnAttemptCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 OnWorktreePlannedCallback = Callable[[dict[str, str | None]], None]
+
+
+async def _maybe_await(cb: Callable[..., Any] | None, *args: Any) -> None:
+    if cb is None:
+        return
+    res = cb(*args)
+    if inspect.isawaitable(res):
+        await res
 
 
 def _has_valid_agy_token_counters(raw_usage: Any) -> bool:
@@ -166,23 +176,40 @@ def _can_auto_retry_attempt(
     if result.provider_state != "stopped":
         return False
 
-    has_turn_progress = bool(
-        (result.response and result.response.strip())
-        or result.usage is not None
-        or (
+    obs_turns = result.observed_num_turns if result.observed_num_turns is not None else result.num_turns
+    prior_turns = (
+        int(prior_watermark["num_turns"])
+        if (
             prior_watermark is not None
             and isinstance(prior_watermark.get("num_turns"), int)
-            and isinstance(result.num_turns, int)
-            and result.num_turns > int(prior_watermark["num_turns"])
+            and not isinstance(prior_watermark.get("num_turns"), bool)
         )
+        else None
+    )
+    turns_advanced = bool(
+        obs_turns is not None
+        and (
+            (prior_turns is not None and obs_turns > prior_turns)
+            or (request.session_id is not None and prior_turns is None and obs_turns > 1)
+        )
+    )
+    has_turn_progress = bool(
+        result.observed_turn_progress
+        or turns_advanced
+        or (result.response and result.response.strip())
+        or result.usage is not None
     )
 
     if request.session_id is not None:
         # On a resumed session, a transient network/service error may have already been applied
-        # server-side, and any turn progress means the session may have advanced.
+        # server-side, and any turn progress or turn-counter advance means the session may have mutated.
         if kind == "transient":
             return False
         if has_turn_progress:
+            return False
+        # On a resumed edit with an observed turn count but no baseline watermark, we cannot prove
+        # the turn counter did not advance -> fail closed instead of re-running an edit!
+        if request.mode == "edit" and obs_turns is not None and prior_turns is None:
             return False
         return True
 
@@ -257,6 +284,20 @@ def classify_failure(
     combined = f"{error_text or ''}\n{stderr_text or ''}"
     local_state: ProviderState = "stopped" if process_stopped else "possibly_running"
 
+    # Preserve Antigravity's remote in-progress signal EVEN when our local deadline also fired
+    # and the local CLI process was verified stopped (killing the CLI does not stop the remote turn!).
+    if backend == "neon" and (
+        exit_code == 3 or any(p.search(combined) for p in _AGY_TIMEOUT_PATTERNS)
+    ):
+        return (
+            "timed_out",
+            "provider_timeout_still_running",
+            "possibly_running",
+            "Antigravity reported that the server-side turn may still be in progress (even after local "
+            "process cleanup). Keep any partial response and session_id; confirm the prior turn finished "
+            "(and inspect git diff for edits) before resuming.",
+        )
+
     if timed_out_locally:
         if process_stopped:
             guidance = (
@@ -269,18 +310,6 @@ def classify_failure(
                 "Verify whether any child process is still running and inspect git diff/worktree before retrying."
             )
         return ("timed_out", "timeout", local_state, guidance)
-
-    if backend == "neon" and (
-        exit_code == 3 or any(p.search(combined) for p in _AGY_TIMEOUT_PATTERNS)
-    ):
-        return (
-            "timed_out",
-            "provider_timeout_still_running",
-            "possibly_running",
-            "Antigravity print timeout elapsed while the server-side turn may still be in progress. "
-            "Keep the partial response and session_id; confirm the prior turn finished (and inspect git diff "
-            "for edits) before resuming.",
-        )
 
     if any(p.search(combined) for p in _AUTH_PATTERNS):
         return (
@@ -1016,6 +1045,9 @@ class NeonRunner:
         if on_activity:
             on_activity(f"running agy ({resolved_model or 'agy-default'})")
 
+        # Commit launch intent in SQLite BEFORE spawning the provider subprocess!
+        await _maybe_await(on_provider_start)
+
         try:
             proc, managed = await spawn_managed_process(
                 *cmd,
@@ -1068,8 +1100,6 @@ class NeonRunner:
                 ),
                 provider_invoked=False,
             )
-        if on_provider_start:
-            on_provider_start()
 
         stdout_lines: list[str] = []
         stderr_chunks: list[bytes] = []
@@ -1319,6 +1349,7 @@ class NeonRunner:
             )
         combined_notice = " ".join(final_notice_parts) if final_notice_parts else None
 
+        observed_progress = bool(step_usages_by_index or partial_text_parts)
         if timed_out_locally:
             status, reason, pstate, guidance = classify_failure(
                 backend="neon",
@@ -1343,12 +1374,15 @@ class NeonRunner:
                 usage_status=usage_status,
                 cumulative_usage=None,
                 num_turns=None,
+                observed_num_turns=num_turns,
+                observed_turn_progress=observed_progress,
                 exit_code=proc.returncode,
                 error=f"Neon subagent timed out after {request.timeout_seconds}s.",
                 failure_reason=reason,
                 provider_state=pstate,
                 retry_guidance=guidance,
                 stderr_tail=stderr_tail,
+                provider_invoked=True,
             )
 
         if envelope is not None:
@@ -1373,9 +1407,12 @@ class NeonRunner:
                     usage_status=usage_status,
                     cumulative_usage=published_cumulative,
                     num_turns=published_turns,
+                    observed_num_turns=num_turns,
+                    observed_turn_progress=observed_progress,
                     exit_code=0,
                     provider_state="stopped" if process_stopped else "possibly_running",
                     stderr_tail=stderr_tail,
+                    provider_invoked=True,
                 )
 
             err_msg = str(
@@ -1407,12 +1444,15 @@ class NeonRunner:
                 usage_status=usage_status,
                 cumulative_usage=None,
                 num_turns=None,
+                observed_num_turns=num_turns,
+                observed_turn_progress=observed_progress,
                 exit_code=proc.returncode,
                 error=err_msg,
                 failure_reason=reason,
                 provider_state=pstate,
                 retry_guidance=guidance,
                 stderr_tail=stderr_tail,
+                provider_invoked=True,
             )
 
         plain_text = partial_text or "".join(stdout_lines).strip()
@@ -1432,9 +1472,12 @@ class NeonRunner:
                 usage_status=usage_status,
                 cumulative_usage=None,
                 num_turns=None,
+                observed_num_turns=num_turns,
+                observed_turn_progress=observed_progress,
                 exit_code=0,
                 provider_state="stopped" if process_stopped else "possibly_running",
                 stderr_tail=stderr_tail,
+                provider_invoked=True,
             )
 
         err_msg = stderr_tail or plain_text or f"agy exited with code {proc.returncode}"
@@ -1461,12 +1504,15 @@ class NeonRunner:
             usage_status=usage_status,
             cumulative_usage=None,
             num_turns=None,
+            observed_num_turns=num_turns,
+            observed_turn_progress=observed_progress,
             exit_code=proc.returncode,
             error=err_msg,
             failure_reason=reason,
             provider_state=pstate,
             retry_guidance=guidance,
             stderr_tail=stderr_tail,
+            provider_invoked=True,
         )
 
     async def run(
@@ -1479,6 +1525,7 @@ class NeonRunner:
         on_activity: OnActivityCallback | None = None,
         on_model: OnModelCallback | None = None,
         on_provider_start: OnProviderStartCallback | None = None,
+        on_attempt: OnAttemptCallback | None = None,
     ) -> RunResult:
         overall_deadline = deadline if deadline is not None else (time.monotonic() + request.timeout_seconds)
         temp_dir: str | None = None
@@ -1653,6 +1700,7 @@ class NeonRunner:
                     f"Model {resolution.resolved!r} was unavailable; seamlessly refreshed and retried with "
                     f"{retry_model or 'agy default'}."
                 )
+                await _maybe_await(on_attempt, _make_attempt_summary(1, result, backend="neon"))
                 second = await self._run_once(
                     request,
                     resolved_model=retry_model,
@@ -1681,6 +1729,8 @@ class NeonRunner:
                 )
                 and (overall_deadline - time.monotonic()) > TRANSIENT_RETRY_MIN_REMAINING_SECONDS
             ):
+                # Record Attempt 1 BEFORE retry backoff sleep so cancelling during backoff keeps Attempt 1 usage!
+                await _maybe_await(on_attempt, _make_attempt_summary(1, result, backend="neon"))
                 if on_activity:
                     on_activity("transient service error; retrying once")
                 await asyncio.sleep(TRANSIENT_RETRY_BACKOFF_SECONDS)
@@ -1912,6 +1962,9 @@ class CodexRunner:
         if on_activity:
             on_activity(f"running codex ({reported_model})")
 
+        # Commit launch intent in SQLite BEFORE spawning the provider subprocess!
+        await _maybe_await(on_provider_start)
+
         try:
             proc, managed = await spawn_managed_process(
                 *cmd,
@@ -1970,8 +2023,6 @@ class CodexRunner:
                 ),
                 provider_invoked=False,
             )
-        if on_provider_start:
-            on_provider_start()
 
         prompt_bytes = request.prompt.encode("utf-8") if use_stdin_prompt else None
         stdout_lines: list[str] = []
@@ -2130,6 +2181,7 @@ class CodexRunner:
                 provider_state=pstate,
                 retry_guidance=guidance,
                 stderr_tail=stderr_tail,
+                provider_invoked=True,
             )
 
         if turn_completed_cleanly:
@@ -2159,6 +2211,7 @@ class CodexRunner:
                 exit_code=0,
                 provider_state="stopped" if process_stopped else "possibly_running",
                 stderr_tail=stderr_tail,
+                provider_invoked=True,
             )
 
         err_msg = "; ".join(errors) if errors else (
@@ -2193,6 +2246,7 @@ class CodexRunner:
             provider_state=pstate,
             retry_guidance=guidance,
             stderr_tail=stderr_tail,
+            provider_invoked=True,
         )
 
     async def run(
@@ -2205,6 +2259,7 @@ class CodexRunner:
         on_activity: OnActivityCallback | None = None,
         on_model: OnModelCallback | None = None,
         on_provider_start: OnProviderStartCallback | None = None,
+        on_attempt: OnAttemptCallback | None = None,
     ) -> RunResult:
         _ = prior_watermark  # Unused for Codex (emits exact per-turn usage natively).
         overall_deadline = deadline if deadline is not None else (time.monotonic() + request.timeout_seconds)
@@ -2240,6 +2295,7 @@ class CodexRunner:
                 f"Requested Codex model {effective_model!r} was unavailable; "
                 "seamlessly fell back to Codex's current default model."
             )
+            await _maybe_await(on_attempt, _make_attempt_summary(1, result, backend="codex"))
             second = await self._run_once(
                 request,
                 effective_model=None,
@@ -2261,6 +2317,8 @@ class CodexRunner:
             and _can_auto_retry_attempt(request, result, kind="transient")
             and (overall_deadline - time.monotonic()) > TRANSIENT_RETRY_MIN_REMAINING_SECONDS
         ):
+            # Record Attempt 1 BEFORE retry backoff sleep so cancelling during backoff keeps Attempt 1 usage!
+            await _maybe_await(on_attempt, _make_attempt_summary(1, result, backend="codex"))
             if on_activity:
                 on_activity("transient service error; retrying once")
             await asyncio.sleep(TRANSIENT_RETRY_BACKOFF_SECONDS)

@@ -77,6 +77,8 @@ class RunResult:
     usage_status: UsageStatus = "missing"
     cumulative_usage: dict[str, Any] | None = None
     num_turns: int | None = None
+    observed_num_turns: int | None = None
+    observed_turn_progress: bool = False
     exit_code: int | None = None
     error: str | None = None
     failure_reason: str | None = None

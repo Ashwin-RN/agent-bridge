@@ -98,7 +98,9 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS usage_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_id TEXT UNIQUE NOT NULL,
+        job_id TEXT NOT NULL,
+        attempt_number INTEGER NOT NULL DEFAULT 1,
+        is_final_attempt INTEGER NOT NULL DEFAULT 1,
         owner_id TEXT NOT NULL,
         ts REAL NOT NULL,
         iso_time TEXT NOT NULL,
@@ -120,7 +122,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         cache_write_tokens INTEGER,
         reasoning_tokens INTEGER,
         total_tokens INTEGER,
-        provider_metrics_json TEXT
+        provider_metrics_json TEXT,
+        UNIQUE(job_id, attempt_number)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts DESC)",
@@ -257,6 +260,8 @@ def _insert_usage_event_row_cur(
     cur: sqlite3.Cursor,
     *,
     job_id: str,
+    attempt_number: int = 1,
+    is_final_attempt: bool = True,
     owner_id: str,
     now_ts: float,
     backend: str,
@@ -284,14 +289,16 @@ def _insert_usage_event_row_cur(
     cur.execute(
         """
         INSERT OR REPLACE INTO usage_events (
-            job_id, owner_id, ts, iso_time, backend, quota_pool, model, effort, mode, status,
-            duration_seconds, cwd, parent_run, label, session_id, usage_status,
-            input_tokens, output_tokens, cached_tokens, cache_write_tokens,
+            job_id, attempt_number, is_final_attempt, owner_id, ts, iso_time, backend, quota_pool,
+            model, effort, mode, status, duration_seconds, cwd, parent_run, label, session_id,
+            usage_status, input_tokens, output_tokens, cached_tokens, cache_write_tokens,
             reasoning_tokens, total_tokens, provider_metrics_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job_id,
+            max(1, int(attempt_number)),
+            1 if is_final_attempt else 0,
             owner_id,
             round(now_ts, 3),
             iso_time,
@@ -325,11 +332,13 @@ def _insert_usage_event_cur(
     attempts: list[dict[str, Any]] | None = None,
 ) -> None:
     now_ts = record.finished_at or time.time()
-    att_list = attempts if attempts and len(attempts) > 1 else None
-    if att_list is None and record.attempts and len(record.attempts) > 1:
+    att_list = attempts if attempts and len(attempts) >= 1 else None
+    if att_list is None and record.attempts and len(record.attempts) >= 1:
         att_list = record.attempts
 
-    if att_list is not None:
+    if att_list is not None and len(att_list) > 1:
+        # Clear any stale attempt rows beyond len(att_list) and replace cleanly with real job_id + attempt_number!
+        cur.execute("DELETE FROM usage_events WHERE job_id = ?", (record.job_id,))
         total_att = len(att_list)
         for idx, att in enumerate(att_list, start=1):
             is_last = idx == total_att
@@ -340,10 +349,11 @@ def _insert_usage_event_cur(
             att_ustatus = str(att.get("usage_status") or "missing")
             att_usage = att.get("usage") if isinstance(att.get("usage"), dict) else None
             att_pm = att.get("provider_metrics") if isinstance(att.get("provider_metrics"), dict) else None
-            row_job_id = record.job_id if is_last else f"{record.job_id}#attempt-{idx}"
             _insert_usage_event_row_cur(
                 cur,
-                job_id=row_job_id,
+                job_id=record.job_id,
+                attempt_number=int(att.get("attempt") or idx),
+                is_final_attempt=is_last,
                 owner_id=record.owner_id,
                 now_ts=now_ts - ((total_att - idx) * 0.001),
                 backend=record.backend,
@@ -363,11 +373,31 @@ def _insert_usage_event_cur(
             )
         return
 
+    # If a prior non-final attempt was already recorded (e.g. cancelled during retry backoff!),
+    # keep those prior attempt rows intact and append the final terminal attempt cleanly.
+    existing_prior = cur.execute(
+        "SELECT MAX(attempt_number) AS max_att FROM usage_events WHERE job_id = ? AND is_final_attempt = 0",
+        (record.job_id,),
+    ).fetchone()
+    prior_max = int(existing_prior["max_att"] or 0) if existing_prior is not None else 0
+    if prior_max > 0:
+        final_att_num = prior_max + 1
+        final_dur = 0.0
+        final_usage = None
+        final_ustatus = "missing"
+    else:
+        final_att_num = 1
+        final_dur = float(record.duration_seconds or 0.0)
+        final_usage = record.usage
+        final_ustatus = record.usage_status
+
     model_name = record.model or record.requested_model or f"{record.backend}-default"
     quota_pool = record.quota_pool or classify_quota_pool(record.backend, model_name)
     _insert_usage_event_row_cur(
         cur,
         job_id=record.job_id,
+        attempt_number=final_att_num,
+        is_final_attempt=True,
         owner_id=record.owner_id,
         now_ts=now_ts,
         backend=record.backend,
@@ -376,13 +406,13 @@ def _insert_usage_event_cur(
         effort=record.effort,
         mode=record.mode,
         status=record.status,
-        duration_seconds=float(record.duration_seconds or 0.0),
+        duration_seconds=final_dur,
         cwd=record.cwd,
         parent_run=record.parent_run,
         label=record.label,
         session_id=record.session_id,
-        usage_status=record.usage_status,
-        usage=record.usage,
+        usage_status=final_ustatus,
+        usage=final_usage,
         provider_metrics=record.provider_metrics,
     )
 
@@ -625,6 +655,87 @@ class BridgeStore:
             }
             if "quota_pool" not in usage_cols:
                 cur.execute("ALTER TABLE usage_events ADD COLUMN quota_pool TEXT")
+
+            # Upgrade older `usage_events` tables that had single-column `job_id TEXT UNIQUE`
+            # into `UNIQUE(job_id, attempt_number)` atomically inside this BEGIN IMMEDIATE tx.
+            usage_ddl_row = cur.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_events'"
+            ).fetchone()
+            usage_ddl = str(usage_ddl_row["sql"] or "") if usage_ddl_row is not None else ""
+            if "attempt_number" not in usage_cols or "job_id TEXT UNIQUE" in usage_ddl:
+                cur.execute(
+                    """
+                    CREATE TABLE usage_events_migrated (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_id TEXT NOT NULL,
+                        attempt_number INTEGER NOT NULL DEFAULT 1,
+                        is_final_attempt INTEGER NOT NULL DEFAULT 1,
+                        owner_id TEXT NOT NULL,
+                        ts REAL NOT NULL,
+                        iso_time TEXT NOT NULL,
+                        backend TEXT NOT NULL,
+                        quota_pool TEXT,
+                        model TEXT,
+                        effort TEXT,
+                        mode TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        duration_seconds REAL NOT NULL,
+                        cwd TEXT NOT NULL,
+                        parent_run TEXT,
+                        label TEXT,
+                        session_id TEXT,
+                        usage_status TEXT NOT NULL,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        cached_tokens INTEGER,
+                        cache_write_tokens INTEGER,
+                        reasoning_tokens INTEGER,
+                        total_tokens INTEGER,
+                        provider_metrics_json TEXT,
+                        UNIQUE(job_id, attempt_number)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO usage_events_migrated (
+                        job_id, attempt_number, is_final_attempt, owner_id, ts, iso_time, backend,
+                        quota_pool, model, effort, mode, status, duration_seconds, cwd, parent_run,
+                        label, session_id, usage_status, input_tokens, output_tokens, cached_tokens,
+                        cache_write_tokens, reasoning_tokens, total_tokens, provider_metrics_json
+                    )
+                    SELECT
+                        CASE
+                            WHEN INSTR(u.job_id, '#attempt-') > 0
+                            THEN SUBSTR(u.job_id, 1, INSTR(u.job_id, '#attempt-') - 1)
+                            ELSE u.job_id
+                        END,
+                        CASE
+                            WHEN INSTR(u.job_id, '#attempt-') > 0
+                            THEN COALESCE(CAST(SUBSTR(u.job_id, INSTR(u.job_id, '#attempt-') + 9) AS INTEGER), 1)
+                            ELSE 1 + COALESCE((
+                                SELECT MAX(CAST(SUBSTR(u2.job_id, INSTR(u2.job_id, '#attempt-') + 9) AS INTEGER))
+                                FROM usage_events u2
+                                WHERE u2.job_id LIKE u.job_id || '#attempt-%'
+                            ), 0)
+                        END,
+                        CASE WHEN INSTR(u.job_id, '#attempt-') > 0 THEN 0 ELSE 1 END,
+                        u.owner_id, u.ts, u.iso_time, u.backend, u.quota_pool, u.model, u.effort, u.mode,
+                        u.status, u.duration_seconds, u.cwd, u.parent_run, u.label, u.session_id,
+                        u.usage_status, u.input_tokens, u.output_tokens, u.cached_tokens,
+                        u.cache_write_tokens, u.reasoning_tokens, u.total_tokens, u.provider_metrics_json
+                    FROM usage_events u
+                    ORDER BY u.id ASC
+                    """
+                )
+                cur.execute("DROP TABLE usage_events")
+                cur.execute("ALTER TABLE usage_events_migrated RENAME TO usage_events")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_owner ON usage_events(owner_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_backend ON usage_events(backend)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_cwd ON usage_events(cwd)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_parent_run ON usage_events(parent_run)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_job_attempt ON usage_events(job_id, attempt_number)")
 
             if cur.execute("SELECT 1 FROM usage_events WHERE quota_pool IS NULL LIMIT 1").fetchone() is not None:
                 cur.execute(
@@ -1292,14 +1403,7 @@ class BridgeStore:
                     (backend, session_id),
                 ).fetchall()
 
-            chosen: sqlite3.Row | None = None
-            for cand in rows:
-                eff = cand["effective_cwd"] or cand["cwd"]
-                if eff and Path(eff).is_dir():
-                    chosen = cand
-                    break
-            if chosen is None and rows:
-                chosen = rows[0]
+            chosen: sqlite3.Row | None = rows[0] if rows else None
 
             if chosen is None and resume_from_job_id:
                 chosen = cur.execute(
@@ -1467,7 +1571,8 @@ class BridgeStore:
                 vals,
             )
             # Atomically claim a newly discovered session_id in the SAME transaction that publishes it!
-            if session_id is not None:
+            # Only claim if the job row is still non-terminal (`cur.rowcount > 0`).
+            if session_id is not None and cur.rowcount > 0:
                 resolved_backend = backend
                 if not resolved_backend:
                     row = cur.execute(
@@ -1664,6 +1769,61 @@ class BridgeStore:
                 (record.job_id, self.max_stored_jobs),
             )
 
+    def delete_aborted_queued_job(self, job_id: str, *, lock_timeout: float = 2.0) -> bool:
+        """Remove a queued job row whose submission was cancelled before execution started."""
+        with self._tx(write=True, lock_timeout=lock_timeout) as cur:
+            cur.execute("DELETE FROM session_claims WHERE job_id = ?", (job_id,))
+            cur.execute(
+                """
+                DELETE FROM jobs
+                WHERE job_id = ?
+                  AND status = 'queued'
+                  AND started_at IS NULL
+                  AND provider_invoked = 0
+                """,
+                (job_id,),
+            )
+            return cur.rowcount > 0
+
+    def record_attempt_usage(
+        self,
+        record: JobRecord,
+        attempt: dict[str, Any],
+        *,
+        attempt_number: int,
+        is_final: bool = False,
+        lock_timeout: float = 2.0,
+    ) -> None:
+        """Persist one executed attempt's usage/duration immediately before retry backoff or next attempt."""
+        now_ts = time.time()
+        att_model = attempt.get("model") or record.model or record.requested_model or f"{record.backend}-default"
+        att_pool = attempt.get("quota_pool") or classify_quota_pool(record.backend, att_model)
+        with self._tx(write=True, lock_timeout=lock_timeout) as cur:
+            _insert_usage_event_row_cur(
+                cur,
+                job_id=record.job_id,
+                attempt_number=attempt_number,
+                is_final_attempt=is_final,
+                owner_id=record.owner_id,
+                now_ts=now_ts,
+                backend=record.backend,
+                quota_pool=str(att_pool),
+                model_name=str(att_model),
+                effort=attempt.get("effort") or record.effort,
+                mode=record.mode,
+                status=str(attempt.get("status") or "failed"),
+                duration_seconds=float(attempt.get("duration_seconds") or 0.0),
+                cwd=record.cwd,
+                parent_run=record.parent_run,
+                label=record.label,
+                session_id=record.session_id,
+                usage_status=str(attempt.get("usage_status") or "missing"),
+                usage=attempt.get("usage") if isinstance(attempt.get("usage"), dict) else None,
+                provider_metrics=attempt.get("provider_metrics")
+                if isinstance(attempt.get("provider_metrics"), dict)
+                else None,
+            )
+
     def get_job(self, job_id: str) -> JobRecord | None:
         with self._tx(write=False) as cur:
             row = cur.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
@@ -1837,8 +1997,9 @@ class BridgeStore:
             rows = cur.execute(
                 """
                 SELECT backend,
-                       COUNT(*) AS runs,
-                       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                       COUNT(DISTINCT job_id) AS runs,
+                       COUNT(*) AS attempts,
+                       SUM(CASE WHEN is_final_attempt = 1 AND status = 'completed' THEN 1 ELSE 0 END) AS completed,
                        ROUND(COALESCE(SUM(duration_seconds), 0.0), 2) AS duration_seconds,
                        SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
                        SUM(CASE WHEN usage_status IN ('partial', 'missing') THEN 1 ELSE 0 END) AS incomplete_usage_runs
@@ -1856,6 +2017,8 @@ class BridgeStore:
                 "duration_seconds": round(float(r["duration_seconds"] or 0.0), 2),
                 "total_tokens": int(r["total_tokens"] or 0),
             }
+            if int(r["attempts"] or 0) > int(r["runs"] or 0):
+                entry["attempts"] = int(r["attempts"])
             if int(r["incomplete_usage_runs"] or 0) > 0:
                 entry["incomplete_usage_runs"] = int(r["incomplete_usage_runs"])
             out[str(r["backend"])] = entry
@@ -1914,11 +2077,12 @@ class BridgeStore:
                 f"""
                 SELECT
                     backend,
-                    COUNT(*) AS runs,
-                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN status = 'timed_out' THEN 1 ELSE 0 END) AS timed_out,
-                    SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                    COUNT(DISTINCT job_id) AS runs,
+                    COUNT(*) AS attempts,
+                    SUM(CASE WHEN is_final_attempt = 1 AND status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                    SUM(CASE WHEN is_final_attempt = 1 AND status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN is_final_attempt = 1 AND status = 'timed_out' THEN 1 ELSE 0 END) AS timed_out,
+                    SUM(CASE WHEN is_final_attempt = 1 AND status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
                     ROUND(COALESCE(SUM(duration_seconds), 0.0), 2) AS duration_seconds,
                     SUM(CASE WHEN usage_status = 'exact' THEN 1 ELSE 0 END) AS cov_exact,
                     SUM(CASE WHEN usage_status = 'delta' THEN 1 ELSE 0 END) AS cov_delta,
@@ -1942,11 +2106,12 @@ class BridgeStore:
                 f"""
                 SELECT
                     {pool_expr} AS pool,
-                    COUNT(*) AS runs,
-                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN status = 'timed_out' THEN 1 ELSE 0 END) AS timed_out,
-                    SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                    COUNT(DISTINCT job_id) AS runs,
+                    COUNT(*) AS attempts,
+                    SUM(CASE WHEN is_final_attempt = 1 AND status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                    SUM(CASE WHEN is_final_attempt = 1 AND status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN is_final_attempt = 1 AND status = 'timed_out' THEN 1 ELSE 0 END) AS timed_out,
+                    SUM(CASE WHEN is_final_attempt = 1 AND status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
                     ROUND(COALESCE(SUM(duration_seconds), 0.0), 2) AS duration_seconds,
                     SUM(CASE WHEN usage_status = 'exact' THEN 1 ELSE 0 END) AS cov_exact,
                     SUM(CASE WHEN usage_status = 'delta' THEN 1 ELSE 0 END) AS cov_delta,
@@ -1974,8 +2139,9 @@ class BridgeStore:
                     SELECT
                         backend,
                         COALESCE(NULLIF(model, ''), backend || '-default') AS model_name,
-                        COUNT(*) AS runs,
-                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                        COUNT(DISTINCT job_id) AS runs,
+                        COUNT(*) AS attempts,
+                        SUM(CASE WHEN is_final_attempt = 1 AND status = 'completed' THEN 1 ELSE 0 END) AS completed,
                         ROUND(COALESCE(SUM(duration_seconds), 0.0), 2) AS duration_seconds,
                         SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
                         SUM(CASE WHEN usage_status = 'exact' THEN 1 ELSE 0 END) AS cov_exact,
@@ -1992,7 +2158,8 @@ class BridgeStore:
                 if recent_n > 0:
                     recent_rows = cur.execute(
                         f"""
-                        SELECT iso_time, job_id, backend, {pool_expr} AS quota_pool, model,
+                        SELECT iso_time, job_id, attempt_number, is_final_attempt, backend,
+                               {pool_expr} AS quota_pool, model,
                                status, duration_seconds, usage_status, total_tokens,
                                effort, parent_run, label
                         FROM usage_events
@@ -2006,6 +2173,7 @@ class BridgeStore:
         def _empty_bucket(in_flight_cnt: int) -> dict[str, Any]:
             return {
                 "runs": 0,
+                "attempts": 0,
                 "completed": 0,
                 "failed": 0,
                 "timed_out": 0,
@@ -2031,6 +2199,7 @@ class BridgeStore:
         def _row_to_bucket(r: sqlite3.Row, in_flight_cnt: int) -> dict[str, Any]:
             bucket: dict[str, Any] = {
                 "runs": int(r["runs"] or 0),
+                "attempts": int(r["attempts"] or 0),
                 "completed": int(r["completed"] or 0),
                 "failed": int(r["failed"] or 0),
                 "timed_out": int(r["timed_out"] or 0),
@@ -2058,6 +2227,7 @@ class BridgeStore:
             return bucket
 
         overall_runs = 0
+        overall_attempts = 0
         overall_completed = 0
         overall_failed = 0
         overall_timed_out = 0
@@ -2080,6 +2250,7 @@ class BridgeStore:
             by_backend[bname] = bucket
 
             overall_runs += bucket["runs"]
+            overall_attempts += bucket["attempts"]
             overall_completed += bucket["completed"]
             overall_failed += bucket["failed"]
             overall_timed_out += bucket["timed_out"]
@@ -2108,6 +2279,7 @@ class BridgeStore:
             "db_path": str(self.db_path),
             "overview": {
                 "runs": overall_runs,
+                "attempts": overall_attempts,
                 "completed": overall_completed,
                 "failed": overall_failed,
                 "timed_out": overall_timed_out,
@@ -2139,6 +2311,7 @@ class BridgeStore:
             mkey = f"{mr['backend']}:{mr['model_name']}"
             by_model[mkey] = {
                 "runs": int(mr["runs"] or 0),
+                "attempts": int(mr["attempts"] or 0),
                 "completed": int(mr["completed"] or 0),
                 "duration_seconds": round(float(mr["duration_seconds"] or 0.0), 2),
                 "total_tokens": int(mr["total_tokens"] or 0),
@@ -2156,6 +2329,7 @@ class BridgeStore:
             item: dict[str, Any] = {
                 "time": rr["iso_time"],
                 "job_id": rr["job_id"],
+                "attempt": int(rr["attempt_number"] or 1),
                 "backend": rr["backend"],
                 "quota_pool": rr["quota_pool"],
                 "model": rr["model"],
@@ -2164,6 +2338,8 @@ class BridgeStore:
                 "usage_status": rr["usage_status"],
                 "total_tokens": rr["total_tokens"],
             }
+            if int(rr["is_final_attempt"] if rr["is_final_attempt"] is not None else 1) == 0:
+                item["is_final_attempt"] = False
             if rr["effort"]:
                 item["effort"] = rr["effort"]
             if rr["parent_run"]:

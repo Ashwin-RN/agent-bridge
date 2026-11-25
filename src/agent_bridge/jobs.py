@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -66,6 +67,45 @@ class SessionResumeBlockedError(RuntimeError):
         )
 
 
+class WorktreeMissingError(RuntimeError):
+    """Raised when a resumed session's recorded Git worktree no longer exists."""
+
+    def __init__(self, *, session_id: str, worktree_path: str) -> None:
+        self.session_id = session_id
+        self.worktree_path = worktree_path
+        super().__init__(
+            f"Recorded worktree for session {session_id!r} no longer exists: {worktree_path!r}. "
+            "Pass relocate_cwd=True (with cwd) to intentionally move this session to another directory, "
+            "or pass worktree=True (with mode='edit') to create a new worktree."
+        )
+
+
+def _sum_attempt_usage(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Aggregate available token counters across prior executed attempts."""
+    keys = (
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    )
+    totals: dict[str, int] = {}
+    for att in attempts:
+        u = att.get("usage")
+        if not isinstance(u, dict):
+            continue
+        for k in keys:
+            v = u.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                totals[k] = totals.get(k, 0) + int(v)
+    if not totals:
+        return None
+    if "total_tokens" not in totals and ("input_tokens" in totals or "output_tokens" in totals):
+        totals["total_tokens"] = totals.get("input_tokens", 0) + totals.get("output_tokens", 0)
+    return totals
+
+
 def _preview(prompt: str, max_chars: int = 120) -> str:
     flat = " ".join(prompt.split())
     if len(flat) <= max_chars:
@@ -102,7 +142,9 @@ class JobManager:
         # In-memory state is tracked ONLY for active (or uncommitted terminal) jobs and released on commit.
         self._local_jobs: dict[str, JobRecord] = {}
         self._terminal_uncommitted: dict[str, JobRecord] = {}
-        self._pending_finalizations: dict[str, asyncio.Task[None]] = {}
+        self._finalizing_records: dict[str, JobRecord] = {}
+        self._uncommitted_session_ids: set[str] = set()
+        self._pending_finalizations: dict[str, asyncio.Task[Any]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._events: dict[str, asyncio.Event] = {}
         self._trackers: dict[str, ProcessTracker] = {}
@@ -122,15 +164,22 @@ class JobManager:
         """Run a SQLite store call off the asyncio event loop so lock waits never stall MCP traffic."""
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    def _visible_record(self, rec: JobRecord) -> JobRecord:
+        """Hide a newly discovered session_id from callers until SQLite commits its claim/terminal row."""
+        if rec.job_id in self._uncommitted_session_ids and rec.session_id is not None:
+            return replace(rec, session_id=None)
+        return rec
+
     def _cleanup_local_job(self, job_id: str) -> None:
         """Release completed job records and handles from RAM once committed to SQLite."""
-        if job_id in self._terminal_uncommitted:
+        if job_id in self._terminal_uncommitted or job_id in self._finalizing_records:
             return
         self._local_jobs.pop(job_id, None)
         self._events.pop(job_id, None)
         self._tasks.pop(job_id, None)
         self._trackers.pop(job_id, None)
         self._cancelled_ids.discard(job_id)
+        self._uncommitted_session_ids.discard(job_id)
 
     def _notify_session_waiters(self, backend: str, session_id: str | None) -> None:
         if not session_id:
@@ -207,10 +256,11 @@ class JobManager:
 
         if resume_from and resume_from.strip():
             token = resume_from.strip()
+            uncommitted_prior = self._terminal_uncommitted.get(token)
             prior = (
-                self._terminal_uncommitted.get(token)
-                or self._local_jobs.get(token)
-                or self.store.get_job(token)
+                self._visible_record(uncommitted_prior)
+                if uncommitted_prior is not None
+                else (self._local_jobs.get(token) or self.store.get_job(token))
             )
             if prior is not None:
                 if not prior.session_id:
@@ -274,6 +324,11 @@ class JobManager:
                     prior_quota_pool = latest_ctx.get("quota_pool")
 
         resolved_mode = normalize_mode(mode)
+        if worktree and resolved_backend != "codex":
+            raise ValueError("worktree=True is only supported for the 'codex' backend.")
+        if worktree and resolved_mode != "edit":
+            raise ValueError("worktree=True requires mode='edit'.")
+
         explicit_effort = bool(effort and effort.strip())
         # Don't let an inherited effort from a prior turn override an explicitly supplied Neon model tier (e.g. `neon-low`).
         should_inherit_effort = (
@@ -285,44 +340,53 @@ class JobManager:
         explicit_cwd = bool(cwd and cwd.strip())
 
         # Preserve a session's recorded worktree on resume unless `relocate_cwd=True` is explicitly set!
+        # If the recorded worktree was removed, FAIL CLOSED unless `relocate_cwd=True` or `worktree=True`.
         preserved_worktree_path: str | None = None
         preserved_worktree_branch: str | None = None
         preserved_worktree_commit: str | None = None
-        if (
-            resolved_session_id
-            and inferred_worktree_path
-            and Path(inferred_worktree_path).is_dir()
-            and not relocate_cwd
-        ):
-            preserved_worktree_path = str(Path(inferred_worktree_path).resolve())
-            preserved_worktree_branch = inferred_worktree_branch
-            preserved_worktree_commit = inferred_worktree_commit
-            if explicit_cwd and _is_path_within(cwd or "", preserved_worktree_path):
-                resolved_cwd = self._validate_cwd(cwd)
-            elif inferred_cwd and Path(inferred_cwd).is_dir() and _is_path_within(
-                inferred_cwd, preserved_worktree_path
-            ):
-                resolved_cwd = self._validate_cwd(inferred_cwd)
+        if resolved_session_id and inferred_worktree_path:
+            if Path(inferred_worktree_path).is_dir():
+                if not relocate_cwd:
+                    preserved_worktree_path = str(Path(inferred_worktree_path).resolve())
+                    preserved_worktree_branch = inferred_worktree_branch
+                    preserved_worktree_commit = inferred_worktree_commit
+                    if explicit_cwd and _is_path_within(cwd or "", preserved_worktree_path):
+                        resolved_cwd = self._validate_cwd(cwd)
+                    elif inferred_cwd and Path(inferred_cwd).is_dir() and _is_path_within(
+                        inferred_cwd, preserved_worktree_path
+                    ):
+                        resolved_cwd = self._validate_cwd(inferred_cwd)
+                    else:
+                        resolved_cwd = self._validate_cwd(preserved_worktree_path)
+                else:
+                    resolved_cwd = self._validate_cwd(cwd if explicit_cwd else inferred_cwd)
+                    if _is_path_within(resolved_cwd, inferred_worktree_path):
+                        preserved_worktree_path = str(Path(inferred_worktree_path).resolve())
+                        preserved_worktree_branch = inferred_worktree_branch
+                        preserved_worktree_commit = inferred_worktree_commit
             else:
-                resolved_cwd = self._validate_cwd(preserved_worktree_path)
+                if not relocate_cwd and not worktree:
+                    raise ValueError(
+                        f"Recorded worktree for session {resolved_session_id!r} no longer exists: "
+                        f"{inferred_worktree_path!r}. Pass relocate_cwd=True (with cwd) to intentionally "
+                        "move this session to another directory, or pass worktree=True (with mode='edit') "
+                        "to create a new worktree."
+                    )
+                if worktree:
+                    fallback_cwd = (
+                        cwd
+                        if explicit_cwd
+                        else (inferred_cwd if inferred_cwd and Path(inferred_cwd).is_dir() else None)
+                    )
+                    resolved_cwd = self._validate_cwd(fallback_cwd)
+                else:
+                    resolved_cwd = self._validate_cwd(cwd if explicit_cwd else inferred_cwd)
         else:
             resolved_cwd = self._validate_cwd(cwd if explicit_cwd else inferred_cwd)
-            if (
-                inferred_worktree_path
-                and Path(inferred_worktree_path).is_dir()
-                and _is_path_within(resolved_cwd, inferred_worktree_path)
-            ):
-                preserved_worktree_path = str(Path(inferred_worktree_path).resolve())
-                preserved_worktree_branch = inferred_worktree_branch
-                preserved_worktree_commit = inferred_worktree_commit
 
         resolved_extra_dirs = self._validate_extra_dirs(extra_dirs)
         resolved_timeout = clamp_timeout(timeout_seconds, self.settings.default_timeout_seconds)
 
-        if worktree and resolved_backend != "codex":
-            raise ValueError("worktree=True is only supported for the 'codex' backend.")
-        if worktree and resolved_mode != "edit":
-            raise ValueError("worktree=True requires mode='edit'.")
         if resolved_backend == "codex" and resolved_session_id and resolved_extra_dirs:
             raise ValueError(
                 "extra_dirs is not supported when resuming a Codex session "
@@ -448,10 +512,59 @@ class JobManager:
 
     async def start_async(self, request: RunRequest) -> JobRecord:
         record = self._build_and_schedule_job(request, persist_sync=False)
+        insert_task = asyncio.create_task(
+            self._db(self.store.insert_job, record),
+            name=f"insert-{record.job_id}",
+        )
         try:
-            await self._db(self.store.insert_job, record)
-        except Exception:
-            self._cleanup_local_job(record.job_id)
+            await asyncio.shield(insert_task)
+        except BaseException:
+            # Remove from local visibility immediately and clean up any row that commits in the worker thread!
+            self._local_jobs.pop(record.job_id, None)
+
+            async def _cleanup_aborted_insert() -> None:
+                try:
+                    inserted = False
+                    try:
+                        await insert_task
+                        inserted = True
+                    except BaseException:
+                        inserted = False
+                    if inserted:
+                        delay = 0.05
+                        dl = time.monotonic() + 10.0
+                        while True:
+                            try:
+                                await self._db(
+                                    self.store.delete_aborted_queued_job,
+                                    record.job_id,
+                                    lock_timeout=1.0,
+                                )
+                                break
+                            except Exception as exc:
+                                if is_sqlite_lock_error(exc) and time.monotonic() < dl:
+                                    await asyncio.sleep(delay)
+                                    delay = min(0.3, delay * 1.5)
+                                    continue
+                                logger.warning(
+                                    "Failed cleaning up aborted queued job %s: %s",
+                                    record.job_id,
+                                    exc,
+                                )
+                                break
+                finally:
+                    self._pending_finalizations.pop(record.job_id, None)
+                    self._cleanup_local_job(record.job_id)
+
+            cleanup_task = asyncio.create_task(
+                _cleanup_aborted_insert(),
+                name=f"cleanup-insert-{record.job_id}",
+            )
+            self._pending_finalizations[record.job_id] = cleanup_task
+            try:
+                await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=2.0)
+            except BaseException:
+                pass
             raise
         self._launch_job_task(record, request)
         return record
@@ -558,24 +671,57 @@ class JobManager:
             exclude_job_id=record.job_id,
         )
         if ctx is None:
+            if request.worktree_path and not Path(request.worktree_path).is_dir():
+                if request.worktree:
+                    request.worktree_path = None
+                    request.worktree_branch = None
+                    request.worktree_commit = None
+                    record.worktree_path = None
+                    record.worktree_branch = None
+                    record.worktree_commit = None
+                else:
+                    raise WorktreeMissingError(
+                        session_id=request.session_id,
+                        worktree_path=request.worktree_path,
+                    )
             return
 
-        wt_path = ctx.get("worktree_path")
-        if wt_path and Path(wt_path).is_dir():
-            wt_resolved = str(Path(wt_path).resolve())
-            request.worktree_path = wt_resolved
-            request.worktree_branch = ctx.get("worktree_branch")
-            request.worktree_commit = ctx.get("worktree_commit")
-            record.worktree_path = request.worktree_path
-            record.worktree_branch = request.worktree_branch
-            record.worktree_commit = request.worktree_commit
-            # Always keep resumed turn inside the session's recorded worktree unless relocate_cwd=True!
-            if not _is_path_within(request.cwd, wt_resolved):
-                cand = ctx.get("effective_cwd") or wt_resolved
-                target = cand if (cand and Path(cand).is_dir() and _is_path_within(cand, wt_resolved)) else wt_resolved
-                resolved = str(Path(target).resolve())
-                request.cwd = resolved
-                record.effective_cwd = resolved
+        wt_path = ctx.get("worktree_path") or request.worktree_path
+        if wt_path:
+            if Path(wt_path).is_dir():
+                wt_resolved = str(Path(wt_path).resolve())
+                request.worktree_path = wt_resolved
+                request.worktree_branch = ctx.get("worktree_branch") or request.worktree_branch
+                request.worktree_commit = ctx.get("worktree_commit") or request.worktree_commit
+                record.worktree_path = request.worktree_path
+                record.worktree_branch = request.worktree_branch
+                record.worktree_commit = request.worktree_commit
+                # Always keep resumed turn inside the session's recorded worktree unless relocate_cwd=True!
+                if not _is_path_within(request.cwd, wt_resolved):
+                    cand = ctx.get("effective_cwd") or wt_resolved
+                    target = cand if (cand and Path(cand).is_dir() and _is_path_within(cand, wt_resolved)) else wt_resolved
+                    resolved = str(Path(target).resolve())
+                    request.cwd = resolved
+                    record.effective_cwd = resolved
+            else:
+                if not request.worktree:
+                    raise WorktreeMissingError(
+                        session_id=request.session_id,
+                        worktree_path=str(wt_path),
+                    )
+                # Caller explicitly opted into creating a new worktree (`worktree=True`).
+                request.worktree_path = None
+                request.worktree_branch = None
+                request.worktree_commit = None
+                record.worktree_path = None
+                record.worktree_branch = None
+                record.worktree_commit = None
+                if not Path(request.cwd).is_dir():
+                    fallback = ctx.get("cwd")
+                    if fallback and Path(fallback).is_dir():
+                        resolved = str(Path(fallback).resolve())
+                        request.cwd = resolved
+                        record.effective_cwd = resolved
         elif not request.explicit_cwd:
             candidate_cwd = ctx.get("effective_cwd") or ctx.get("cwd")
             if candidate_cwd and Path(candidate_cwd).is_dir():
@@ -608,6 +754,44 @@ class JobManager:
         except Exception as exc:
             logger.debug("Deferred progress refresh for %s: %s", record.job_id, exc)
 
+    async def _commit_required_progress(
+        self,
+        job_id: str,
+        *,
+        deadline: float,
+        description: str,
+        **fields: Any,
+    ) -> None:
+        """Commit safety-critical job progress to SQLite, retrying on lock contention until `deadline`."""
+        delay = 0.05
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.05:
+                raise asyncio.TimeoutError(
+                    f"Timed out waiting for SQLite lock while {description}."
+                )
+            lock_t = min(0.5, max(0.05, remaining - 0.02))
+            try:
+                await self._db(
+                    self.store.update_job_progress,
+                    job_id,
+                    owner_id=self.owner_id,
+                    lock_timeout=lock_t,
+                    **fields,
+                )
+                return
+            except Exception as exc:
+                if is_sqlite_lock_error(exc):
+                    rem2 = deadline - time.monotonic()
+                    if rem2 <= 0.05:
+                        raise asyncio.TimeoutError(
+                            f"Timed out waiting for SQLite lock while {description}."
+                        ) from exc
+                    await asyncio.sleep(min(delay, rem2))
+                    delay = min(0.25, delay * 1.5)
+                    continue
+                raise
+
     async def _finalize_job_durable(
         self,
         record: JobRecord,
@@ -619,8 +803,11 @@ class JobManager:
         attempts: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Persist terminal job state idempotently off the event loop, retaining result & claim until committed."""
+        # Mark finalizing immediately so `cancel()` and `shutdown()` wait for this commit instead of cancelling it!
+        self._finalizing_records[record.job_id] = record
 
-        async def _try_commit_once(lock_timeout: float) -> bool:
+        async def _try_commit_once(lock_timeout: float) -> tuple[bool, bool]:
+            """Return `(committed, retryable)`."""
             try:
                 await self._db(
                     self.store.finalize_job,
@@ -631,55 +818,60 @@ class JobManager:
                     attempts=attempts,
                     lock_timeout=lock_timeout,
                 )
-                return True
+                return True, False
             except Exception as exc:
                 if is_sqlite_lock_error(exc):
-                    return False
+                    return False, True
                 logger.warning("Unexpected error finalizing job %s: %s", record.job_id, exc)
-                return False
+                return False, False
 
-        # Fast path: try immediate commit first before exposing `_terminal_uncommitted`.
-        if await _try_commit_once(lock_timeout=0.3):
-            self._terminal_uncommitted.pop(record.job_id, None)
-            return True
-
-        # Lock contention detected: expose full terminal result in RAM and hold session_claims until committed!
-        self._terminal_uncommitted[record.job_id] = record
-        self._local_jobs[record.job_id] = record
-
-        retry_deadline = time.monotonic() + max(0.2, self._finalize_retry_seconds)
-        delay = 0.08
-        while True:
-            rem = retry_deadline - time.monotonic()
-            if rem <= 0:
-                break
-            await asyncio.sleep(min(delay, rem))
-            delay = min(0.4, delay * 1.5)
-            if await _try_commit_once(lock_timeout=0.8):
-                self._terminal_uncommitted.pop(record.job_id, None)
-                return True
-
-        # Lock persisted beyond inline retry budget: keep terminal result in RAM AND keep
-        # session_claims held while a background committer retries until SQLite commits!
-        async def _bg_commit() -> None:
+        async def _commit_loop() -> bool:
+            delay = 0.08
+            first_attempt = True
             try:
-                while record.job_id in self._terminal_uncommitted:
-                    if await _try_commit_once(lock_timeout=0.8):
+                while True:
+                    committed, retryable = await _try_commit_once(
+                        lock_timeout=0.35 if first_attempt else 0.8
+                    )
+                    if committed:
                         self._terminal_uncommitted.pop(record.job_id, None)
+                        self._uncommitted_session_ids.discard(record.job_id)
+                        self._finalizing_records.pop(record.job_id, None)
                         self._notify_session_waiters(record.backend, request_session_id)
                         if record.session_id and record.session_id != request_session_id:
                             self._notify_session_waiters(record.backend, record.session_id)
-                        self._cleanup_local_job(record.job_id)
-                        return
-                    await asyncio.sleep(0.4)
+                        task_ref = self._tasks.get(record.job_id)
+                        if task_ref is None or task_ref.done():
+                            self._cleanup_local_job(record.job_id)
+                        return True
+                    if not retryable:
+                        return False
+                    # Lock contention detected: expose full terminal result in RAM while holding session_claims!
+                    self._terminal_uncommitted[record.job_id] = record
+                    self._local_jobs[record.job_id] = record
+                    first_attempt = False
+                    await asyncio.sleep(delay)
+                    delay = min(0.4, delay * 1.5)
             finally:
-                self._pending_finalizations.pop(record.job_id, None)
+                if self._pending_finalizations.get(record.job_id) is asyncio.current_task():
+                    self._pending_finalizations.pop(record.job_id, None)
 
-        if record.job_id not in self._pending_finalizations:
-            self._pending_finalizations[record.job_id] = asyncio.create_task(
-                _bg_commit(),
-                name=f"finalize-{record.job_id}",
-            )
+        fin_task = self._pending_finalizations.get(record.job_id)
+        if fin_task is None or fin_task.done():
+            fin_task = asyncio.create_task(_commit_loop(), name=f"finalize-{record.job_id}")
+            self._pending_finalizations[record.job_id] = fin_task
+
+        # Fast-path wait: if SQLite is uncontended, finishes immediately without exposing `_terminal_uncommitted`.
+        done, _ = await asyncio.wait({fin_task}, timeout=0.35)
+        if fin_task in done:
+            return bool(fin_task.result()) if not fin_task.cancelled() and fin_task.exception() is None else False
+
+        # Delayed write or lock contention: expose terminal result in RAM while continuing to wait (uncancelled!).
+        self._terminal_uncommitted[record.job_id] = record
+        self._local_jobs[record.job_id] = record
+        done2, _ = await asyncio.wait({fin_task}, timeout=max(0.2, self._finalize_retry_seconds))
+        if fin_task in done2:
+            return bool(fin_task.result()) if not fin_task.cancelled() and fin_task.exception() is None else False
         return False
 
     async def _execute(
@@ -695,6 +887,11 @@ class JobManager:
         progress_flusher: asyncio.Task[None] | None = None
         fatal_progress_exc: BaseException | None = None
         active_runner_task: asyncio.Task[RunResult] | None = None
+        committed_session_ids: set[str] = {request.session_id} if request.session_id else set()
+        pending_session_ids: set[str] = set()
+        session_claim_tasks: list[asyncio.Task[None]] = []
+        last_observed_session_id: str | None = request.session_id
+        recorded_attempts: list[dict[str, Any]] = []
 
         async def _flush_progress_loop() -> None:
             nonlocal progress_flusher, fatal_progress_exc
@@ -736,7 +933,25 @@ class JobManager:
             if progress_flusher is None or progress_flusher.done():
                 progress_flusher = asyncio.create_task(_flush_progress_loop())
 
-        async def _drain_progress() -> None:
+        async def _drain_progress(*, cancel_session_claims: bool = False) -> None:
+            if session_claim_tasks:
+                pending_claims = [t for t in session_claim_tasks if not t.done()]
+                if pending_claims:
+                    if cancel_session_claims:
+                        for t in pending_claims:
+                            t.cancel()
+                        await asyncio.gather(*pending_claims, return_exceptions=True)
+                    else:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*pending_claims, return_exceptions=True),
+                                timeout=0.3,
+                            )
+                        except Exception:
+                            for t in pending_claims:
+                                if not t.done():
+                                    t.cancel()
+                            await asyncio.gather(*pending_claims, return_exceptions=True)
             if progress_flusher is not None and not progress_flusher.done():
                 try:
                     await asyncio.wait_for(asyncio.shield(progress_flusher), timeout=0.5)
@@ -744,9 +959,43 @@ class JobManager:
                     pass
 
         def on_session(session_id: str) -> None:
-            if record.session_id != session_id:
-                record.session_id = session_id
-                _schedule_progress(lock_timeout=2.0, backend=record.backend, session_id=session_id)
+            nonlocal last_observed_session_id, fatal_progress_exc
+            last_observed_session_id = session_id
+            if session_id in committed_session_ids or session_id in pending_session_ids:
+                return
+            pending_session_ids.add(session_id)
+
+            async def _commit_and_publish_session(sid: str) -> None:
+                nonlocal fatal_progress_exc
+                try:
+                    await self._commit_required_progress(
+                        record.job_id,
+                        deadline=deadline,
+                        description=f"claiming session {sid!r}",
+                        backend=record.backend,
+                        session_id=sid,
+                    )
+                except asyncio.CancelledError:
+                    return
+                except asyncio.TimeoutError:
+                    return
+                except Exception as exc:
+                    fatal_progress_exc = exc
+                    if active_runner_task is not None and not active_runner_task.done():
+                        active_runner_task.cancel()
+                    return
+                finally:
+                    pending_session_ids.discard(sid)
+                committed_session_ids.add(sid)
+                if not record.is_terminal:
+                    record.session_id = sid
+
+            session_claim_tasks.append(
+                asyncio.create_task(
+                    _commit_and_publish_session(session_id),
+                    name=f"claim-session-{record.job_id}",
+                )
+            )
 
         def on_model(model: str) -> None:
             if record.model != model:
@@ -758,10 +1007,81 @@ class JobManager:
             record.last_activity = activity
             _schedule_progress(lock_timeout=0.3, last_activity=activity)
 
-        def on_provider_start() -> None:
+        async def on_provider_start() -> None:
             if not record.provider_invoked:
+                await self._commit_required_progress(
+                    record.job_id,
+                    deadline=deadline,
+                    description=f"recording launch intent for {record.job_id}",
+                    status="running",
+                    provider_invoked=True,
+                )
                 record.provider_invoked = True
-                _schedule_progress(lock_timeout=2.0, provider_invoked=True)
+
+        async def on_attempt(attempt_summary: dict[str, Any]) -> None:
+            recorded_attempts.append(attempt_summary)
+            record.attempts = list(recorded_attempts)
+            try:
+                await self._db(
+                    self.store.record_attempt_usage,
+                    record,
+                    attempt_summary,
+                    attempt_number=int(attempt_summary.get("attempt") or len(recorded_attempts)),
+                    is_final=False,
+                    lock_timeout=1.5,
+                )
+            except Exception as exc:
+                if is_sqlite_lock_error(exc):
+                    logger.debug(
+                        "Deferring intermediate attempt usage write for %s: %s",
+                        record.job_id,
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "Failed recording intermediate attempt usage for %s: %s",
+                        record.job_id,
+                        exc,
+                    )
+
+        def _prepare_session_for_finalization(candidate_sid: str | None) -> None:
+            sid = candidate_sid or last_observed_session_id
+            if sid:
+                record.session_id = sid
+                if sid not in committed_session_ids:
+                    self._uncommitted_session_ids.add(record.job_id)
+
+        def _attach_interrupted_attempts() -> list[dict[str, Any]] | None:
+            if not recorded_attempts:
+                return None
+            prior_dur = sum(float(a.get("duration_seconds") or 0.0) for a in recorded_attempts)
+            wall_dur = float(record.duration_seconds or 0.0)
+            total_dur = round(max(wall_dur, prior_dur), 2)
+            record.duration_seconds = total_dur
+            rem_dur = round(max(0.0, total_dur - prior_dur), 2)
+            final_att: dict[str, Any] = {
+                "attempt": len(recorded_attempts) + 1,
+                "status": record.status,
+                "model": record.model or record.requested_model or f"{record.backend}-default",
+                "quota_pool": record.quota_pool
+                or classify_quota_pool(record.backend, record.model or record.requested_model),
+                "duration_seconds": rem_dur,
+                "usage_status": "missing",
+            }
+            if record.effort:
+                final_att["effort"] = record.effort
+            if record.failure_reason:
+                final_att["failure_reason"] = record.failure_reason
+            if record.error:
+                final_att["error"] = record.error
+            combined = [*recorded_attempts, final_att]
+            record.attempts = combined
+            if record.usage is None:
+                agg_usage = _sum_attempt_usage(recorded_attempts)
+                if agg_usage is not None:
+                    record.usage = agg_usage
+                    record.usage_status = "partial"
+            return combined
 
         def on_worktree_planned(planned: dict[str, str | None]) -> None:
             wt_p = planned.get("worktree_path")
@@ -811,21 +1131,19 @@ class JobManager:
             await asyncio.wait_for(sem_ref.acquire(), timeout=rem)
             acquired_sem = sem_ref
 
+            started_ts = time.time()
+            starting_activity = f"starting {request.backend}"
+            await self._commit_required_progress(
+                record.job_id,
+                deadline=deadline,
+                description=f"marking job {record.job_id} running",
+                status="running",
+                started_at=started_ts,
+                last_activity=starting_activity,
+            )
             record.status = "running"
-            record.started_at = time.time()
-            record.last_activity = f"starting {request.backend}"
-            try:
-                await self._db(
-                    self.store.update_job_progress,
-                    record.job_id,
-                    owner_id=self.owner_id,
-                    status="running",
-                    started_at=record.started_at,
-                    last_activity=record.last_activity,
-                    lock_timeout=0.25,
-                )
-            except Exception as exc:
-                logger.debug("Skipping non-fatal running progress update for %s: %s", record.job_id, exc)
+            record.started_at = started_ts
+            record.last_activity = starting_activity
 
             # 3. Pre-assign a dedicated Git worktree BEFORE launch and persist planned path before invoking Git.
             if request.backend == "codex" and request.worktree:
@@ -881,6 +1199,7 @@ class JobManager:
                     on_activity=on_activity,
                     on_model=on_model,
                     on_provider_start=on_provider_start,
+                    on_attempt=on_attempt,
                 )
             )
             try:
@@ -902,10 +1221,9 @@ class JobManager:
             work_stop_wall = time.time()
             c0 = time.monotonic()
             stopped = await tracker.terminate_all_and_verify()
-            cleanup_secs = round(max(0.0, time.monotonic() - c0) + tracker.total_cleanup_seconds, 2)
-            # Avoid double-counting terminate_all_and_verify inside tracker.total_cleanup_seconds:
             cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
-            await _drain_progress()
+            await _drain_progress(cancel_session_claims=True)
+            _prepare_session_for_finalization(None)
             record.status = "cancelled"
             record.failure_reason = "cancelled"
             record.provider_state = "stopped" if stopped else "possibly_running"
@@ -924,14 +1242,16 @@ class JobManager:
             )
             record.cleanup_seconds = cleanup_secs
             record.last_activity = "cancelled"
+            final_attempts = _attach_interrupted_attempts()
             finalized_committed = await self._finalize_job_durable(
                 record,
                 request_session_id=request.session_id,
                 touched_provider=record.provider_invoked,
+                attempts=final_attempts,
             )
             return
         except SessionResumeBlockedError as exc:
-            await _drain_progress()
+            await _drain_progress(cancel_session_claims=True)
             record.status = "failed"
             record.failure_reason = "prior_turn_uncertain"
             record.provider_state = "stopped"
@@ -950,18 +1270,39 @@ class JobManager:
                 touched_provider=False,
             )
             return
+        except WorktreeMissingError as exc:
+            await _drain_progress(cancel_session_claims=True)
+            record.status = "failed"
+            record.failure_reason = "worktree_missing"
+            record.provider_state = "stopped"
+            record.error = str(exc)
+            record.retry_guidance = (
+                "Recorded Git worktree is missing. Inspect `git worktree list`, then retry with "
+                "relocate_cwd=True (and cwd) to intentionally move the session or worktree=True "
+                "(with mode='edit') to create a new worktree."
+            )
+            record.finished_at = time.time()
+            record.duration_seconds = 0.0
+            record.last_activity = "worktree_missing"
+            finalized_committed = await self._finalize_job_durable(
+                record,
+                request_session_id=request.session_id,
+                touched_provider=False,
+            )
+            return
         except asyncio.TimeoutError as exc:
             work_stop_wall = time.time()
             c0 = time.monotonic()
             stopped = await tracker.terminate_all_and_verify()
             cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
-            await _drain_progress()
+            await _drain_progress(cancel_session_claims=True)
+            _prepare_session_for_finalization(None)
             record.status = "timed_out"
             record.failure_reason = "timeout"
             record.provider_state = "stopped" if stopped else "possibly_running"
             record.error = str(exc) or f"Job timed out after {request.timeout_seconds}s."
             record.retry_guidance = (
-                "Job deadline expired while queued or waiting on an active session turn. "
+                "Job deadline expired while queued or waiting on an active session turn or storage lock. "
                 "Increase timeout_seconds or wait for active work to finish."
             )
             record.finished_at = time.time()
@@ -972,10 +1313,12 @@ class JobManager:
             )
             record.cleanup_seconds = cleanup_secs
             record.last_activity = "timed_out"
+            final_attempts = _attach_interrupted_attempts()
             finalized_committed = await self._finalize_job_durable(
                 record,
                 request_session_id=request.session_id,
                 touched_provider=record.provider_invoked,
+                attempts=final_attempts,
             )
             return
         except Exception as exc:
@@ -984,7 +1327,8 @@ class JobManager:
             c0 = time.monotonic()
             stopped = await tracker.terminate_all_and_verify()
             cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
-            await _drain_progress()
+            await _drain_progress(cancel_session_claims=True)
+            _prepare_session_for_finalization(None)
             record.status = "failed"
             record.failure_reason = (
                 "launch_error" if isinstance(exc, ProcessContainmentError) else "cli_error"
@@ -1005,25 +1349,36 @@ class JobManager:
             )
             record.cleanup_seconds = cleanup_secs if cleanup_secs > 0 else None
             record.last_activity = "failed"
+            final_attempts = _attach_interrupted_attempts()
             finalized_committed = await self._finalize_job_durable(
                 record,
                 request_session_id=request.session_id,
                 touched_provider=record.provider_invoked,
+                attempts=final_attempts,
             )
             return
         else:
-            record.provider_invoked = (
-                record.provider_invoked
-                or result.provider_invoked
-                or (result.status == "completed")
-            )
+            if (
+                not recorded_attempts
+                and not result.provider_invoked
+                and result.status in {"failed", "timed_out"}
+                and result.failure_reason in {"launch_error", "timeout", "model_unavailable", "cli_not_found"}
+            ):
+                record.provider_invoked = False
+            else:
+                record.provider_invoked = (
+                    record.provider_invoked
+                    or result.provider_invoked
+                    or (result.status == "completed")
+                )
             if record.job_id in self._cancelled_ids:
                 self._cancelled_ids.discard(record.job_id)
                 work_stop_wall = time.time()
                 c0 = time.monotonic()
                 stopped = await tracker.terminate_all_and_verify()
                 cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
-                await _drain_progress()
+                await _drain_progress(cancel_session_claims=True)
+                _prepare_session_for_finalization(result.session_id)
                 record.status = "cancelled"
                 record.failure_reason = "cancelled"
                 record.provider_state = "stopped" if stopped else "possibly_running"
@@ -1041,18 +1396,19 @@ class JobManager:
                 )
                 record.cleanup_seconds = cleanup_secs
                 record.last_activity = "cancelled"
+                final_attempts = _attach_interrupted_attempts()
                 finalized_committed = await self._finalize_job_durable(
                     record,
                     request_session_id=request.session_id,
                     touched_provider=record.provider_invoked,
+                    attempts=final_attempts,
                 )
                 return
 
-            await _drain_progress()
+            await _drain_progress(cancel_session_claims=True)
             record.status = result.status
             record.response = result.response
-            if result.session_id:
-                record.session_id = result.session_id
+            _prepare_session_for_finalization(result.session_id)
             if result.model:
                 record.model = result.model
             record.quota_pool = classify_quota_pool(
@@ -1194,13 +1550,13 @@ class JobManager:
     def get(self, job_id: str) -> JobRecord:
         uncommitted = self._terminal_uncommitted.get(job_id)
         if uncommitted is not None:
-            return uncommitted
+            return self._visible_record(uncommitted)
         rec = self.store.get_job(job_id)
         if rec is not None:
             if not rec.is_terminal:
                 local = self._local_jobs.get(job_id)
                 if local is not None and local.owner_id == self.owner_id:
-                    return local
+                    return self._visible_record(local)
                 if rec.owner_id != self.owner_id:
                     if not self.store.is_owner_alive(
                         rec.owner_id,
@@ -1218,13 +1574,13 @@ class JobManager:
             return rec
         local = self._local_jobs.get(job_id)
         if local is not None:
-            return local
+            return self._visible_record(local)
         raise KeyError(f"Unknown job_id: {job_id!r}")
 
     async def get_async(self, job_id: str) -> JobRecord:
         uncommitted = self._terminal_uncommitted.get(job_id)
         if uncommitted is not None:
-            return uncommitted
+            return self._visible_record(uncommitted)
         return await self._db(self.get, job_id)
 
     async def wait_for(
@@ -1255,7 +1611,12 @@ class JobManager:
             if ev is not None:
                 local_events.append(ev)
             else:
-                latest = self._terminal_uncommitted.get(jid) or await self._db(self.store.get_job, jid)
+                uncommitted = self._terminal_uncommitted.get(jid)
+                latest = (
+                    self._visible_record(uncommitted)
+                    if uncommitted is not None
+                    else await self._db(self.store.get_job, jid)
+                )
                 if latest is not None:
                     records[idx] = latest
                     if latest.is_terminal:
@@ -1285,9 +1646,9 @@ class JobManager:
                         w.cancel()
                 await asyncio.gather(*waiters, return_exceptions=True)
             return [
-                self._terminal_uncommitted.get(jid)
-                or (await self._db(self.store.get_job, jid))
-                or rec
+                self._visible_record(self._terminal_uncommitted[jid])
+                if jid in self._terminal_uncommitted
+                else ((await self._db(self.store.get_job, jid)) or rec)
                 for jid, rec in zip(job_ids, records)
             ]
 
@@ -1303,9 +1664,9 @@ class JobManager:
             except Exception:
                 pass
             current = [
-                self._terminal_uncommitted.get(jid)
-                or (await self._db(self.store.get_job, jid))
-                or rec
+                self._visible_record(self._terminal_uncommitted[jid])
+                if jid in self._terminal_uncommitted
+                else ((await self._db(self.store.get_job, jid)) or rec)
                 for jid, rec in zip(job_ids, records)
             ]
             if wait_mode == "any" and any(r.is_terminal for r in current):
@@ -1315,13 +1676,26 @@ class JobManager:
             await asyncio.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
 
         return [
-            self._terminal_uncommitted.get(jid)
-            or (await self._db(self.store.get_job, jid))
-            or rec
+            self._visible_record(self._terminal_uncommitted[jid])
+            if jid in self._terminal_uncommitted
+            else ((await self._db(self.store.get_job, jid)) or rec)
             for jid, rec in zip(job_ids, records)
         ]
 
     async def cancel(self, job_id: str) -> JobRecord:
+        # Never cancel a job that has already reached terminal state and is committing its terminal write!
+        if job_id in self._finalizing_records:
+            fin_task = self._pending_finalizations.get(job_id)
+            if fin_task is not None and not fin_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(fin_task), timeout=2.0)
+                except Exception:
+                    pass
+            fin_rec = self._terminal_uncommitted.get(job_id) or self._finalizing_records.get(job_id)
+            if fin_rec is not None and fin_rec.is_terminal:
+                return self._visible_record(fin_rec)
+            return await self.get_async(job_id)
+
         record = await self.get_async(job_id)
         if record.is_terminal:
             return record
@@ -1354,7 +1728,7 @@ class JobManager:
         # Single-owner cleanup: cancel the job's task so its ManagedProcess terminates the tree.
         task = self._tasks.get(job_id)
         task_finished = task is None or task.done()
-        if task is not None and not task.done():
+        if task is not None and not task.done() and job_id not in self._finalizing_records:
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=6.0)
@@ -1364,9 +1738,14 @@ class JobManager:
             except asyncio.TimeoutError:
                 task_finished = task.done()
 
+        if job_id in self._finalizing_records:
+            fin_rec = self._terminal_uncommitted.get(job_id) or self._finalizing_records.get(job_id)
+            if fin_rec is not None and fin_rec.is_terminal:
+                return self._visible_record(fin_rec)
+
         uncommitted = self._terminal_uncommitted.get(job_id)
         if uncommitted is not None and uncommitted.is_terminal:
-            return uncommitted
+            return self._visible_record(uncommitted)
         latest = await self._db(self.store.get_job, job_id)
         if latest is not None and latest.is_terminal:
             return latest
@@ -1440,7 +1819,10 @@ class JobManager:
             parent_run=norm_parent,
         )
         merged: list[JobRecord] = [
-            self._terminal_uncommitted.get(r.job_id, r) for r in recs
+            self._visible_record(self._terminal_uncommitted[r.job_id])
+            if r.job_id in self._terminal_uncommitted
+            else r
+            for r in recs
         ]
         return [r.to_summary() for r in merged]
 
@@ -1475,7 +1857,10 @@ class JobManager:
             parent_run=norm_parent,
         )
         merged: list[JobRecord] = [
-            self._terminal_uncommitted.get(r.job_id, r) for r in recs
+            self._visible_record(self._terminal_uncommitted[r.job_id])
+            if r.job_id in self._terminal_uncommitted
+            else r
+            for r in recs
         ]
         return [r.to_summary() for r in merged]
 
@@ -1595,23 +1980,44 @@ class JobManager:
         pairs = await asyncio.gather(*(_probe_one(b) for b in backends))
         return dict(pairs)
 
-    async def shutdown(self) -> None:
-        active_ids = list(self._tasks.keys())
-        if active_ids:
-            await asyncio.gather(*(self.cancel(jid) for jid in active_ids), return_exceptions=True)
-        pending_fin = list(self._pending_finalizations.values())
-        if pending_fin:
+    async def shutdown(self, *, flush_timeout: float = 20.0) -> None:
+        # 1. Cancel ONLY active jobs that have NOT already reached terminal finalization.
+        non_finalizing = [
+            jid for jid in list(self._tasks.keys()) if jid not in self._finalizing_records
+        ]
+        if non_finalizing:
+            await asyncio.gather(
+                *(self.cancel(jid) for jid in non_finalizing),
+                return_exceptions=True,
+            )
+
+        # 2. Wait for BOTH in-progress finalizing job tasks AND background finalization/cleanup tasks!
+        dl = time.monotonic() + max(0.5, flush_timeout)
+        while True:
+            wait_tasks = [
+                t
+                for t in (*self._tasks.values(), *self._pending_finalizations.values())
+                if not t.done()
+            ]
+            if not wait_tasks:
+                break
+            rem = dl - time.monotonic()
+            if rem <= 0:
+                for t in wait_tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*wait_tasks, return_exceptions=True)
+                break
+            await asyncio.wait(wait_tasks, timeout=rem)
+
+        # 3. Only mark owner exited & clear claims once all terminal writes have committed!
+        if not self._terminal_uncommitted and not self._finalizing_records:
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending_fin, return_exceptions=True),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
-                for task in pending_fin:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*pending_fin, return_exceptions=True)
-        try:
-            await self._db(self.store.mark_owner_exited, self.owner_id)
-        except Exception:
-            pass
+                await self._db(self.store.mark_owner_exited, self.owner_id)
+            except Exception:
+                pass
+        else:
+            logger.warning(
+                "Shutdown flush timeout reached with %d uncommitted terminal job(s); skipping mark_owner_exited.",
+                len(self._terminal_uncommitted) or len(self._finalizing_records),
+            )

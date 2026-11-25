@@ -1098,7 +1098,9 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "outpu
         async def run(self, request, **kwargs):  # type: ignore[override]
             if request.prompt == "TURN1":
                 if kwargs.get("on_provider_start"):
-                    kwargs["on_provider_start"]()
+                    res_cb = kwargs["on_provider_start"]()
+                    if asyncio.iscoroutine(res_cb):
+                        await res_cb
                 if kwargs.get("on_session"):
                     kwargs["on_session"]("thr-wt-keep")
                 self.turn1_started.set()
@@ -1124,6 +1126,11 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "outpu
 
     t1 = mgr.start(mgr.prepare_request(backend="codex", prompt="TURN1", cwd=str(parent_dir), mode="edit"))
     await asyncio.wait_for(hold_runner.turn1_started.wait(), timeout=5.0)
+    # Wait for Turn 1's session claim to commit to SQLite before resuming it.
+    claim_dl = time.monotonic() + 3.0
+    while time.monotonic() < claim_dl and mgr.get(t1.job_id).session_id != "thr-wt-keep":
+        await asyncio.sleep(0.01)
+    assert mgr.get(t1.job_id).session_id == "thr-wt-keep"
 
     # Queue Turn 2 while Turn 1 holds the session (Turn 2 starts with parent_dir and no worktree_path yet).
     t2 = mgr.start(mgr.prepare_request(backend="codex", prompt="TURN2_CANCEL", resume_from=t1.job_id, mode="edit"))
@@ -2514,9 +2521,15 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 30, "outpu
     mgr = JobManager(settings, codex_runner=StubCodexRunner(settings, fake_codex))
     mgr._finalize_retry_seconds = 6.0
 
-    # Launch the job before acquiring the external write lock.
+    # Launch the job and wait until launch intent (`provider_invoked`) commits before holding the lock.
     job = await mgr.start_async(mgr.prepare_request(backend="codex", prompt="finish under lock"))
-    await asyncio.sleep(0.05)
+    launch_dl = time.monotonic() + 3.0
+    while time.monotonic() < launch_dl:
+        cur = mgr.get(job.job_id)
+        if cur.provider_invoked:
+            break
+        await asyncio.sleep(0.01)
+    assert mgr.get(job.job_id).provider_invoked is True
 
     # Hold a real external SQLite write lock for 2.2 seconds!
     locker = sqlite3.connect(str(mgr.store.db_path), isolation_level=None, timeout=1.0)
@@ -2696,11 +2709,20 @@ async def test_retry_guards_uncertain_and_resumed_turns_and_preserves_attempt_us
 
     usage_sum = await mgr.get_usage_summary(period="session", parent_run="retry-wf", compact=False)
     codex_bucket = usage_sum["by_backend"]["codex"]
+    assert usage_sum["overview"]["runs"] == 1
+    assert usage_sum["overview"]["attempts"] == 2
+    assert codex_bucket["runs"] == 1
+    assert codex_bucket["attempts"] == 2
+    assert codex_bucket["completed"] == 1
+    assert codex_bucket["failed"] == 0
     assert codex_bucket["duration_seconds"] == 2.0
     assert codex_bucket["tokens"]["total_tokens"] == 25
     assert codex_bucket["partial_total_tokens"] == 50
     assert codex_bucket["usage_coverage"]["exact"] == 1
     assert codex_bucket["usage_coverage"]["partial"] == 1
+    assert len(usage_sum["recent"]) == 2
+    assert all(entry["job_id"] == rec.job_id for entry in usage_sum["recent"])
+    assert all(mgr.get(entry["job_id"]).job_id == rec.job_id for entry in usage_sum["recent"])
     await mgr.shutdown()
 
 
@@ -2885,4 +2907,619 @@ sys.exit(0)
     assert data["backends"]["neon"]["resolved_default_model"] is None
     assert data["backends"]["neon"]["models_status"] == "unavailable"
     assert data["backends"]["neon"].get("catalog_error")
+    await mgr.shutdown()
+
+
+async def test_missing_worktree_fails_resume_unless_relocate_or_new_worktree(
+    tmp_path: Path,
+) -> None:
+    """Audit High #1: if a session's recorded worktree was removed, resuming with
+    `relocate_cwd=False` and `worktree=False` MUST fail (both during `prepare_request` and
+    pre-launch refresh) instead of targeting the parent checkout."""
+    import subprocess
+
+    repo = tmp_path / "wt_missing_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    invocations_log = tmp_path / "wt_missing_invocations.log"
+    fake_codex = tmp_path / "fake_codex_wt_missing.py"
+    fake_codex.write_text(
+        f"""
+import json, os, sys
+from pathlib import Path
+
+prompt = sys.stdin.read().strip()
+with Path({str(invocations_log)!r}).open("a", encoding="utf-8") as fh:
+    fh.write(f"{{prompt}}|{{os.getcwd()}}\\n")
+tid = "thr-wt-missing-2" if "second-session" in prompt else "thr-wt-missing-1"
+print(json.dumps({{"type": "thread.started", "thread_id": tid}}), flush=True)
+print(json.dumps({{"type": "item.completed", "item": {{"id": "m1", "type": "agent_message", "text": f"CWD={{os.getcwd()}}"}}}}), flush=True)
+print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 10, "output_tokens": 5}}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path, default_cwd=repo)
+    mgr = JobManager(settings, codex_runner=StubCodexRunner(settings, fake_codex))
+
+    t1 = await mgr.run(
+        mgr.prepare_request(
+            backend="codex",
+            prompt="first-session",
+            cwd=str(repo),
+            mode="edit",
+            worktree=True,
+        )
+    )
+    assert t1.status == "completed"
+    assert t1.worktree_path is not None
+    wt1 = Path(t1.worktree_path)
+    assert wt1.is_dir()
+
+    # Remove the recorded worktree with Git.
+    subprocess.run(["git", "worktree", "remove", "--force", str(wt1)], cwd=repo, check=True, capture_output=True)
+    assert not wt1.exists()
+
+    # Resuming by job_id OR raw session_id with parent cwd and relocate_cwd=False MUST fail!
+    with pytest.raises(ValueError, match="no longer exists"):
+        mgr.prepare_request(
+            backend="codex",
+            prompt="resume-should-fail",
+            cwd=str(repo),
+            mode="edit",
+            resume_from=t1.job_id,
+        )
+    with pytest.raises(ValueError, match="no longer exists"):
+        mgr.prepare_request(
+            backend="codex",
+            prompt="resume-sid-should-fail",
+            cwd=str(repo),
+            mode="edit",
+            resume_from=t1.session_id,
+        )
+
+    # Pre-launch refresh guard: prepare while worktree exists, remove it before execution starts!
+    t2 = await mgr.run(
+        mgr.prepare_request(
+            backend="codex",
+            prompt="second-session",
+            cwd=str(repo),
+            mode="edit",
+            worktree=True,
+        )
+    )
+    assert t2.status == "completed" and t2.worktree_path is not None
+    wt2 = Path(t2.worktree_path)
+    req_prepared = mgr.prepare_request(
+        backend="codex",
+        prompt="prepared-before-removal",
+        cwd=str(repo),
+        mode="edit",
+        resume_from=t2.job_id,
+    )
+    subprocess.run(["git", "worktree", "remove", "--force", str(wt2)], cwd=repo, check=True, capture_output=True)
+    assert not wt2.exists()
+
+    before_lines = invocations_log.read_text(encoding="utf-8").splitlines()
+    failed_rec = await mgr.run(req_prepared)
+    assert failed_rec.status == "failed"
+    assert failed_rec.failure_reason == "worktree_missing"
+    assert failed_rec.provider_state == "stopped"
+    assert failed_rec.provider_invoked is False
+    # Provider MUST NOT have been invoked in the parent checkout!
+    assert invocations_log.read_text(encoding="utf-8").splitlines() == before_lines
+
+    # Explicit opt-in #1: `relocate_cwd=True` succeeds in parent checkout.
+    reloc = await mgr.run(
+        mgr.prepare_request(
+            backend="codex",
+            prompt="relocate-ok",
+            cwd=str(repo),
+            mode="edit",
+            resume_from=t1.job_id,
+            relocate_cwd=True,
+        )
+    )
+    assert reloc.status == "completed"
+    assert reloc.worktree_path is None
+    assert reloc.effective_cwd == str(repo.resolve())
+
+    # Explicit opt-in #2: `worktree=True` creates a fresh worktree instead of reusing deleted `wt2`.
+    new_wt = await mgr.run(
+        mgr.prepare_request(
+            backend="codex",
+            prompt="new-worktree-ok",
+            cwd=str(repo),
+            mode="edit",
+            resume_from=t2.job_id,
+            worktree=True,
+        )
+    )
+    assert new_wt.status == "completed"
+    assert new_wt.worktree_path is not None
+    assert Path(new_wt.worktree_path).resolve() != wt2.resolve()
+    assert Path(new_wt.worktree_path).is_dir()
+    await mgr.shutdown()
+
+
+async def test_safety_critical_commits_block_session_publication_and_launch_until_sqlite_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit High #2:
+    (A) Window 1 MUST NOT expose a newly discovered session_id before SQLite commits its
+        session_claims row, so Window 2 can never start a concurrent turn on that session.
+    (B) A SQLite lock before launch MUST prevent spawning the provider while the DB row still
+        says `queued`, and when unlocked, `status='running'` + `provider_invoked=1` commit
+        BEFORE the provider executes.
+    """
+    import sqlite3
+    import threading
+
+    # --- Part A: Two-window session publication ordering ---
+    gate1 = tmp_path / "gate1.go"
+    order_log = tmp_path / "order.log"
+    fake_codex_two = tmp_path / "fake_codex_two_win.py"
+    fake_codex_two.write_text(
+        f"""
+import json, sys, time
+from pathlib import Path
+
+prompt = sys.stdin.read().strip()
+log_p = Path({str(order_log)!r})
+print(json.dumps({{"type": "thread.started", "thread_id": "thr-two-win-atomic"}}), flush=True)
+with log_p.open("a", encoding="utf-8") as fh:
+    fh.write(f"START:{{prompt}}\\n")
+if prompt == "turn1":
+    gate = Path({str(gate1)!r})
+    dl = time.monotonic() + 10.0
+    while not gate.exists() and time.monotonic() < dl:
+        time.sleep(0.02)
+with log_p.open("a", encoding="utf-8") as fh:
+    fh.write(f"END:{{prompt}}\\n")
+print(json.dumps({{"type": "item.completed", "item": {{"id": "m1", "type": "agent_message", "text": f"DONE:{{prompt}}"}}}}), flush=True)
+print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 10, "output_tokens": 5}}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr1 = JobManager(settings, codex_runner=StubCodexRunner(settings, fake_codex_two), owner_id="win-1")
+    mgr2 = JobManager(settings, codex_runner=StubCodexRunner(settings, fake_codex_two), owner_id="win-2")
+
+    claim_entered = threading.Event()
+    allow_claim_commit = threading.Event()
+    orig_update = mgr1.store.update_job_progress
+
+    def gated_update(*args, **kwargs):
+        if kwargs.get("session_id") == "thr-two-win-atomic":
+            claim_entered.set()
+            allow_claim_commit.wait(timeout=5.0)
+        return orig_update(*args, **kwargs)
+
+    monkeypatch.setattr(mgr1.store, "update_job_progress", gated_update)
+
+    j1 = await mgr1.start_async(mgr1.prepare_request(backend="codex", prompt="turn1", timeout_seconds=15))
+    dl = time.monotonic() + 4.0
+    while not claim_entered.is_set() and time.monotonic() < dl:
+        await asyncio.sleep(0.01)
+    assert claim_entered.is_set(), "Window 1 never attempted session claim commit"
+
+    # BEFORE SQLite commits the claim, NEITHER Window 1 NOR Window 2 may see `session_id`!
+    assert mgr1.get(j1.job_id).session_id is None
+    assert (await mgr1.get_async(j1.job_id)).session_id is None
+    db_row_before = mgr2.store.get_job(j1.job_id)
+    assert db_row_before is not None and db_row_before.session_id is None
+
+    # Allow Window 1's session claim to commit to SQLite.
+    allow_claim_commit.set()
+    dl2 = time.monotonic() + 4.0
+    while time.monotonic() < dl2:
+        if mgr1.get(j1.job_id).session_id == "thr-two-win-atomic":
+            break
+        await asyncio.sleep(0.01)
+    assert mgr1.get(j1.job_id).session_id == "thr-two-win-atomic"
+
+    # Now Window 2 starts Turn 2 on that session while Turn 1 is STILL running -> MUST wait!
+    j2 = await mgr2.start_async(
+        mgr2.prepare_request(
+            backend="codex",
+            prompt="turn2",
+            resume_from="thr-two-win-atomic",
+            timeout_seconds=15,
+        )
+    )
+    await asyncio.sleep(0.25)
+    lines_while_running = order_log.read_text(encoding="utf-8").splitlines()
+    assert lines_while_running == ["START:turn1"], f"Turn 2 overlapped Turn 1! {lines_while_running}"
+
+    # Release Turn 1 -> Turn 1 finishes, THEN Turn 2 starts and finishes sequentially!
+    gate1.write_text("go", encoding="utf-8")
+    r1 = (await mgr1.wait_for([j1.job_id], wait_seconds=10))[0]
+    r2 = (await mgr2.wait_for([j2.job_id], wait_seconds=10))[0]
+    assert r1.status == "completed" and r2.status == "completed"
+    assert order_log.read_text(encoding="utf-8").splitlines() == [
+        "START:turn1",
+        "END:turn1",
+        "START:turn2",
+        "END:turn2",
+    ]
+    await mgr1.shutdown()
+    await mgr2.shutdown()
+
+    # --- Part B: Launch state commits BEFORE spawning (locked DB blocks spawn!) ---
+    settings_b = _make_settings(tmp_path / "b_root", default_cwd=tmp_path)
+    state_b = settings_b.state_dir
+    spawned_flag = tmp_path / "should_not_spawn.flag"
+    db_snapshot_flag = tmp_path / "db_snapshot.json"
+    fake_codex_launch = tmp_path / "fake_codex_launch_check.py"
+    fake_codex_launch.write_text(
+        f"""
+import json, sqlite3, sys
+from pathlib import Path
+
+prompt = sys.stdin.read().strip()
+if prompt == "locked-run":
+    Path({str(spawned_flag)!r}).write_text("SPAWNED", encoding="utf-8")
+else:
+    conn = sqlite3.connect({str(state_b / "bridge.db")!r})
+    row = conn.execute("SELECT status, provider_invoked FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+    conn.close()
+    Path({str(db_snapshot_flag)!r}).write_text(json.dumps({{"status": row[0], "provider_invoked": row[1]}}), encoding="utf-8")
+print(json.dumps({{"type": "thread.started", "thread_id": "thr-launch-ok"}}), flush=True)
+print(json.dumps({{"type": "item.completed", "item": {{"id": "m1", "type": "agent_message", "text": "OK"}}}}), flush=True)
+print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 5, "output_tokens": 2}}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    mgr_b = JobManager(settings_b, codex_runner=StubCodexRunner(settings_b, fake_codex_launch))
+    mgr_b._finalize_retry_seconds = 3.0
+
+    # Hold a real external SQLite write lock right after `insert_job` commits the `queued` row!
+    locker = sqlite3.connect(
+        str(mgr_b.store.db_path),
+        isolation_level=None,
+        timeout=1.0,
+        check_same_thread=False,
+    )
+    orig_insert = mgr_b.store.insert_job
+    lock_acquired = False
+
+    def insert_then_lock(rec):
+        nonlocal lock_acquired
+        orig_insert(rec)
+        if not lock_acquired:
+            locker.execute("BEGIN IMMEDIATE")
+            lock_acquired = True
+
+    monkeypatch.setattr(mgr_b.store, "insert_job", insert_then_lock)
+
+    async def release_lock_later() -> None:
+        await asyncio.sleep(1.3)
+        if lock_acquired:
+            locker.execute("ROLLBACK")
+        locker.close()
+
+    rel_task = asyncio.create_task(release_lock_later())
+    req_locked = mgr_b.prepare_request(backend="codex", prompt="locked-run", timeout_seconds=10)
+    req_locked.timeout_seconds = 0.8  # type: ignore[assignment]
+    res_locked = await mgr_b.run(req_locked)
+    await rel_task
+    assert not spawned_flag.exists(), "Provider spawned while SQLite row was still queued under lock!"
+    assert res_locked.status == "timed_out"
+    assert res_locked.provider_invoked is False
+    assert res_locked.provider_state == "stopped"
+
+    # Now run unlocked and verify the DB ALREADY shows `status='running'` & `provider_invoked=1`
+    # when the provider process begins executing!
+    monkeypatch.setattr(mgr_b.store, "insert_job", orig_insert)
+    res_ok = await mgr_b.run(mgr_b.prepare_request(backend="codex", prompt="unlocked-run", timeout_seconds=10))
+    assert res_ok.status == "completed"
+    snap = json.loads(db_snapshot_flag.read_text(encoding="utf-8"))
+    assert snap["status"] == "running"
+    assert snap["provider_invoked"] == 1
+    await mgr_b.shutdown()
+
+
+async def test_graceful_shutdown_waits_for_delayed_terminal_write_before_marking_owner_exited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit High #3: `shutdown()` MUST NOT cancel a job that has already reached terminal
+    finalization, and MUST wait for delayed terminal writes to commit before marking the owner
+    exited so another window cannot overwrite the completed result as `owner_exited`."""
+    import threading
+
+    fake_codex = tmp_path / "fake_codex_shutdown.py"
+    fake_codex.write_text(
+        """
+import json, sys
+
+_ = sys.stdin.read()
+print(json.dumps({"type": "thread.started", "thread_id": "thr-shutdown-safe"}), flush=True)
+print(json.dumps({"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": "PRESERVED_COMPLETED_RESULT"}}), flush=True)
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 25, "output_tokens": 10}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr1 = JobManager(settings, codex_runner=StubCodexRunner(settings, fake_codex), owner_id="win-shutdown-1")
+
+    finalize_entered = threading.Event()
+    orig_finalize = mgr1.store.finalize_job
+
+    def delayed_finalize(*args, **kwargs):
+        finalize_entered.set()
+        time.sleep(0.75)
+        return orig_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(mgr1.store, "finalize_job", delayed_finalize)
+
+    job = await mgr1.start_async(mgr1.prepare_request(backend="codex", prompt="finish cleanly"))
+    dl = time.monotonic() + 5.0
+    while not finalize_entered.is_set() and time.monotonic() < dl:
+        await asyncio.sleep(0.01)
+    assert finalize_entered.is_set(), "Job never reached terminal finalization"
+
+    # Trigger graceful shutdown RIGHT in the middle of the delayed terminal write!
+    await mgr1.shutdown(flush_timeout=10.0)
+
+    # Window 2 opens the same DB (with Window 1's PID treated as dead) and runs recovery:
+    mgr2 = JobManager(
+        settings,
+        codex_runner=StubCodexRunner(settings, fake_codex),
+        owner_id="win-shutdown-2",
+        is_pid_alive_fn=lambda _pid: False,
+    )
+    rec = mgr2.get(job.job_id)
+    assert rec.status == "completed"
+    assert rec.failure_reason is None
+    assert "PRESERVED_COMPLETED_RESULT" in rec.response
+    assert rec.usage is not None and rec.usage["total_tokens"] == 35
+    await mgr2.shutdown()
+
+
+async def test_agy_remote_in_progress_survives_local_timeout_and_observed_turn_advance_blocks_edit_retry(
+    tmp_path: Path,
+) -> None:
+    """Audit High #4:
+    (A) Antigravity's remote in-progress signal (`exit_code=3` or timeout stderr) MUST remain
+        `provider_timeout_still_running` / `possibly_running` even when local timeout cleanup stops
+        the client process.
+    (B) An observed `num_turns` increase on a failed Antigravity edit envelope MUST block automatic
+        model-fallback retry even when usage checkpoint fields are absent.
+    """
+    from agent_bridge.runners import classify_failure
+
+    # Part A1: Direct classifier check for exit_code=3 + timed_out_locally=True + process_stopped=True.
+    st, reason, pstate, _guidance = classify_failure(
+        backend="neon",
+        exit_code=3,
+        error_text="Neon subagent timed out after 1s.",
+        stderr_text="",
+        timed_out_locally=True,
+        process_stopped=True,
+    )
+    assert st == "timed_out"
+    assert reason == "provider_timeout_still_running"
+    assert pstate == "possibly_running"
+
+    # Part A2: End-to-end NeonRunner local timeout with remote in-progress stderr signal!
+    fake_agy_remote = tmp_path / "fake_agy_remote_timeout.py"
+    fake_agy_remote.write_text(
+        """
+import json, sys, time
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+print(json.dumps({"event": "init", "conversation_id": "conv-remote-still-going", "init": {"model": "gemini-4-neon-medium"}}), flush=True)
+sys.stderr.write("Warning: remote turn still in progress after wait deadline\\n")
+sys.stderr.flush()
+time.sleep(30)
+""".strip(),
+        encoding="utf-8",
+    )
+    settings = _make_settings(tmp_path)
+    runner_a = StubAgyRunner(settings, fake_agy_remote)
+    res_a = await runner_a.run(
+        RunRequest(backend="neon", model="neon-medium", prompt="slow", cwd=str(tmp_path), timeout_seconds=10),
+        deadline=time.monotonic() + 0.45,
+    )
+    assert res_a.status == "timed_out"
+    assert res_a.failure_reason == "provider_timeout_still_running"
+    assert res_a.provider_state == "possibly_running"
+
+    # Part B: Resumed edit where failed model rejection already advanced `num_turns` (1 -> 2) with NO usage!
+    edit_calls_log = tmp_path / "edit_retry_calls.log"
+    fake_agy_edit = tmp_path / "fake_agy_edit_turn_adv.py"
+    fake_agy_edit.write_text(
+        f"""
+import json, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\\tGemini 4 Neon (Medium)")
+    print("gemini-4-neon-high\\tGemini 4 Neon (High)")
+    sys.exit(0)
+
+with Path({str(edit_calls_log)!r}).open("a", encoding="utf-8") as fh:
+    fh.write("CALL\\n")
+
+print(json.dumps({{
+    "conversation_id": "conv-edit-adv",
+    "status": "ERROR",
+    "error": "Requested model is not available",
+    "num_turns": 2,
+}}), flush=True)
+sys.exit(1)
+""".strip(),
+        encoding="utf-8",
+    )
+    runner_b = StubAgyRunner(settings, fake_agy_edit)
+    res_b = await runner_b.run(
+        RunRequest(
+            backend="neon",
+            model="gemini-4-neon-medium",
+            prompt="apply patch",
+            cwd=str(tmp_path),
+            mode="edit",
+            session_id="conv-edit-adv",
+            timeout_seconds=30,
+        ),
+        prior_watermark={
+            "num_turns": 1,
+            "cumulative": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+        },
+    )
+    assert res_b.status == "failed"
+    assert res_b.observed_num_turns == 2
+    assert edit_calls_log.read_text(encoding="utf-8").splitlines() == ["CALL"], (
+        "NeonRunner retried a resumed edit after observed num_turns advanced!"
+    )
+
+
+async def test_cancellation_during_start_async_submission_cleans_up_committed_queued_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit Medium #5: cancelling `start_async()` while `insert_job` is running in a worker
+    thread MUST clean up any `queued` row that finishes committing instead of leaving an orphan."""
+    import sqlite3
+    import threading
+
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(settings)
+
+    insert_entered = threading.Event()
+    orig_insert = mgr.store.insert_job
+
+    def slow_insert(rec):
+        insert_entered.set()
+        time.sleep(0.25)
+        return orig_insert(rec)
+
+    monkeypatch.setattr(mgr.store, "insert_job", slow_insert)
+
+    req = mgr.prepare_request(backend="codex", prompt="cancel during submit")
+    submit_task = asyncio.create_task(mgr.start_async(req))
+
+    dl = time.monotonic() + 3.0
+    while not insert_entered.is_set() and time.monotonic() < dl:
+        await asyncio.sleep(0.01)
+    assert insert_entered.is_set()
+
+    submit_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await submit_task
+
+    await mgr.shutdown(flush_timeout=5.0)
+
+    conn = sqlite3.connect(str(mgr.store.db_path))
+    try:
+        queued_count = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'queued'").fetchone()[0]
+        total_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    finally:
+        conn.close()
+    assert queued_count == 0, f"Orphaned queued row remained in SQLite ({queued_count})"
+    assert total_count == 0
+
+
+async def test_cancel_during_retry_backoff_preserves_attempt1_usage_and_real_job_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit Medium #6: cancelling a job during retry backoff preserves Attempt 1's reported
+    usage and duration (recorded BEFORE backoff starts), exposes distinct job vs attempt counts,
+    and uses the real `job_id` on every `usage_events` row."""
+    from agent_bridge import runners as runners_mod
+    from agent_bridge.models import RunResult
+
+    monkeypatch.setattr(runners_mod, "TRANSIENT_RETRY_BACKOFF_SECONDS", 6.0)
+    settings = _make_settings(tmp_path)
+    runner = CodexRunner(settings)
+    attempt1_done = asyncio.Event()
+    calls = 0
+
+    async def fake_run_once_backoff(*_args, **_kwargs) -> RunResult:
+        nonlocal calls
+        calls += 1
+        attempt1_done.set()
+        return RunResult(
+            status="failed",
+            model="gpt-6.2-sol",
+            duration_seconds=1.1,
+            usage={"input_tokens": 35, "output_tokens": 15, "total_tokens": 50},
+            usage_status="partial",
+            error="HTTP 503 Service Unavailable",
+            failure_reason="transient_service",
+            provider_state="stopped",
+            provider_invoked=True,
+        )
+
+    monkeypatch.setattr(runner, "_run_once", fake_run_once_backoff)
+    mgr = JobManager(settings, codex_runner=runner)
+
+    job = await mgr.start_async(
+        mgr.prepare_request(
+            backend="codex",
+            prompt="cancel during backoff",
+            mode="read_only",
+            parent_run="backoff-cancel-wf",
+        )
+    )
+    await asyncio.wait_for(attempt1_done.wait(), timeout=3.0)
+
+    # Confirm Attempt 1 was ALREADY persisted to `usage_events` BEFORE backoff finished / Attempt 2 started!
+    pre_dl = time.monotonic() + 3.0
+    pre_sum = None
+    while time.monotonic() < pre_dl:
+        pre_sum = await mgr.get_usage_summary(period="session", parent_run="backoff-cancel-wf", compact=False)
+        if pre_sum["overview"]["attempts"] >= 1:
+            break
+        await asyncio.sleep(0.02)
+    assert pre_sum is not None and pre_sum["overview"]["attempts"] == 1
+    assert pre_sum["by_backend"]["codex"]["partial_total_tokens"] == 50
+
+    # Now cancel DURING retry backoff sleep!
+    cancelled = await mgr.cancel(job.job_id)
+    assert calls == 1, "Attempt 2 should not have started during backoff"
+    assert cancelled.status == "cancelled"
+    assert cancelled.usage is not None and cancelled.usage["total_tokens"] == 50
+    assert cancelled.usage_status == "partial"
+    assert cancelled.duration_seconds is not None and cancelled.duration_seconds >= 1.1
+
+    detail = cancelled.to_detail()
+    assert len(detail["attempts"]) == 2
+    assert detail["attempts"][0]["attempt"] == 1
+    assert detail["attempts"][0]["usage"]["total_tokens"] == 50
+    assert detail["attempts"][1]["attempt"] == 2
+    assert detail["attempts"][1]["status"] == "cancelled"
+
+    usage_sum = await mgr.get_usage_summary(period="session", parent_run="backoff-cancel-wf", compact=False)
+    assert usage_sum["overview"]["runs"] == 1
+    assert usage_sum["overview"]["attempts"] == 2
+    codex_bucket = usage_sum["by_backend"]["codex"]
+    assert codex_bucket["runs"] == 1
+    assert codex_bucket["attempts"] == 2
+    assert codex_bucket["cancelled"] == 1
+    assert codex_bucket["failed"] == 0
+    assert codex_bucket["partial_total_tokens"] == 50
+    assert codex_bucket["duration_seconds"] >= 1.1
+    assert len(usage_sum["recent"]) == 2
+    for entry in usage_sum["recent"]:
+        assert entry["job_id"] == job.job_id
+        assert "#attempt-" not in entry["job_id"]
+        assert mgr.get(entry["job_id"]).job_id == job.job_id
     await mgr.shutdown()
