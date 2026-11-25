@@ -24,9 +24,10 @@ subscription quota pools over two local CLIs:
    effort (seamlessly rides newer versions / falls back if retired). Override per call with `effort`
    (`low` | `medium` | `high` | `xhigh`). Great for focused code reviews, targeted edits, test
    generation, and isolated pre-assigned Git worktree edits (`mode="edit"`, `worktree=True`).
-2. `neon` / `agy` Gemini Models (`agy_gemini` pool) — versionless shortcuts (`neon-medium`,
-   `neon-high`, `neon-xhigh`, `hydrogen`, `flash`) auto-upgrade while preserving effort tier.
-   Great for architecture reviews, second opinions, and large-context codebase analysis.
+2. `neon` / `agy` Gemini Models (`agy_gemini` pool) — versionless shortcuts auto-upgrade while
+   preserving effort tier. Use **Hydrogen** (`hydrogen-medium` / `hydrogen-high`) for codebase
+   exploration and research, and **Neon** (`neon-medium` / `neon-high`) for builds, architecture,
+   and reviews based on task complexity (`flash` for quick lightweight checks).
 3. `agy-claude` / `agy-opus` / `agy-gpt` (`agy_claude_gpt` pool inside `agy`) — SEPARATE 5h +
    weekly quota pool from both Gemini Models and your Claude Code subscription! Use
    `backend="agy-claude"` (Sonnet), `backend="agy-opus"` (Opus), or `backend="agy-gpt"` (GPT-OSS),

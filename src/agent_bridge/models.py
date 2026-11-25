@@ -75,6 +75,7 @@ class RunResult:
     provider_state: ProviderState | None = None
     retry_guidance: str | None = None
     stderr_tail: str | None = None
+    provider_invoked: bool = False
 
 
 @dataclass(slots=True)
@@ -115,6 +116,7 @@ class JobRecord:
     error: str | None = None
     stderr_tail: str | None = None
     last_activity: str | None = None
+    provider_invoked: bool = False
 
     @property
     def is_terminal(self) -> bool:

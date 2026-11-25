@@ -19,127 +19,133 @@ logger = logging.getLogger("agent_bridge.storage")
 
 UsagePeriod = Literal["session", "today", "7d", "30d", "all"]
 
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS owners (
-    owner_id TEXT PRIMARY KEY,
-    pid INTEGER NOT NULL,
-    started_at REAL NOT NULL,
-    last_heartbeat REAL NOT NULL,
-    exited_at REAL
-);
-
-CREATE TABLE IF NOT EXISTS jobs (
-    job_id TEXT PRIMARY KEY,
-    owner_id TEXT NOT NULL,
-    backend TEXT NOT NULL,
-    quota_pool TEXT,
-    cwd TEXT NOT NULL,
-    effective_cwd TEXT,
-    mode TEXT NOT NULL,
-    requested_model TEXT,
-    model TEXT,
-    effort TEXT,
-    model_notice TEXT,
-    prompt_preview TEXT NOT NULL,
-    label TEXT,
-    parent_run TEXT,
-    worktree INTEGER NOT NULL DEFAULT 0,
-    worktree_path TEXT,
-    worktree_branch TEXT,
-    worktree_commit TEXT,
-    requested_session_id TEXT,
-    session_id TEXT,
-    status TEXT NOT NULL,
-    failure_reason TEXT,
-    provider_state TEXT,
-    retry_guidance TEXT,
-    created_at REAL NOT NULL,
-    started_at REAL,
-    finished_at REAL,
-    duration_seconds REAL,
-    response TEXT NOT NULL DEFAULT '',
-    usage_json TEXT,
-    provider_metrics_json TEXT,
-    usage_status TEXT NOT NULL DEFAULT 'missing',
-    exit_code INTEGER,
-    error TEXT,
-    stderr_tail TEXT,
-    last_activity TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(backend, session_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_cwd ON jobs(cwd);
-CREATE INDEX IF NOT EXISTS idx_jobs_parent_run ON jobs(parent_run);
-
-CREATE TABLE IF NOT EXISTS session_claims (
-    backend TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    job_id TEXT NOT NULL,
-    owner_id TEXT NOT NULL,
-    claimed_at REAL NOT NULL,
-    PRIMARY KEY (backend, session_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_claims_job ON session_claims(job_id);
-CREATE INDEX IF NOT EXISTS idx_session_claims_owner ON session_claims(owner_id);
-
-CREATE TABLE IF NOT EXISTS usage_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id TEXT UNIQUE NOT NULL,
-    owner_id TEXT NOT NULL,
-    ts REAL NOT NULL,
-    iso_time TEXT NOT NULL,
-    backend TEXT NOT NULL,
-    quota_pool TEXT,
-    model TEXT,
-    effort TEXT,
-    mode TEXT NOT NULL,
-    status TEXT NOT NULL,
-    duration_seconds REAL NOT NULL,
-    cwd TEXT NOT NULL,
-    parent_run TEXT,
-    label TEXT,
-    session_id TEXT,
-    usage_status TEXT NOT NULL,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cached_tokens INTEGER,
-    cache_write_tokens INTEGER,
-    reasoning_tokens INTEGER,
-    total_tokens INTEGER,
-    provider_metrics_json TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts DESC);
-CREATE INDEX IF NOT EXISTS idx_usage_owner ON usage_events(owner_id);
-CREATE INDEX IF NOT EXISTS idx_usage_backend ON usage_events(backend);
-CREATE INDEX IF NOT EXISTS idx_usage_cwd ON usage_events(cwd);
-CREATE INDEX IF NOT EXISTS idx_usage_parent_run ON usage_events(parent_run);
-
-CREATE TABLE IF NOT EXISTS session_usage_watermarks (
-    backend TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    cumulative_json TEXT NOT NULL,
-    num_turns INTEGER NOT NULL DEFAULT 0,
-    last_job_id TEXT,
-    updated_at REAL NOT NULL,
-    PRIMARY KEY (backend, session_id)
-);
-
-CREATE TABLE IF NOT EXISTS quota_cache (
-    backend TEXT PRIMARY KEY,
-    fetched_at REAL NOT NULL,
-    payload_json TEXT NOT NULL
-);
-"""
+_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS owners (
+        owner_id TEXT PRIMARY KEY,
+        pid INTEGER NOT NULL,
+        started_at REAL NOT NULL,
+        last_heartbeat REAL NOT NULL,
+        exited_at REAL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        job_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        quota_pool TEXT,
+        cwd TEXT NOT NULL,
+        effective_cwd TEXT,
+        mode TEXT NOT NULL,
+        requested_model TEXT,
+        model TEXT,
+        effort TEXT,
+        model_notice TEXT,
+        prompt_preview TEXT NOT NULL,
+        label TEXT,
+        parent_run TEXT,
+        worktree INTEGER NOT NULL DEFAULT 0,
+        worktree_path TEXT,
+        worktree_branch TEXT,
+        worktree_commit TEXT,
+        requested_session_id TEXT,
+        session_id TEXT,
+        status TEXT NOT NULL,
+        failure_reason TEXT,
+        provider_state TEXT,
+        retry_guidance TEXT,
+        created_at REAL NOT NULL,
+        started_at REAL,
+        finished_at REAL,
+        duration_seconds REAL,
+        response TEXT NOT NULL DEFAULT '',
+        usage_json TEXT,
+        provider_metrics_json TEXT,
+        usage_status TEXT NOT NULL DEFAULT 'missing',
+        exit_code INTEGER,
+        error TEXT,
+        stderr_tail TEXT,
+        last_activity TEXT,
+        provider_invoked INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(backend, session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner_id)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_cwd ON jobs(cwd)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_parent_run ON jobs(parent_run)",
+    """
+    CREATE TABLE IF NOT EXISTS session_claims (
+        backend TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        claimed_at REAL NOT NULL,
+        PRIMARY KEY (backend, session_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_session_claims_job ON session_claims(job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_session_claims_owner ON session_claims(owner_id)",
+    """
+    CREATE TABLE IF NOT EXISTS usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT UNIQUE NOT NULL,
+        owner_id TEXT NOT NULL,
+        ts REAL NOT NULL,
+        iso_time TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        quota_pool TEXT,
+        model TEXT,
+        effort TEXT,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        duration_seconds REAL NOT NULL,
+        cwd TEXT NOT NULL,
+        parent_run TEXT,
+        label TEXT,
+        session_id TEXT,
+        usage_status TEXT NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cached_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        reasoning_tokens INTEGER,
+        total_tokens INTEGER,
+        provider_metrics_json TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_owner ON usage_events(owner_id)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_backend ON usage_events(backend)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_cwd ON usage_events(cwd)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_parent_run ON usage_events(parent_run)",
+    """
+    CREATE TABLE IF NOT EXISTS session_usage_watermarks (
+        backend TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        cumulative_json TEXT NOT NULL,
+        num_turns INTEGER NOT NULL DEFAULT 0,
+        last_job_id TEXT,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (backend, session_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS quota_cache (
+        backend TEXT PRIMARY KEY,
+        fetched_at REAL NOT NULL,
+        payload_json TEXT NOT NULL
+    )
+    """,
+)
 
 
 def _period_cutoff_ts(period: UsagePeriod) -> float | None:
@@ -219,6 +225,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         error=row["error"],
         stderr_tail=row["stderr_tail"],
         last_activity=row["last_activity"],
+        provider_invoked=bool(row["provider_invoked"]) if "provider_invoked" in keys else (row["started_at"] is not None),
     )
 
 
@@ -341,30 +348,46 @@ class BridgeStore:
             isolation_level=None,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
+        for attempt in range(6):
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() and attempt < 5:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                raise
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_db(self) -> None:
-        conn = self._connect()
-        try:
-            conn.executescript(_SCHEMA_SQL)
-            # Lightweight idempotent column migrations for existing databases.
+        # Execute ALL DDL checks, column migrations, and backfills inside ONE atomic BEGIN IMMEDIATE
+        # transaction so concurrent windows upgrading an older DB never race on ALTER TABLE or partial backfill.
+        with self._tx(write=True) as cur:
+            for stmt in _SCHEMA_STATEMENTS:
+                cur.execute(stmt)
+
             wm_cols = {
                 str(r["name"])
-                for r in conn.execute("PRAGMA table_info(session_usage_watermarks)").fetchall()
+                for r in cur.execute("PRAGMA table_info(session_usage_watermarks)").fetchall()
             }
             if "last_job_id" not in wm_cols:
-                conn.execute("ALTER TABLE session_usage_watermarks ADD COLUMN last_job_id TEXT")
+                cur.execute("ALTER TABLE session_usage_watermarks ADD COLUMN last_job_id TEXT")
 
             job_cols = {
                 str(r["name"])
-                for r in conn.execute("PRAGMA table_info(jobs)").fetchall()
+                for r in cur.execute("PRAGMA table_info(jobs)").fetchall()
             }
             if "quota_pool" not in job_cols:
-                conn.execute("ALTER TABLE jobs ADD COLUMN quota_pool TEXT")
-                conn.execute(
+                cur.execute("ALTER TABLE jobs ADD COLUMN quota_pool TEXT")
+            if "provider_invoked" not in job_cols:
+                cur.execute("ALTER TABLE jobs ADD COLUMN provider_invoked INTEGER NOT NULL DEFAULT 0")
+                cur.execute("UPDATE jobs SET provider_invoked = 1 WHERE started_at IS NOT NULL")
+
+            # Always backfill any NULL quota_pool rows atomically (recovers interrupted prior migrations too).
+            if cur.execute("SELECT 1 FROM jobs WHERE quota_pool IS NULL LIMIT 1").fetchone() is not None:
+                cur.execute(
                     """
                     UPDATE jobs SET quota_pool = CASE
                         WHEN backend = 'codex' THEN 'codex'
@@ -372,21 +395,25 @@ class BridgeStore:
                           OR LOWER(COALESCE(model, requested_model, '')) LIKE '%gpt%'
                           OR LOWER(COALESCE(model, requested_model, '')) LIKE '%opus%'
                           OR LOWER(COALESCE(model, requested_model, '')) LIKE '%sonnet%'
+                          OR LOWER(COALESCE(model, requested_model, '')) LIKE '%haiku%'
+                          OR LOWER(COALESCE(model, requested_model, '')) LIKE '%oss%'
                         THEN 'agy_claude_gpt'
                         ELSE 'agy_gemini'
                     END
                     WHERE quota_pool IS NULL
                     """
                 )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_quota_pool ON jobs(quota_pool)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_quota_pool ON jobs(quota_pool)")
 
             usage_cols = {
                 str(r["name"])
-                for r in conn.execute("PRAGMA table_info(usage_events)").fetchall()
+                for r in cur.execute("PRAGMA table_info(usage_events)").fetchall()
             }
             if "quota_pool" not in usage_cols:
-                conn.execute("ALTER TABLE usage_events ADD COLUMN quota_pool TEXT")
-                conn.execute(
+                cur.execute("ALTER TABLE usage_events ADD COLUMN quota_pool TEXT")
+
+            if cur.execute("SELECT 1 FROM usage_events WHERE quota_pool IS NULL LIMIT 1").fetchone() is not None:
+                cur.execute(
                     """
                     UPDATE usage_events SET quota_pool = CASE
                         WHEN backend = 'codex' THEN 'codex'
@@ -394,15 +421,15 @@ class BridgeStore:
                           OR LOWER(COALESCE(model, '')) LIKE '%gpt%'
                           OR LOWER(COALESCE(model, '')) LIKE '%opus%'
                           OR LOWER(COALESCE(model, '')) LIKE '%sonnet%'
+                          OR LOWER(COALESCE(model, '')) LIKE '%haiku%'
+                          OR LOWER(COALESCE(model, '')) LIKE '%oss%'
                         THEN 'agy_claude_gpt'
                         ELSE 'agy_gemini'
                     END
                     WHERE quota_pool IS NULL
                     """
                 )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_quota_pool ON usage_events(quota_pool)")
-        finally:
-            conn.close()
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_quota_pool ON usage_events(quota_pool)")
 
         self._import_legacy_files_if_needed()
 
@@ -497,10 +524,10 @@ class BridgeStore:
                     failure_reason, provider_state, retry_guidance, created_at,
                     started_at, finished_at, duration_seconds, response, usage_json,
                     provider_metrics_json, usage_status, exit_code, error, stderr_tail,
-                    last_activity
+                    last_activity, provider_invoked
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -540,6 +567,7 @@ class BridgeStore:
                     error,
                     entry.get("stderr_tail"),
                     entry.get("last_activity") or status,
+                    1 if (entry.get("started_at") is not None or status == "completed") else 0,
                 ),
             )
             if cur.rowcount > 0:
@@ -581,8 +609,19 @@ class BridgeStore:
                 v = usage.get(key)
                 return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
-            if not usage:
+            has_numeric_usage = any(
+                _opt_int(k) is not None
+                for k in ("input_tokens", "output_tokens", "total_tokens")
+            )
+            explicit_ustatus = entry.get("usage_status")
+            if isinstance(explicit_ustatus, str) and explicit_ustatus in {"exact", "delta", "partial", "missing"}:
+                usage_status = explicit_ustatus
+            elif not has_numeric_usage:
                 usage_status = "missing"
+            elif backend == "neon":
+                # Legacy v1 `usage.jsonl` lacked resume metadata and stored cumulative Antigravity blobs on
+                # resumed turns; mark ambiguous legacy Neon totals as `partial` so they never inflate totals.
+                usage_status = "partial"
             elif status == "completed":
                 usage_status = "exact"
             else:
@@ -886,36 +925,47 @@ class BridgeStore:
         resume_from_job_id: str | None = None,
         exclude_job_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Return the latest committed working directory & worktree metadata for `(backend, session_id)`."""
+        """Return the latest committed working directory & worktree metadata from a job that actually executed."""
         with self._tx(write=False) as cur:
             if exclude_job_id:
-                row = cur.execute(
+                rows = cur.execute(
                     """
                     SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit
                     FROM jobs
                     WHERE backend = ? AND session_id = ?
+                      AND provider_invoked = 1
                       AND status IN ('completed', 'failed', 'cancelled', 'timed_out')
                       AND job_id != ?
                     ORDER BY COALESCE(finished_at, created_at) DESC
-                    LIMIT 1
+                    LIMIT 10
                     """,
                     (backend, session_id, exclude_job_id),
-                ).fetchone()
+                ).fetchall()
             else:
-                row = cur.execute(
+                rows = cur.execute(
                     """
                     SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit
                     FROM jobs
                     WHERE backend = ? AND session_id = ?
+                      AND provider_invoked = 1
                       AND status IN ('completed', 'failed', 'cancelled', 'timed_out')
                     ORDER BY COALESCE(finished_at, created_at) DESC
-                    LIMIT 1
+                    LIMIT 10
                     """,
                     (backend, session_id),
-                ).fetchone()
+                ).fetchall()
 
-            if row is None and resume_from_job_id:
-                row = cur.execute(
+            chosen: sqlite3.Row | None = None
+            for cand in rows:
+                eff = cand["effective_cwd"] or cand["cwd"]
+                if eff and Path(eff).is_dir():
+                    chosen = cand
+                    break
+            if chosen is None and rows:
+                chosen = rows[0]
+
+            if chosen is None and resume_from_job_id:
+                chosen = cur.execute(
                     """
                     SELECT cwd, effective_cwd, worktree_path, worktree_branch, worktree_commit
                     FROM jobs
@@ -924,14 +974,14 @@ class BridgeStore:
                     (resume_from_job_id,),
                 ).fetchone()
 
-            if row is None:
+            if chosen is None:
                 return None
             return {
-                "cwd": row["cwd"],
-                "effective_cwd": row["effective_cwd"] or row["cwd"],
-                "worktree_path": row["worktree_path"],
-                "worktree_branch": row["worktree_branch"],
-                "worktree_commit": row["worktree_commit"],
+                "cwd": chosen["cwd"],
+                "effective_cwd": chosen["effective_cwd"] or chosen["cwd"],
+                "worktree_path": chosen["worktree_path"],
+                "worktree_branch": chosen["worktree_branch"],
+                "worktree_commit": chosen["worktree_commit"],
             }
 
     # --- Per-job CRUD ---
@@ -953,10 +1003,10 @@ class BridgeStore:
                     failure_reason, provider_state, retry_guidance, created_at,
                     started_at, finished_at, duration_seconds, response, usage_json,
                     provider_metrics_json, usage_status, exit_code, error, stderr_tail,
-                    last_activity
+                    last_activity, provider_invoked
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -998,6 +1048,7 @@ class BridgeStore:
                     record.error,
                     record.stderr_tail,
                     record.last_activity,
+                    1 if record.provider_invoked else 0,
                 ),
             )
             cur.execute(
@@ -1021,6 +1072,7 @@ class BridgeStore:
         worktree_branch: str | None = None,
         worktree_commit: str | None = None,
         last_activity: str | None = None,
+        provider_invoked: bool | None = None,
     ) -> None:
         sets: list[str] = []
         vals: list[Any] = []
@@ -1054,6 +1106,9 @@ class BridgeStore:
         if last_activity is not None:
             sets.append("last_activity = ?")
             vals.append(last_activity)
+        if provider_invoked is not None:
+            sets.append("provider_invoked = ?")
+            vals.append(1 if provider_invoked else 0)
         if not sets:
             return
         vals.append(job_id)
@@ -1109,6 +1164,7 @@ class BridgeStore:
         *,
         watermark_cumulative: dict[str, Any] | None = None,
         watermark_turns: int | None = None,
+        touched_provider: bool | None = None,
     ) -> None:
         """Atomically persist terminal status, usage event, session claim release, and watermark update/invalidation."""
         now = time.time()
@@ -1117,6 +1173,12 @@ class BridgeStore:
             record.model or record.requested_model,
         )
         record.quota_pool = pool
+        invoked = (
+            bool(touched_provider)
+            if touched_provider is not None
+            else (record.provider_invoked or record.started_at is not None)
+        )
+        record.provider_invoked = invoked
         with self._tx(write=True) as cur:
             cur.execute(
                 """
@@ -1126,7 +1188,8 @@ class BridgeStore:
                     session_id = ?, status = ?, failure_reason = ?, provider_state = ?,
                     retry_guidance = ?, started_at = ?, finished_at = ?, duration_seconds = ?,
                     response = ?, usage_json = ?, provider_metrics_json = ?, usage_status = ?,
-                    exit_code = ?, error = ?, stderr_tail = ?, last_activity = ?
+                    exit_code = ?, error = ?, stderr_tail = ?, last_activity = ?,
+                    provider_invoked = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -1156,15 +1219,16 @@ class BridgeStore:
                     record.error,
                     record.stderr_tail,
                     record.last_activity,
+                    1 if invoked else 0,
                     record.job_id,
                 ),
             )
             _insert_usage_event_cur(cur, record)
 
-            # Watermark hygiene for Neon sessions: update ONLY on a clean completed turn with
-            # both cumulative usage and an integer turn count; otherwise INVALIDATE so a future
-            # turn can never compute a bogus delta across a missing envelope or interrupted turn!
-            if record.backend == "neon" and record.session_id:
+            # Watermark hygiene for Neon sessions: ONLY touch the checkpoint if the provider was actually
+            # invoked! Pre-launch cancellations/timeouts never executed on the session and must preserve
+            # the prior turn's valid checkpoint.
+            if invoked and record.backend == "neon" and record.session_id:
                 if (
                     record.status == "completed"
                     and watermark_cumulative is not None

@@ -8,6 +8,7 @@ from pathlib import Path
 from agent_bridge.models import JobRecord
 from agent_bridge.quota import (
     build_quota_advisory,
+    has_passed_reset,
     parse_codex_rate_limits,
     parse_neon_usage_envelope,
 )
@@ -474,3 +475,272 @@ def test_sqlite_usage_tracks_agy_claude_gpt_pool_separately(tmp_path: Path) -> N
     only_3p = store.summarize_usage(period="today", owner_id="o1", quota_pool="agy_claude_gpt", compact=True)
     assert only_3p["overview"]["runs"] == 1
     assert list(only_3p["by_quota_pool"].keys()) == ["agy_claude_gpt"]
+
+
+def test_concurrent_sqlite_schema_upgrade_no_duplicate_column_and_backfills_null_pools(
+    tmp_path: Path,
+) -> None:
+    """Audit High #2: concurrent windows upgrading an older DB never race on ALTER TABLE,
+    and interrupted/NULL quota_pool rows are backfilled atomically."""
+    import sqlite3
+    import threading
+
+    state_dir = tmp_path / "upgrade_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "bridge.db"
+
+    # Create a legacy v2 database missing `quota_pool`, `provider_invoked`, and `last_job_id`.
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE owners (
+            owner_id TEXT PRIMARY KEY,
+            pid INTEGER NOT NULL,
+            started_at REAL NOT NULL,
+            last_heartbeat REAL NOT NULL,
+            exited_at REAL
+        );
+        CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            effective_cwd TEXT,
+            mode TEXT NOT NULL,
+            requested_model TEXT,
+            model TEXT,
+            effort TEXT,
+            model_notice TEXT,
+            prompt_preview TEXT NOT NULL,
+            label TEXT,
+            parent_run TEXT,
+            worktree INTEGER NOT NULL DEFAULT 0,
+            worktree_path TEXT,
+            worktree_branch TEXT,
+            worktree_commit TEXT,
+            requested_session_id TEXT,
+            session_id TEXT,
+            status TEXT NOT NULL,
+            failure_reason TEXT,
+            provider_state TEXT,
+            retry_guidance TEXT,
+            created_at REAL NOT NULL,
+            started_at REAL,
+            finished_at REAL,
+            duration_seconds REAL,
+            response TEXT NOT NULL DEFAULT '',
+            usage_json TEXT,
+            provider_metrics_json TEXT,
+            usage_status TEXT NOT NULL DEFAULT 'missing',
+            exit_code INTEGER,
+            error TEXT,
+            stderr_tail TEXT,
+            last_activity TEXT
+        );
+        CREATE TABLE usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT UNIQUE NOT NULL,
+            owner_id TEXT NOT NULL,
+            ts REAL NOT NULL,
+            iso_time TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            model TEXT,
+            effort TEXT,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            duration_seconds REAL NOT NULL,
+            cwd TEXT NOT NULL,
+            parent_run TEXT,
+            label TEXT,
+            session_id TEXT,
+            usage_status TEXT NOT NULL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cached_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER,
+            total_tokens INTEGER,
+            provider_metrics_json TEXT
+        );
+        CREATE TABLE session_usage_watermarks (
+            backend TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cumulative_json TEXT NOT NULL,
+            num_turns INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (backend, session_id)
+        );
+        INSERT INTO jobs (job_id, owner_id, backend, cwd, mode, model, prompt_preview, status, created_at, started_at)
+        VALUES
+            ('neon-old-3p', 'o0', 'neon', '/repo', 'read_only', 'claude-sonnet-5-5-high', 'hi', 'completed', 100.0, 101.0),
+            ('neon-old-gem', 'o0', 'neon', '/repo', 'read_only', 'gemini-4-neon-high', 'hi', 'completed', 100.0, 101.0),
+            ('codex-old-1', 'o0', 'codex', '/repo', 'read_only', 'gpt-6.2-sol', 'hi', 'completed', 100.0, 101.0);
+        INSERT INTO usage_events (job_id, owner_id, ts, iso_time, backend, model, mode, status, duration_seconds, cwd, usage_status, total_tokens)
+        VALUES
+            ('neon-old-3p', 'o0', 102.0, '2026-11-25T10:00:00Z', 'neon', 'claude-sonnet-5-5-high', 'read_only', 'completed', 1.0, '/repo', 'exact', 500),
+            ('neon-old-gem', 'o0', 102.0, '2026-11-25T10:00:00Z', 'neon', 'gemini-4-neon-high', 'read_only', 'completed', 1.0, '/repo', 'exact', 300),
+            ('codex-old-1', 'o0', 102.0, '2026-11-25T10:00:00Z', 'codex', 'gpt-6.2-sol', 'read_only', 'completed', 1.0, '/repo', 'exact', 200);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # Open 8 BridgeStores simultaneously across threads to stress the migration transaction.
+    barrier = threading.Barrier(8)
+    errors: list[BaseException] = []
+
+    def _opener() -> None:
+        try:
+            barrier.wait()
+            BridgeStore(state_dir)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_opener) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"Concurrent migration failed: {errors}"
+
+    store = BridgeStore(state_dir)
+    assert store.get_job("neon-old-3p").quota_pool == "agy_claude_gpt"  # type: ignore[union-attr]
+    assert store.get_job("neon-old-gem").quota_pool == "agy_gemini"  # type: ignore[union-attr]
+    assert store.get_job("codex-old-1").quota_pool == "codex"  # type: ignore[union-attr]
+    assert store.get_job("neon-old-3p").provider_invoked is True  # type: ignore[union-attr]
+
+    summary = store.summarize_usage(period="all", owner_id="o1", compact=True)
+    assert summary["by_quota_pool"]["agy_claude_gpt"]["tokens"]["total_tokens"] == 500
+    assert summary["by_quota_pool"]["agy_gemini"]["tokens"]["total_tokens"] == 300
+    assert summary["by_quota_pool"]["codex"]["tokens"]["total_tokens"] == 200
+
+    # Also simulate an interrupted partial backfill (column exists, NULL row left behind) -> re-open heals it!
+    conn2 = sqlite3.connect(str(db_path))
+    conn2.execute("UPDATE usage_events SET quota_pool = NULL WHERE job_id = 'neon-old-3p'")
+    conn2.commit()
+    conn2.close()
+
+    healed = BridgeStore(state_dir)
+    healed_summary = healed.summarize_usage(period="all", owner_id="o1", compact=True)
+    assert healed_summary["by_quota_pool"]["agy_claude_gpt"]["tokens"]["total_tokens"] == 500
+
+
+def test_legacy_usage_jsonl_marks_ambiguous_neon_totals_as_partial(tmp_path: Path) -> None:
+    """Audit Medium #4: legacy usage.jsonl Neon entries without usage_status are marked partial."""
+    import json
+
+    state_dir = tmp_path / "legacy_neon"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "usage.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "ts": time.time() - 50,
+                        "job_id": "neon-leg-resumed",
+                        "backend": "neon",
+                        "model": "gemini-4-neon-high",
+                        "mode": "read_only",
+                        "status": "completed",
+                        "duration_seconds": 5.0,
+                        "cwd": str(tmp_path),
+                        "usage": {"input_tokens": 14000, "output_tokens": 80, "total_tokens": 14080},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "ts": time.time() - 40,
+                        "job_id": "codex-leg-1",
+                        "backend": "codex",
+                        "model": "gpt-6.2-sol",
+                        "mode": "read_only",
+                        "status": "completed",
+                        "duration_seconds": 2.0,
+                        "cwd": str(tmp_path),
+                        "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    store = BridgeStore(state_dir)
+    summary = store.summarize_usage(period="all", owner_id="new-win", compact=True)
+    assert summary["by_backend"]["neon"]["usage_coverage"]["partial"] == 1
+    assert summary["by_backend"]["neon"]["usage_coverage"]["exact"] == 0
+    assert summary["by_backend"]["neon"]["tokens"]["total_tokens"] == 0
+    assert summary["by_backend"]["codex"]["usage_coverage"]["exact"] == 1
+    assert summary["by_backend"]["codex"]["tokens"]["total_tokens"] == 120
+
+
+def test_quota_advisory_handles_passed_reset_and_all_exhausted_honestly() -> None:
+    """Audit Medium #5: passed resets are marked stale (never use_before_reset), and all-exhausted
+    advisory never claims a 'Best available pool'."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 11, 28, 12, 0, 0, tzinfo=timezone.utc)
+    passed_weekly_ts = int((now - timedelta(minutes=15)).timestamp())
+    future_5h_ts = int((now + timedelta(hours=2)).timestamp())
+
+    # 1. Stale passed weekly reset with 50% remaining MUST NOT trigger use_before_reset!
+    codex_stale = parse_codex_rate_limits(
+        {
+            "ordinaryUsageAllowed": True,
+            "rateLimits": {
+                "planType": "plus",
+                "primary": {"usedPercent": 20, "windowDurationMins": 300, "resetsAt": future_5h_ts},
+                "secondary": {"usedPercent": 50, "windowDurationMins": 10080, "resetsAt": passed_weekly_ts},
+            },
+        },
+        now_utc=now,
+    )
+    assert has_passed_reset(codex_stale, now_utc=now) is True
+    adv_stale = build_quota_advisory({"codex": codex_stale}, now_utc=now)
+    assert adv_stale["expiring_weekly_alerts"] == []
+    assert adv_stale["recommended_order"] == []
+    assert adv_stale["pools"][0]["priority"] == "stale"
+    assert adv_stale["pools"][0]["weekly"]["signal"] == "stale_reset"
+    assert "Best available pool" not in adv_stale["summary"]
+    assert "stale" in adv_stale["summary"].lower() or "passed reset" in adv_stale["summary"].lower()
+
+    # 2. All pools exhausted -> recommended_order is empty and summary must NOT claim a best pool!
+    future_weekly_iso = (now + timedelta(days=2)).isoformat().replace("+00:00", "Z")
+    future_5h_iso = (now + timedelta(hours=1, minutes=30)).isoformat().replace("+00:00", "Z")
+    codex_ex = parse_codex_rate_limits(
+        {
+            "ordinaryUsageAllowed": False,
+            "rateLimits": {
+                "planType": "plus",
+                "primary": {"usedPercent": 100, "windowDurationMins": 300, "resetsAt": future_5h_ts},
+                "secondary": {"usedPercent": 100, "windowDurationMins": 10080, "resetsAt": int((now + timedelta(days=3)).timestamp())},
+            },
+        },
+        now_utc=now,
+    )
+    neon_ex = parse_neon_usage_envelope(
+        {
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.0, "reset_time": future_weekly_iso},
+                                {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0.0, "reset_time": future_5h_iso},
+                            ],
+                        }
+                    ]
+                },
+            }
+        },
+        now_utc=now,
+    )
+    adv_ex = build_quota_advisory({"codex": codex_ex, "neon": neon_ex}, now_utc=now)
+    assert adv_ex["recommended_order"] == []
+    assert all(p["priority"] == "avoid" for p in adv_ex["pools"])
+    assert "Best available pool" not in adv_ex["summary"]
+    assert "exhausted" in adv_ex["summary"].lower()

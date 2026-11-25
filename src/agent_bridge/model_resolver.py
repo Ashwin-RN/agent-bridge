@@ -492,6 +492,8 @@ class NeonModelCatalog:
             "neon-low",
             "hydrogen",
             "hydrogen-xhigh",
+            "hydrogen-high",
+            "hydrogen-medium",
             "carbon",
             "argon",
             "flash",

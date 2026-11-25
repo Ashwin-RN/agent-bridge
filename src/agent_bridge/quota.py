@@ -151,7 +151,18 @@ def _enrich_window(
             enriched["signal"] = "exhausted" if (rem_pct is not None and rem_pct <= 2.0) else "on_track"
         return enriched
 
-    resets_in_sec = max(0, int((reset_dt - now_utc).total_seconds()))
+    delta_sec = int((reset_dt - now_utc).total_seconds())
+    if delta_sec <= 0:
+        enriched["stale_reset"] = True
+        enriched["resets_in_seconds"] = 0
+        enriched["resets_in"] = "reset passed (stale — refresh quota)"
+        if dur_sec and dur_sec > 0:
+            enriched["time_remaining_percent"] = 0.0
+        enriched["signal"] = "stale_reset"
+        return enriched
+
+    enriched["stale_reset"] = False
+    resets_in_sec = delta_sec
     enriched["resets_in_seconds"] = resets_in_sec
     enriched["resets_in"] = _format_duration_human(resets_in_sec)
 
@@ -184,6 +195,29 @@ def _enrich_window(
             signal = "burning_fast"
     enriched["signal"] = signal
     return enriched
+
+
+def has_passed_reset(
+    reading: dict[str, Any] | None,
+    *,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Return True if any window in a quota reading has a `reset_time` that has already passed."""
+    if not isinstance(reading, dict) or reading.get("status") != "ok":
+        return False
+    now = now_utc or datetime.now(timezone.utc)
+    windows: list[dict[str, Any]] = []
+    if isinstance(reading.get("windows"), list):
+        windows.extend(w for w in reading["windows"] if isinstance(w, dict))
+    if isinstance(reading.get("groups"), list):
+        for g in reading["groups"]:
+            if isinstance(g, dict) and isinstance(g.get("windows"), list):
+                windows.extend(w for w in g["windows"] if isinstance(w, dict))
+    for w in windows:
+        reset_dt = _parse_iso_utc(w.get("reset_time"))
+        if reset_dt is not None and (reset_dt - now).total_seconds() <= 0:
+            return True
+    return False
 
 
 def enrich_quota_reading(
@@ -260,9 +294,14 @@ def build_quota_advisory(
                 c["time_remaining_percent"] = w["time_remaining_percent"]
             return c
 
-        # Record all active resets so parent AI can inspect exact reset times of all involved models.
+        # Record only FUTURE active resets so parent AI can inspect upcoming reset schedules accurately.
         for w in windows:
-            if w.get("reset_time") and w.get("resets_in_seconds") is not None:
+            if (
+                w.get("reset_time")
+                and not w.get("stale_reset")
+                and isinstance(w.get("resets_in_seconds"), int)
+                and int(w["resets_in_seconds"]) > 0
+            ):
                 upcoming_resets.append(
                     {
                         "pool": pool,
@@ -281,9 +320,16 @@ def build_quota_advisory(
         wk_sig = win_weekly.get("signal") if win_weekly else None
         w5_rem = _as_number(win_5h.get("remaining_percent")) if win_5h else None
         wk_rem = _as_number(win_weekly.get("remaining_percent")) if win_weekly else None
+        has_stale = any(bool(w.get("stale_reset")) for w in windows)
 
         # Determine routing priority & human recommendation.
-        if rate_limit_reached or w5_sig == "exhausted" or wk_sig == "exhausted":
+        if has_stale:
+            priority = "stale"
+            rec = (
+                f"Quota reading for {label} is stale (a reset timestamp has already passed). "
+                "Re-run get_usage(include_quota=True, refresh_quota=True) for fresh post-reset capacity."
+            )
+        elif rate_limit_reached or w5_sig == "exhausted" or wk_sig == "exhausted":
             priority = "avoid"
             blocked_win = win_weekly if wk_sig == "exhausted" else win_5h
             reset_note = (
@@ -337,19 +383,20 @@ def build_quota_advisory(
                 f"resets in {win_weekly.get('resets_in') if win_weekly else 'unknown'})."
             )
 
-        pools_info.append(
-            {
-                "pool": pool,
-                "backend": backend,
-                "label": label,
-                "models": models[:8],
-                "effective_remaining_percent": eff_rem,
-                "five_hour": _compact_win(win_5h),
-                "weekly": _compact_win(win_weekly),
-                "priority": priority,
-                "recommendation": rec,
-            }
-        )
+        pool_entry: dict[str, Any] = {
+            "pool": pool,
+            "backend": backend,
+            "label": label,
+            "models": models[:8],
+            "effective_remaining_percent": eff_rem,
+            "five_hour": _compact_win(win_5h),
+            "weekly": _compact_win(win_weekly),
+            "priority": priority,
+            "recommendation": rec,
+        }
+        if has_stale:
+            pool_entry["stale"] = True
+        pools_info.append(pool_entry)
 
     # Codex pool
     codex_q = quota_by_backend.get("codex")
@@ -391,37 +438,49 @@ def build_quota_advisory(
         "high": 1,
         "normal": 2,
         "conserve": 3,
-        "avoid": 4,
+        "stale": 4,
+        "avoid": 5,
     }
 
     def _pool_sort_key(p: dict[str, Any]) -> tuple[int, float, float]:
         pr = priority_rank.get(str(p.get("priority")), 3)
         wk = p.get("weekly") or {}
         wk_secs = wk.get("resets_in_seconds")
-        # Among equally prioritized pools: for `use_before_reset`, soonest reset first;
-        # for others, higher remaining % first, then sooner weekly reset!
         eff = float(p.get("effective_remaining_percent") or 0.0)
         if pr == 0:
             return (pr, float(wk_secs if wk_secs is not None else 10**9), -eff)
         return (pr, -eff, float(wk_secs if wk_secs is not None else 10**9))
 
     pools_sorted = sorted(pools_info, key=_pool_sort_key)
-    recommended_order = [p["pool"] for p in pools_sorted if p.get("priority") != "avoid"]
+    eligible_pools = [p for p in pools_sorted if p.get("priority") not in {"avoid", "stale"}]
+    stale_pools = [p for p in pools_sorted if p.get("priority") == "stale"]
+    recommended_order = [p["pool"] for p in eligible_pools]
     upcoming_resets.sort(key=lambda item: int(item.get("resets_in_seconds") or 10**9))
+
+    next_reset = upcoming_resets[0] if upcoming_resets else None
+    reset_part = (
+        f" Next reset: {next_reset['pool']} {next_reset['window']} in {next_reset['resets_in']}."
+        if next_reset
+        else ""
+    )
 
     if expiring_weekly_alerts:
         summary_text = "WEEKLY RESET PRIORITY: " + " | ".join(expiring_weekly_alerts)
-    elif pools_sorted:
-        top = pools_sorted[0]
-        next_reset = upcoming_resets[0] if upcoming_resets else None
-        reset_part = (
-            f" Next reset: {next_reset['pool']} {next_reset['window']} in {next_reset['resets_in']}."
-            if next_reset
-            else ""
-        )
+    elif eligible_pools:
+        top = eligible_pools[0]
         summary_text = (
             f"Best available pool: {top['pool']} ({top['effective_remaining_percent']}% effective remaining)."
             f"{reset_part}"
+        )
+    elif stale_pools:
+        stale_names = ", ".join(p["pool"] for p in stale_pools)
+        summary_text = (
+            f"No fresh eligible pools ({stale_names} reading(s) passed reset time); "
+            "refresh with get_usage(include_quota=True, refresh_quota=True)."
+        )
+    elif pools_sorted:
+        summary_text = (
+            f"No eligible pools available: all {len(pools_sorted)} pool(s) are exhausted.{reset_part}"
         )
     else:
         summary_text = "No live quota windows available; check individual backend quota errors."

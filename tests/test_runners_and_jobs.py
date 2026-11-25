@@ -1063,3 +1063,295 @@ print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status"
     assert usage["by_quota_pool"]["agy_claude_gpt"]["runs"] == 3
     assert usage["by_quota_pool"]["agy_gemini"]["runs"] == 1
     await mgr.shutdown()
+
+
+async def test_prelaunch_cancel_preserves_session_context_and_agy_checkpoint(tmp_path: Path) -> None:
+    """Audit High #1: cancelling a queued resume before launch MUST NOT overwrite the session's
+    worktree context with the parent checkout and MUST NOT erase a valid Antigravity watermark."""
+    parent_dir = tmp_path / "parent"
+    worktree_dir = tmp_path / "wt_checkout"
+    parent_dir.mkdir()
+    worktree_dir.mkdir()
+
+    # Part A: Codex worktree session context preserved when queued Turn 2 is cancelled before launch.
+    fake_codex = tmp_path / "fake_codex_ctx.py"
+    fake_codex.write_text(
+        """
+import json, os, sys
+from pathlib import Path
+
+_ = sys.stdin.read()
+cwd = str(Path(os.getcwd()).resolve())
+print(json.dumps({"type": "thread.started", "thread_id": "thr-wt-keep"}), flush=True)
+print(json.dumps({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": f"RAN_IN:{cwd}"}}), flush=True)
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    class HoldTurn1CodexRunner(StubCodexRunner):
+        def __init__(self, settings: Settings, script_path: Path) -> None:
+            super().__init__(settings, script_path)
+            self.turn1_started = asyncio.Event()
+            self.release_turn1 = asyncio.Event()
+
+        async def run(self, request, **kwargs):  # type: ignore[override]
+            if request.prompt == "TURN1":
+                if kwargs.get("on_provider_start"):
+                    kwargs["on_provider_start"]()
+                if kwargs.get("on_session"):
+                    kwargs["on_session"]("thr-wt-keep")
+                self.turn1_started.set()
+                await self.release_turn1.wait()
+                from agent_bridge.models import RunResult
+
+                return RunResult(
+                    status="completed",
+                    response="t1 done",
+                    session_id="thr-wt-keep",
+                    effective_cwd=str(worktree_dir.resolve()),
+                    worktree_path=str(worktree_dir.resolve()),
+                    worktree_branch="agent-bridge/t1",
+                    usage_status="missing",
+                    provider_state="stopped",
+                    provider_invoked=True,
+                )
+            return await super().run(request, **kwargs)
+
+    settings = _make_settings(tmp_path, default_cwd=parent_dir)
+    hold_runner = HoldTurn1CodexRunner(settings, fake_codex)
+    mgr = JobManager(settings, codex_runner=hold_runner)
+
+    t1 = mgr.start(mgr.prepare_request(backend="codex", prompt="TURN1", cwd=str(parent_dir), mode="edit"))
+    await asyncio.wait_for(hold_runner.turn1_started.wait(), timeout=5.0)
+
+    # Queue Turn 2 while Turn 1 holds the session (Turn 2 starts with parent_dir and no worktree_path yet).
+    t2 = mgr.start(mgr.prepare_request(backend="codex", prompt="TURN2_CANCEL", resume_from=t1.job_id, mode="edit"))
+    await asyncio.sleep(0.15)
+    # Cancel queued Turn 2 BEFORE launch!
+    t2_done = await mgr.cancel(t2.job_id)
+    assert t2_done.status == "cancelled"
+    assert t2_done.provider_invoked is False
+
+    # Now let Turn 1 finish publishing worktree_dir!
+    hold_runner.release_turn1.set()
+    t1_done = (await mgr.wait_for([t1.job_id], wait_seconds=10))[0]
+    assert t1_done.status == "completed"
+    assert t1_done.effective_cwd == str(worktree_dir.resolve())
+
+    # Also cancel a SECOND queued Turn 2b AFTER Turn 1 finished (before it executes) to be doubly sure!
+    mgr._semaphore = asyncio.Semaphore(0)  # Block concurrency slot so Turn 2b stays pre-launch.
+    t2b = mgr.start(mgr.prepare_request(backend="codex", prompt="TURN2B_CANCEL", cwd=str(parent_dir), resume_from=t1.job_id, mode="edit"))
+    await asyncio.sleep(0.15)
+    t2b_done = await mgr.cancel(t2b.job_id)
+    assert t2b_done.status == "cancelled"
+    assert t2b_done.provider_invoked is False
+    mgr._semaphore = asyncio.Semaphore(4)
+
+    # Turn 3 with implicit cwd MUST run in worktree_dir and keep worktree metadata!
+    t3_done = await mgr.run(mgr.prepare_request(backend="codex", prompt="TURN3", resume_from=t1.job_id, mode="edit"))
+    assert t3_done.status == "completed"
+    assert t3_done.effective_cwd == str(worktree_dir.resolve())
+    assert t3_done.worktree_path == str(worktree_dir.resolve())
+    assert f"RAN_IN:{worktree_dir.resolve()}" in t3_done.response
+
+    # Part B: Antigravity usage checkpoint preserved when queued resume is cancelled before launch!
+    fake_agy = tmp_path / "fake_agy_prelaunch.py"
+    fake_agy.write_text(
+        """
+import json, sys
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+prompt = [a for a in args if a.startswith("--print=")][0][len("--print="):]
+if prompt == "N1":
+    print(json.dumps({"conversation_id": "conv-keep-wm", "status": "SUCCESS", "response": "N1", "num_turns": 1, "usage": {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}}), flush=True)
+elif prompt == "N3":
+    print(json.dumps({"conversation_id": "conv-keep-wm", "status": "SUCCESS", "response": "N3", "num_turns": 2, "usage": {"input_tokens": 140, "output_tokens": 20, "total_tokens": 160}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+    mgr_n = JobManager(settings, neon_runner=StubAgyRunner(settings, fake_agy))
+    n1 = await mgr_n.run(mgr_n.prepare_request(backend="neon", model="neon-medium", prompt="N1"))
+    assert n1.status == "completed"
+    assert mgr_n.store.get_session_watermark("neon", "conv-keep-wm") is not None
+
+    # Block semaphore so queued N2 cannot launch, then cancel N2 before launch.
+    mgr_n._semaphore = asyncio.Semaphore(0)
+    n2 = mgr_n.start(mgr_n.prepare_request(backend="neon", model="neon-medium", prompt="N2_CANCEL", resume_from=n1.job_id))
+    await asyncio.sleep(0.15)
+    n2_done = await mgr_n.cancel(n2.job_id)
+    assert n2_done.status == "cancelled"
+    assert n2_done.provider_invoked is False
+    mgr_n._semaphore = asyncio.Semaphore(4)
+
+    # Watermark MUST still exist so N3 computes exact adjacent delta (160 - 100 = 60)!
+    assert mgr_n.store.get_session_watermark("neon", "conv-keep-wm") is not None
+    n3 = await mgr_n.run(mgr_n.prepare_request(backend="neon", model="neon-medium", prompt="N3", resume_from=n1.job_id))
+    assert n3.status == "completed"
+    assert n3.usage_status == "delta"
+    assert n3.usage is not None and n3.usage["total_tokens"] == 60
+
+    await mgr.shutdown()
+    await mgr_n.shutdown()
+
+
+async def test_worktree_lock_respects_deadline_and_cancel_mid_checkout_reports_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit Medium #3: worktree lock wait honors job deadline, and cancelling during `git worktree add`
+    still reports the planned worktree_path/branch on the cancelled JobRecord."""
+    import os
+    import subprocess
+
+    from agent_bridge import runners as runners_mod
+
+    repo = tmp_path / "wt_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("v1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    # Part A: Hold repo worktree lock for 3.5s -> a job with 0.6s deadline times out quickly!
+    lock = runners_mod._repo_worktree_lock(os.path.normcase(str(repo.resolve())))
+    await lock.acquire()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError, match="worktree lock"):
+            await runners_mod.prepare_codex_worktree(
+                job_id="codex-lock-test",
+                cwd=str(repo),
+                state_dir=tmp_path / "state",
+                deadline=t0 + 0.6,
+            )
+        assert (time.monotonic() - t0) < 1.8
+    finally:
+        lock.release()
+
+    # Part B: Cancel mid-`git worktree add` -> cancelled JobRecord reports planned worktree_path & branch!
+    orig_run_git = runners_mod._run_git
+    in_checkout = asyncio.Event()
+
+    async def slow_worktree_add(args: list[str], *, cwd: str, timeout_seconds: float = 15.0):
+        if args and args[0] == "worktree" and len(args) >= 5 and args[1] == "add":
+            # Create the worktree directory before stalling so it simulates a partial/registered checkout.
+            Path(args[4]).mkdir(parents=True, exist_ok=True)
+            in_checkout.set()
+            await asyncio.sleep(10.0)
+        return await orig_run_git(args, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(runners_mod, "_run_git", slow_worktree_add)
+    settings = _make_settings(tmp_path, default_cwd=repo)
+    mgr = JobManager(settings)
+    job = mgr.start(mgr.prepare_request(backend="codex", prompt="edit", cwd=str(repo), mode="edit", worktree=True))
+    await asyncio.wait_for(in_checkout.wait(), timeout=5.0)
+    cancelled = await mgr.cancel(job.job_id)
+    assert cancelled.status == "cancelled"
+    assert cancelled.worktree_path is not None
+    assert Path(cancelled.worktree_path).exists()
+    assert cancelled.worktree_branch == f"agent-bridge/{job.job_id}"
+    assert cancelled.provider_invoked is False
+    await mgr.shutdown()
+
+
+async def test_agy_empty_usage_envelope_does_not_advance_checkpoint_and_quota_cache_refreshes_past_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit Medium #4 & #5: empty `{}` agy usage envelope invalidates checkpoint (never 380 vs 210),
+    and cached quota whose reset timestamp has already passed triggers automatic live refresh."""
+    fake_agy = tmp_path / "fake_agy_empty_usage.py"
+    fake_agy.write_text(
+        """
+import json, sys
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+prompt = [a for a in args if a.startswith("--print=")][0][len("--print="):]
+cid = "conv-empty-u"
+if prompt == "E1":
+    print(json.dumps({"event": "init", "conversation_id": cid, "init": {"model": "gemini-4-neon-medium"}}), flush=True)
+    print(json.dumps({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": 1, "state": "DONE", "step_type": "agent_response", "text_delta": "E1", "usage": {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}}}), flush=True)
+    print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": "E1", "num_turns": 1, "usage": {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}}}), flush=True)
+elif prompt == "E2":
+    # Step reports 70 tokens, but final envelope has an EMPTY usage `{}` with num_turns=2!
+    print(json.dumps({"event": "init", "conversation_id": cid, "init": {"model": "gemini-4-neon-medium"}}), flush=True)
+    print(json.dumps({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": 2, "state": "DONE", "step_type": "agent_response", "text_delta": "E2", "usage": {"input_tokens": 60, "output_tokens": 10, "total_tokens": 70}}}), flush=True)
+    print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": "E2", "num_turns": 2, "usage": {}}}), flush=True)
+elif prompt == "E3":
+    # Envelope-only Turn 3 reports cumulative 210 with num_turns=3 -> MUST NOT subtract empty {} to get 210!
+    print(json.dumps({"conversation_id": cid, "status": "SUCCESS", "response": "E3", "num_turns": 3, "usage": {"input_tokens": 180, "output_tokens": 30, "total_tokens": 210}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(settings, neon_runner=StubAgyRunner(settings, fake_agy))
+    e1 = await mgr.run(mgr.prepare_request(backend="neon", model="neon-medium", prompt="E1", parent_run="emp"))
+    e2 = await mgr.run(mgr.prepare_request(backend="neon", model="neon-medium", prompt="E2", resume_from=e1.job_id, parent_run="emp"))
+    assert mgr.store.get_session_watermark("neon", "conv-empty-u") is None  # Empty `{}` invalidated checkpoint!
+    e3 = await mgr.run(mgr.prepare_request(backend="neon", model="neon-medium", prompt="E3", resume_from=e2.job_id, parent_run="emp"))
+    assert e3.usage_status == "partial"
+    assert e3.usage is None
+
+    summary = await mgr.get_usage_summary(period="session", parent_run="emp", compact=True)
+    assert summary["by_backend"]["neon"]["tokens"]["total_tokens"] == 170  # Never 380!
+
+    # Cached quota whose reset timestamp already passed MUST bypass cache and fetch fresh!
+    from datetime import datetime, timedelta, timezone
+    from agent_bridge import jobs as jobs_mod
+
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+    future_iso = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(timespec="seconds")
+    mgr.store.set_cached_quota(
+        "codex",
+        {
+            "backend": "codex",
+            "pool": "codex",
+            "status": "ok",
+            "fetched_at": past_iso,
+            "windows": [
+                {"slot": "secondary", "window": "weekly", "used_percent": 50.0, "remaining_percent": 50.0, "reset_time": past_iso}
+            ],
+        },
+    )
+
+    fetch_calls = 0
+
+    async def fake_fetch_codex(_cmd: list[str]) -> dict[str, object]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return {
+            "backend": "codex",
+            "pool": "codex",
+            "status": "ok",
+            "fetched_at": future_iso,
+            "windows": [
+                {"slot": "secondary", "window": "weekly", "used_percent": 0.0, "remaining_percent": 100.0, "reset_time": future_iso}
+            ],
+        }
+
+    monkeypatch.setattr(jobs_mod, "fetch_codex_quota", fake_fetch_codex)
+    monkeypatch.setattr(mgr.codex_runner, "resolve_command", lambda: ["codex"])
+
+    refreshed = await mgr.get_quota(["codex"], refresh=False)
+    assert fetch_calls == 1
+    assert refreshed["codex"]["cached"] is False
+    assert refreshed["codex"]["windows"][0]["remaining_percent"] == 100.0
+
+    # Second call with future reset_time SHOULD hit cache!
+    cached_hit = await mgr.get_quota(["codex"], refresh=False)
+    assert fetch_calls == 1
+    assert cached_hit["codex"]["cached"] is True
+
+    await mgr.shutdown()

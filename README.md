@@ -138,7 +138,7 @@ Drop this into `~/.claude/CLAUDE.md` (or a project's `CLAUDE.md`):
 ## Multi-Model Subagents (`agent-bridge` MCP)
 - Before substantial fan-out, call `get_usage(compact=True, cwd=<repo>, include_quota=True)` to inspect all 3 quota pools (`codex`, `agy_gemini`, `agy_claude_gpt`), upcoming model resets, and `quota_advisory.expiring_weekly_alerts` / `recommended_order`.
 - Prioritize any pool flagged `use_before_reset` when its weekly quota is about to reset with unused capacity. Leverage the separate `agy_claude_gpt` pool (`backend="agy-claude"` / `"agy-opus"` / `"agy-gpt"`) when you want extra Claude/GPT capacity without drawing down Codex or Gemini limits.
-- Start with one subagent for routine work; use multiple backends when independent perspectives or dual reviews matter; resume the original agent (`resume_from`) when prior context matters.
+- Start with one subagent for routine work: use `hydrogen-medium` / `hydrogen-high` for exploration, and `neon-medium` / `neon-high` for builds and reviews based on task complexity; use multiple backends when independent perspectives or dual reviews matter; resume the original agent (`resume_from`) when prior context matters.
 - Always pass `cwd`. Codex defaults to `gpt-6.2-sol` at `high` effort (override `effort` when you want `low`/`medium`/`xhigh`). Default to `mode="read_only"`; for unattended edits prefer `codex` with `mode="edit"` and `worktree=True`, and inspect the returned `effective_cwd` / `worktree_path`.
 - For multi-minute work, use `start_agent` or `run_parallel(wait=False)` and poll with `check_jobs`. Return concise findings inline and reference longer outputs by `job_id`.
 ```

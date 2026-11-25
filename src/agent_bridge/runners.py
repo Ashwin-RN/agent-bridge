@@ -42,6 +42,41 @@ TRANSIENT_RETRY_MIN_REMAINING_SECONDS = 12.0
 OnSessionCallback = Callable[[str], None]
 OnActivityCallback = Callable[[str], None]
 OnModelCallback = Callable[[str], None]
+OnProviderStartCallback = Callable[[], None]
+OnWorktreePlannedCallback = Callable[[dict[str, str | None]], None]
+
+
+def _has_valid_agy_token_counters(raw_usage: Any) -> bool:
+    """Return True only when an `agy` usage dict contains real, non-zero numeric token counters."""
+    if not isinstance(raw_usage, dict) or not raw_usage:
+        return False
+    vals: dict[str, int] = {}
+    for key in ("input_tokens", "output_tokens", "thinking_tokens", "cache_read_tokens", "total_tokens"):
+        v = raw_usage.get(key)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            return False
+        vals[key] = int(v)
+    if not vals:
+        return False
+    total = vals.get("total_tokens", 0)
+    io_sum = vals.get("input_tokens", 0) + vals.get("output_tokens", 0)
+    return total > 0 or io_sum > 0
+
+
+def _is_valid_agy_cumulative_checkpoint(
+    raw_usage: dict[str, Any] | None,
+    prior_watermark: dict[str, Any] | None,
+) -> bool:
+    """Verify `raw_usage` is a non-empty, non-zero, monotonic cumulative checkpoint."""
+    if not _has_valid_agy_token_counters(raw_usage):
+        return False
+    assert isinstance(raw_usage, dict)
+    if prior_watermark is not None and isinstance(prior_watermark.get("cumulative"), dict):
+        if compute_agy_usage_delta(raw_usage, prior_watermark["cumulative"]) is None:
+            return False
+    return True
 
 _WORKTREE_REPO_LOCKS: dict[str, asyncio.Lock] = {}
 
@@ -513,16 +548,19 @@ async def prepare_codex_worktree(
     state_dir: Path,
     existing_worktree_path: str | None = None,
     deadline: float | None = None,
+    on_worktree_planned: OnWorktreePlannedCallback | None = None,
 ) -> dict[str, str | None]:
     """Deterministically assign or reuse a per-job Git worktree BEFORE launching Codex.
 
-    Assigning a dedicated worktree per `job_id` eliminates parallel worktree detection races.
+    Assigning a dedicated worktree per `job_id` eliminates parallel worktree detection races,
+    applies `deadline` to lock acquisition, and notifies `on_worktree_planned` before invoking Git
+    so any cancellation mid-checkout still reports the checkout path left behind.
     """
     def _budget(cap: float = 15.0) -> float:
         if deadline is None:
             return cap
         rem = deadline - time.monotonic()
-        if rem <= 0.1:
+        if rem <= 0.05:
             raise asyncio.TimeoutError("Job deadline expired before Git worktree could be created.")
         return min(cap, rem)
 
@@ -594,7 +632,29 @@ async def prepare_codex_worktree(
     wt_root.parent.mkdir(parents=True, exist_ok=True)
 
     lock = _repo_worktree_lock(os.path.normcase(str(repo_root)))
-    async with lock:
+    lock_wait = _budget(20.0)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=lock_wait)
+    except asyncio.TimeoutError as exc:
+        raise asyncio.TimeoutError(
+            "Job deadline expired while waiting for Git worktree lock."
+        ) from exc
+
+    try:
+        # Verify remaining budget after acquiring lock, then persist planned path BEFORE invoking Git!
+        _budget(20.0)
+        planned_effective = (wt_root / rel_prefix).resolve() if rel_prefix else wt_root
+        if on_worktree_planned is not None:
+            on_worktree_planned(
+                {
+                    "effective_cwd": str(planned_effective),
+                    "worktree_path": str(wt_root),
+                    "worktree_branch": wt_branch,
+                    "worktree_commit": head_commit,
+                    "git_common_dir": git_common_dir,
+                }
+            )
+
         last_err = ""
         for attempt in range(4):
             rc_add, _out_add, err_add = await _run_git(
@@ -609,6 +669,8 @@ async def prepare_codex_worktree(
                 await asyncio.sleep(min(0.25 * (attempt + 1), _budget(2.0)))
                 continue
             raise RuntimeError(f"Failed to create Git worktree at {wt_root}: {last_err}")
+    finally:
+        lock.release()
 
     effective_path = (wt_root / rel_prefix).resolve() if rel_prefix else wt_root
     if not effective_path.is_dir():
@@ -767,6 +829,7 @@ class NeonRunner:
         on_session: OnSessionCallback | None,
         on_activity: OnActivityCallback | None,
         on_model: OnModelCallback | None,
+        on_provider_start: OnProviderStartCallback | None = None,
     ) -> RunResult:
         started = time.monotonic()
         remaining = deadline - started
@@ -815,6 +878,8 @@ class NeonRunner:
             **subprocess_creation_kwargs(),
         )
         managed = ManagedProcess(proc)
+        if on_provider_start:
+            on_provider_start()
 
         stdout_lines: list[str] = []
         stderr_chunks: list[bytes] = []
@@ -958,9 +1023,14 @@ class NeonRunner:
 
         # Determine per-turn usage accurately without double-counting or labeling interrupted turns exact.
         step_sum = sum_agy_step_usages(list(step_usages_by_index.values()))
-        env_raw_usage = (
+        raw_env_candidate = (
             envelope.get("usage")
             if isinstance(envelope, dict) and isinstance(envelope.get("usage"), dict)
+            else None
+        )
+        env_raw_usage = (
+            raw_env_candidate
+            if _has_valid_agy_token_counters(raw_env_candidate)
             else None
         )
         raw_turns = envelope.get("num_turns") if isinstance(envelope, dict) else None
@@ -1007,10 +1077,15 @@ class NeonRunner:
                     provider_metrics["cumulative_only"] = True
                 usage_status = "partial"
 
-        # Only publish a new cumulative watermark when this turn completed cleanly with an explicit turn count.
+        # Only publish a new cumulative checkpoint when this turn completed cleanly with valid,
+        # non-zero, monotonic counters and an explicit turn count.
         published_cumulative = (
             env_raw_usage
-            if (turn_completed_cleanly and env_raw_usage is not None and num_turns is not None)
+            if (
+                turn_completed_cleanly
+                and num_turns is not None
+                and _is_valid_agy_cumulative_checkpoint(env_raw_usage, prior_watermark)
+            )
             else None
         )
         published_turns = num_turns if published_cumulative is not None else None
@@ -1196,6 +1271,7 @@ class NeonRunner:
         on_session: OnSessionCallback | None = None,
         on_activity: OnActivityCallback | None = None,
         on_model: OnModelCallback | None = None,
+        on_provider_start: OnProviderStartCallback | None = None,
     ) -> RunResult:
         overall_deadline = deadline if deadline is not None else (time.monotonic() + request.timeout_seconds)
         temp_dir: str | None = None
@@ -1256,6 +1332,7 @@ class NeonRunner:
                 on_session=on_session,
                 on_activity=on_activity,
                 on_model=on_model,
+                on_provider_start=on_provider_start,
             )
 
             # Seamless self-healing retry if selected model was retired/rejected.
@@ -1297,6 +1374,7 @@ class NeonRunner:
                     on_session=on_session,
                     on_activity=on_activity,
                     on_model=on_model,
+                    on_provider_start=on_provider_start,
                 )
 
             # One bounded retry for transient service errors on read-only tasks only.
@@ -1320,6 +1398,7 @@ class NeonRunner:
                     on_session=on_session,
                     on_activity=on_activity,
                     on_model=on_model,
+                    on_provider_start=on_provider_start,
                 )
 
             return result
@@ -1475,6 +1554,7 @@ class CodexRunner:
         on_session: OnSessionCallback | None,
         on_activity: OnActivityCallback | None,
         on_model: OnModelCallback | None,
+        on_provider_start: OnProviderStartCallback | None = None,
     ) -> RunResult:
         started = time.monotonic()
         local_defaults = read_codex_local_defaults()
@@ -1543,6 +1623,8 @@ class CodexRunner:
             **subprocess_creation_kwargs(),
         )
         managed = ManagedProcess(proc)
+        if on_provider_start:
+            on_provider_start()
 
         prompt_bytes = request.prompt.encode("utf-8") if use_stdin_prompt else None
         stdout_lines: list[str] = []
@@ -1754,6 +1836,7 @@ class CodexRunner:
         on_session: OnSessionCallback | None = None,
         on_activity: OnActivityCallback | None = None,
         on_model: OnModelCallback | None = None,
+        on_provider_start: OnProviderStartCallback | None = None,
     ) -> RunResult:
         _ = prior_watermark  # Unused for Codex (emits exact per-turn usage natively).
         overall_deadline = deadline if deadline is not None else (time.monotonic() + request.timeout_seconds)
@@ -1770,6 +1853,7 @@ class CodexRunner:
             on_session=on_session,
             on_activity=on_activity,
             on_model=on_model,
+            on_provider_start=on_provider_start,
         )
 
         # Seamless fallback if an explicit/pinned Codex model is rejected/retired.
@@ -1796,6 +1880,7 @@ class CodexRunner:
                 on_session=on_session,
                 on_activity=on_activity,
                 on_model=on_model,
+                on_provider_start=on_provider_start,
             )
 
         # One bounded retry for transient service errors on read-only tasks only.
@@ -1817,6 +1902,7 @@ class CodexRunner:
                 on_session=on_session,
                 on_activity=on_activity,
                 on_model=on_model,
+                on_provider_start=on_provider_start,
             )
 
         return result

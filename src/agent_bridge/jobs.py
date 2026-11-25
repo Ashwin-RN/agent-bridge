@@ -34,6 +34,7 @@ from agent_bridge.quota import (
     enrich_quota_reading,
     fetch_codex_quota,
     fetch_neon_quota,
+    has_passed_reset,
 )
 from agent_bridge.runners import CodexRunner, NeonRunner, prepare_codex_worktree
 from agent_bridge.storage import BridgeStore, UsagePeriod
@@ -405,6 +406,40 @@ class JobManager:
                 last_activity=activity,
             )
 
+        def on_provider_start() -> None:
+            if not record.provider_invoked:
+                record.provider_invoked = True
+                self.store.update_job_progress(
+                    record.job_id,
+                    owner_id=self.owner_id,
+                    provider_invoked=True,
+                )
+
+        def on_worktree_planned(planned: dict[str, str | None]) -> None:
+            wt_p = planned.get("worktree_path")
+            wt_b = planned.get("worktree_branch")
+            wt_c = planned.get("worktree_commit")
+            eff = planned.get("effective_cwd")
+            if wt_p:
+                record.worktree_path = wt_p
+                request.worktree_path = wt_p
+            if wt_b:
+                record.worktree_branch = wt_b
+                request.worktree_branch = wt_b
+            if wt_c:
+                record.worktree_commit = wt_c
+                request.worktree_commit = wt_c
+            if planned.get("git_common_dir"):
+                request.git_common_dir = planned["git_common_dir"]
+            self.store.update_job_progress(
+                record.job_id,
+                owner_id=self.owner_id,
+                worktree_path=record.worktree_path,
+                worktree_branch=record.worktree_branch,
+                worktree_commit=record.worktree_commit,
+                last_activity=f"creating git worktree ({wt_b or wt_p or eff})",
+            )
+
         sem_acquired = False
         tracker_token = CURRENT_PROCESS_TRACKER.set(tracker)
 
@@ -433,7 +468,7 @@ class JobManager:
                 last_activity=record.last_activity,
             )
 
-            # 3. Pre-assign a dedicated Git worktree BEFORE launch and persist that exact path.
+            # 3. Pre-assign a dedicated Git worktree BEFORE launch and persist planned path before invoking Git.
             if request.backend == "codex" and request.worktree:
                 record.last_activity = "preparing git worktree"
                 self.store.update_job_progress(
@@ -447,6 +482,7 @@ class JobManager:
                     state_dir=self.settings.state_dir,
                     existing_worktree_path=request.worktree_path if not request.explicit_cwd else None,
                     deadline=deadline,
+                    on_worktree_planned=on_worktree_planned,
                 )
                 request.cwd = str(wt_info["effective_cwd"] or request.cwd)
                 request.worktree_path = wt_info["worktree_path"]
@@ -481,6 +517,7 @@ class JobManager:
                 on_session=on_session,
                 on_activity=on_activity,
                 on_model=on_model,
+                on_provider_start=on_provider_start,
             )
         except asyncio.CancelledError:
             self._cancelled_ids.discard(record.job_id)
@@ -503,7 +540,7 @@ class JobManager:
             )
             record.last_activity = "cancelled"
             try:
-                self.store.finalize_job(record)
+                self.store.finalize_job(record, touched_provider=record.provider_invoked)
             except Exception as store_exc:
                 logger.warning("Failed to finalize cancelled job %s: %s", record.job_id, store_exc)
             return
@@ -525,7 +562,7 @@ class JobManager:
             )
             record.last_activity = "timed_out"
             try:
-                self.store.finalize_job(record)
+                self.store.finalize_job(record, touched_provider=record.provider_invoked)
             except Exception as store_exc:
                 logger.warning("Failed to finalize timed_out job %s: %s", record.job_id, store_exc)
             return
@@ -550,11 +587,16 @@ class JobManager:
             )
             record.last_activity = "failed"
             try:
-                self.store.finalize_job(record)
+                self.store.finalize_job(record, touched_provider=record.provider_invoked)
             except Exception as store_exc:
                 logger.warning("Failed to finalize failed job %s: %s", record.job_id, store_exc)
             return
         else:
+            record.provider_invoked = (
+                record.provider_invoked
+                or result.provider_invoked
+                or (result.status == "completed")
+            )
             if record.job_id in self._cancelled_ids:
                 self._cancelled_ids.discard(record.job_id)
                 stopped = await tracker.terminate_all_and_verify()
@@ -574,7 +616,7 @@ class JobManager:
                     else 0.0
                 )
                 record.last_activity = "cancelled"
-                self.store.finalize_job(record)
+                self.store.finalize_job(record, touched_provider=record.provider_invoked)
                 return
 
             record.status = result.status
@@ -619,6 +661,7 @@ class JobManager:
                 record,
                 watermark_cumulative=result.cumulative_usage,
                 watermark_turns=result.num_turns,
+                touched_provider=record.provider_invoked,
             )
         finally:
             CURRENT_PROCESS_TRACKER.reset(tracker_token)
@@ -855,7 +898,7 @@ class JobManager:
                 else 0.0
             )
             local_record.last_activity = "cancelled"
-            self.store.finalize_job(local_record)
+            self.store.finalize_job(local_record, touched_provider=local_record.provider_invoked)
             if ev is not None:
                 ev.set()
             if task_finished:
@@ -966,7 +1009,7 @@ class JobManager:
         async def _probe_one(bname: str) -> tuple[str, dict[str, Any]]:
             if not refresh:
                 cached = self.store.get_cached_quota(bname, self.settings.quota_cache_ttl_seconds)
-                if cached is not None:
+                if cached is not None and not has_passed_reset(cached):
                     return bname, enrich_quota_reading(cached)
 
             if bname == "codex":
