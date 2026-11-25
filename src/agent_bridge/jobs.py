@@ -51,8 +51,9 @@ class SessionResumeBlockedError(RuntimeError):
         self.prior_provider_state = prior_provider_state
         super().__init__(
             f"Automatic resume blocked on session {session_id!r}: prior turn {prior_job_id!r} "
-            f"ended with provider_state={prior_provider_state!r}. Confirm the prior turn has ended "
-            "(and inspect git diff/worktree for edits), then retry with confirm_prior_stopped=True."
+            f"ended with provider_state={prior_provider_state!r}. Confirm that exact turn has ended "
+            f"(and inspect git diff/worktree for edits), then retry with confirm_prior_job_id={prior_job_id!r} "
+            "(or confirm_prior_stopped=True)."
         )
 
 
@@ -166,6 +167,7 @@ class JobManager:
         review_base: str | None = None,
         review_commit: str | None = None,
         confirm_prior_stopped: bool = False,
+        confirm_prior_job_id: str | None = None,
         allow_cross_pool_fallback: bool = False,
     ) -> RunRequest:
         if not prompt.strip() and review_scope is None:
@@ -230,6 +232,17 @@ class JobManager:
 
         requested_model = hinted_model
 
+        # Bind confirmation to a specific prior turn so a pre-confirmed or stale boolean cannot bypass a newer uncertain turn!
+        bound_confirm_job_id: str | None = None
+        if confirm_prior_job_id and confirm_prior_job_id.strip():
+            bound_confirm_job_id = confirm_prior_job_id.strip()
+        elif confirm_prior_stopped and resolved_session_id:
+            active_block = self.store.get_session_safety_block(resolved_backend, resolved_session_id)
+            if active_block is not None:
+                bound_confirm_job_id = active_block["blocking_job_id"]
+            elif resume_from_job_id is not None:
+                bound_confirm_job_id = resume_from_job_id
+
         return RunRequest(
             backend=resolved_backend,
             prompt=prompt,
@@ -251,7 +264,8 @@ class JobManager:
             review_scope=review_scope,
             review_base=review_base,
             review_commit=review_commit,
-            confirm_prior_stopped=bool(confirm_prior_stopped),
+            confirm_prior_stopped=bool(confirm_prior_stopped or bound_confirm_job_id),
+            confirm_prior_job_id=bound_confirm_job_id,
             allow_cross_pool_fallback=bool(allow_cross_pool_fallback),
         )
 
@@ -307,7 +321,7 @@ class JobManager:
         session_id: str,
         deadline: float,
         *,
-        confirm_prior_stopped: bool = False,
+        confirm_prior_job_id: str | None = None,
     ) -> None:
         """Atomically claim `(record.backend, session_id)` in SQLite within `deadline`."""
         key = (record.backend, session_id)
@@ -319,7 +333,7 @@ class JobManager:
                 record.job_id,
                 self.owner_id,
                 is_pid_alive_fn=self._is_pid_alive,
-                confirm_prior_stopped=confirm_prior_stopped,
+                confirm_prior_job_id=confirm_prior_job_id,
             )
             if outcome == "claimed":
                 return
@@ -477,7 +491,7 @@ class JobManager:
                     record,
                     request.session_id,
                     deadline,
-                    confirm_prior_stopped=request.confirm_prior_stopped,
+                    confirm_prior_job_id=request.confirm_prior_job_id,
                 )
                 # Prior turn has now finalized: refresh its final effective_cwd / worktree path!
                 self._refresh_resumed_context(record, request)
@@ -585,8 +599,8 @@ class JobManager:
             record.error = str(exc)
             record.retry_guidance = (
                 f"Prior turn {exc.prior_job_id!r} ended with provider_state={exc.prior_provider_state!r}. "
-                "Confirm the prior turn has stopped (and inspect git status/diff for edits), "
-                "then retry with confirm_prior_stopped=True."
+                "Confirm that exact prior turn has stopped (and inspect git status/diff for edits), "
+                f"then retry with confirm_prior_job_id={exc.prior_job_id!r} (or confirm_prior_stopped=True)."
             )
             record.finished_at = time.time()
             record.duration_seconds = 0.0

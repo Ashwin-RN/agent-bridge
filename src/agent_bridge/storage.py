@@ -139,6 +139,16 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS session_safety_state (
+        backend TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        blocking_job_id TEXT NOT NULL,
+        provider_state TEXT NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (backend, session_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS quota_cache (
         backend TEXT PRIMARY KEY,
         fetched_at REAL NOT NULL,
@@ -336,6 +346,19 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
                 "DELETE FROM session_usage_watermarks WHERE backend = ? AND session_id = ?",
                 (rec.backend, rec.session_id),
             )
+        # Persist durable unresolved provider state per session (independent of job-history pruning).
+        if (rec.provider_invoked or not was_queued_never_started) and rec.session_id and rec.provider_state in {
+            "possibly_running",
+            "unknown",
+        }:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO session_safety_state (
+                    backend, session_id, blocking_job_id, provider_state, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (rec.backend, rec.session_id, rec.job_id, rec.provider_state, now),
+            )
     return changed
 
 
@@ -438,6 +461,52 @@ class BridgeStore:
                     """
                 )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_quota_pool ON usage_events(quota_pool)")
+
+            # One-time backfill of durable session_safety_state for any existing unresolved sessions.
+            if (
+                cur.execute(
+                    "SELECT 1 FROM meta WHERE key = 'session_safety_backfilled'"
+                ).fetchone()
+                is None
+            ):
+                now = time.time()
+                uncertain_rows = cur.execute(
+                    """
+                    SELECT j.backend, j.session_id, j.job_id, j.provider_state
+                    FROM jobs j
+                    WHERE j.session_id IS NOT NULL
+                      AND j.provider_invoked = 1
+                      AND j.status IN ('completed', 'failed', 'cancelled', 'timed_out')
+                      AND j.provider_state IN ('possibly_running', 'unknown')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM jobs j2
+                          WHERE j2.backend = j.backend
+                            AND j2.session_id = j.session_id
+                            AND j2.provider_invoked = 1
+                            AND j2.status IN ('completed', 'failed', 'cancelled', 'timed_out')
+                            AND COALESCE(j2.finished_at, j2.created_at) > COALESCE(j.finished_at, j.created_at)
+                      )
+                    """
+                ).fetchall()
+                for urow in uncertain_rows:
+                    cur.execute(
+                        """
+                        INSERT OR IGNORE INTO session_safety_state (
+                            backend, session_id, blocking_job_id, provider_state, updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(urow["backend"]),
+                            str(urow["session_id"]),
+                            str(urow["job_id"]),
+                            str(urow["provider_state"]),
+                            now,
+                        ),
+                    )
+                cur.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('session_safety_backfilled', ?)",
+                    (str(now),),
+                )
 
         self._import_legacy_files_if_needed()
 
@@ -805,6 +874,28 @@ class BridgeStore:
 
     # --- Atomic per-session claims ---
 
+    def get_session_safety_block(
+        self,
+        backend: str,
+        session_id: str,
+    ) -> dict[str, str] | None:
+        """Return durable unresolved provider state for `(backend, session_id)`, independent of job pruning."""
+        with self._tx(write=False) as cur:
+            row = cur.execute(
+                """
+                SELECT blocking_job_id, provider_state
+                FROM session_safety_state
+                WHERE backend = ? AND session_id = ?
+                """,
+                (backend, session_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "blocking_job_id": str(row["blocking_job_id"]),
+                "provider_state": str(row["provider_state"]),
+            }
+
     def try_claim_session(
         self,
         backend: str,
@@ -813,15 +904,15 @@ class BridgeStore:
         owner_id: str,
         *,
         is_pid_alive_fn: Callable[[int], bool],
-        confirm_prior_stopped: bool = False,
+        confirm_prior_job_id: str | None = None,
     ) -> tuple[Literal["claimed", "busy", "blocked"], str | None, str | None]:
         """Atomically claim `(backend, session_id)` for `job_id`.
 
         Returns:
         - `("claimed", None, None)` if claimed by `job_id`
         - `("busy", holder_job_id, None)` if another live job currently holds the turn
-        - `("blocked", prior_job_id, prior_provider_state)` if the latest executed turn ended with
-          uncertain provider state (`possibly_running` or `unknown`) and `confirm_prior_stopped` is False.
+        - `("blocked", blocking_job_id, prior_provider_state)` if the session has unresolved
+          uncertain provider state that has not been confirmed for that exact `blocking_job_id`.
         """
         now = time.time()
         with self._tx(write=True) as cur:
@@ -911,26 +1002,20 @@ class BridgeStore:
                         (now, str(rrow["owner_id"])),
                     )
 
-            # Safety gate: never auto-resume over a prior executed turn whose provider state is uncertain!
-            if not confirm_prior_stopped:
-                latest_exec = cur.execute(
-                    """
-                    SELECT job_id, provider_state
-                    FROM jobs
-                    WHERE backend = ? AND session_id = ?
-                      AND provider_invoked = 1
-                      AND status IN ('completed', 'failed', 'cancelled', 'timed_out')
-                      AND job_id != ?
-                    ORDER BY COALESCE(finished_at, created_at) DESC
-                    LIMIT 1
-                    """,
-                    (backend, session_id, job_id),
-                ).fetchone()
-                if latest_exec is not None and str(latest_exec["provider_state"] or "") in {
-                    "possibly_running",
-                    "unknown",
-                }:
-                    return "blocked", str(latest_exec["job_id"]), str(latest_exec["provider_state"])
+            # Durable safety gate (independent of jobs table pruning, bound to the exact blocking_job_id!):
+            safety = cur.execute(
+                """
+                SELECT blocking_job_id, provider_state
+                FROM session_safety_state
+                WHERE backend = ? AND session_id = ?
+                """,
+                (backend, session_id),
+            ).fetchone()
+            if safety is not None:
+                blocking_id = str(safety["blocking_job_id"])
+                blocking_state = str(safety["provider_state"])
+                if blocking_id != job_id and confirm_prior_job_id != blocking_id:
+                    return "blocked", blocking_id, blocking_state
 
             cur.execute(
                 """
@@ -1290,6 +1375,30 @@ class BridgeStore:
                         (record.backend, record.session_id),
                     )
 
+            # Durable session safety state (survives job-history pruning!):
+            # Record uncertain provider state per session; clear only once an invoked turn cleanly stops.
+            if invoked and record.session_id:
+                if record.provider_state in {"possibly_running", "unknown"}:
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO session_safety_state (
+                            backend, session_id, blocking_job_id, provider_state, updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            record.backend,
+                            record.session_id,
+                            record.job_id,
+                            str(record.provider_state),
+                            now,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        "DELETE FROM session_safety_state WHERE backend = ? AND session_id = ?",
+                        (record.backend, record.session_id),
+                    )
+
             # Atomically release any session claim held by this job right as terminal state commits.
             cur.execute("DELETE FROM session_claims WHERE job_id = ?", (record.job_id,))
 
@@ -1298,18 +1407,19 @@ class BridgeStore:
                 (now, record.owner_id),
             )
 
-            # Prune only oldest TERMINAL jobs beyond max_stored_jobs (never prune active jobs).
+            # Prune only oldest TERMINAL jobs beyond max_stored_jobs (never prune active jobs or self).
             cur.execute(
                 """
                 DELETE FROM jobs
                 WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')
+                  AND job_id != ?
                   AND job_id NOT IN (
                       SELECT job_id FROM jobs
                       ORDER BY MAX(created_at, COALESCE(finished_at, 0)) DESC
                       LIMIT ?
                   )
                 """,
-                (self.max_stored_jobs,),
+                (record.job_id, self.max_stored_jobs),
             )
 
     def get_job(self, job_id: str) -> JobRecord | None:

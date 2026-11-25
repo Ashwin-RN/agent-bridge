@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from agent_bridge.process_control import ManagedProcess, subprocess_creation_kwargs
+from agent_bridge.process_control import ManagedProcess, spawn_managed_process
 
 logger = logging.getLogger("agent_bridge.quota")
 
@@ -666,15 +666,13 @@ async def fetch_codex_quota(codex_cmd: list[str], *, timeout_seconds: float = 12
     ts = _iso_now()
     managed: ManagedProcess | None = None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc, managed = await spawn_managed_process(
             *codex_cmd,
             "app-server",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **subprocess_creation_kwargs(),
         )
-        managed = ManagedProcess(proc)
         assert proc.stdin is not None and proc.stdout is not None
 
         messages = [
@@ -752,7 +750,7 @@ async def fetch_neon_quota(agy_cmd: list[str], *, timeout_seconds: float = 15.0)
     ts = _iso_now()
     managed: ManagedProcess | None = None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc, managed = await spawn_managed_process(
             *agy_cmd,
             "--mode",
             "plan",
@@ -764,11 +762,9 @@ async def fetch_neon_quota(agy_cmd: list[str], *, timeout_seconds: float = 15.0)
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **subprocess_creation_kwargs(),
         )
-        managed = ManagedProcess(proc)
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-        managed.close()
+        await managed.finish()
 
         stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0 or not stdout_text:

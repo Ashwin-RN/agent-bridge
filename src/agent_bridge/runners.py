@@ -17,7 +17,7 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
-from agent_bridge.config import Settings, read_codex_local_defaults
+from agent_bridge.config import Settings, classify_quota_pool, read_codex_local_defaults
 from agent_bridge.model_resolver import (
     DEFAULT_INTENT_TOKENS,
     ModelPoolUnavailableError,
@@ -26,7 +26,7 @@ from agent_bridge.model_resolver import (
     is_newer_codex_model_in_same_family,
 )
 from agent_bridge.models import JobStatus, ProviderState, RunRequest, RunResult, UsageStatus
-from agent_bridge.process_control import ManagedProcess, subprocess_creation_kwargs
+from agent_bridge.process_control import ManagedProcess, spawn_managed_process
 from agent_bridge.usage import (
     compute_agy_usage_delta,
     normalize_usage,
@@ -468,21 +468,19 @@ async def _run_git(
         raise RuntimeError("`git` executable not found in PATH.")
     managed: ManagedProcess | None = None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc, managed = await spawn_managed_process(
             git_bin,
             *args,
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **subprocess_creation_kwargs(),
         )
-        managed = ManagedProcess(proc)
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(),
             timeout=max(0.01, timeout_seconds),
         )
-        managed.close()
+        await managed.finish()
         return (
             int(proc.returncode or 0),
             stdout_b.decode("utf-8", errors="replace").strip(),
@@ -729,17 +727,15 @@ async def _check_cli_health(cmd: list[str]) -> tuple[bool, str | None, str | Non
     """Run `<cmd> --version` and return `(healthy, version_line, error_msg)`."""
     managed: ManagedProcess | None = None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc, managed = await spawn_managed_process(
             *cmd,
             "--version",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **subprocess_creation_kwargs(),
         )
-        managed = ManagedProcess(proc)
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        managed.close()
+        await managed.finish()
         out = stdout_b.decode("utf-8", errors="replace").strip()
         err = stderr_b.decode("utf-8", errors="replace").strip()
         text = out or err
@@ -797,16 +793,14 @@ class NeonRunner:
         cmd = [*self.resolve_command(), "models"]
         managed: ManagedProcess | None = None
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc, managed = await spawn_managed_process(
                 *cmd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                **subprocess_creation_kwargs(),
             )
-            managed = ManagedProcess(proc)
             stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-            managed.close()
+            await managed.finish()
         except BaseException:
             if managed is not None:
                 await managed.terminate()
@@ -909,15 +903,13 @@ class NeonRunner:
         if on_activity:
             on_activity(f"running agy ({resolved_model or 'agy-default'})")
 
-        proc = await asyncio.create_subprocess_exec(
+        proc, managed = await spawn_managed_process(
             *cmd,
             cwd=request.cwd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **subprocess_creation_kwargs(),
         )
-        managed = ManagedProcess(proc)
         if on_provider_start:
             on_provider_start()
 
@@ -1038,8 +1030,7 @@ class NeonRunner:
                     timeout=wait_budget,
                     managed=managed,
                 )
-                managed.close()
-                process_stopped = not managed.is_alive()
+                process_stopped = await managed.finish()
         except asyncio.TimeoutError:
             timed_out_locally = True
             process_stopped = not managed.is_alive()
@@ -1434,11 +1425,42 @@ class NeonRunner:
                         ),
                         provider_invoked=result.provider_invoked,
                     )
-                retry_model = (
+                requested_pool = classify_quota_pool("neon", resolution.resolved or request.model)
+                different_model = (
                     refreshed.resolved
-                    if refreshed.resolved != resolution.resolved
+                    if (refreshed.resolved is not None and refreshed.resolved != resolution.resolved)
                     else None
                 )
+                if different_model is not None and not request.allow_cross_pool_fallback:
+                    if classify_quota_pool("neon", different_model) != requested_pool:
+                        different_model = None
+
+                if different_model is None and not request.allow_cross_pool_fallback:
+                    return RunResult(
+                        status="failed",
+                        session_id=result.session_id or request.session_id,
+                        model=resolution.resolved,
+                        effort=request.effort,
+                        effective_cwd=request.cwd,
+                        duration_seconds=result.duration_seconds,
+                        usage_status=result.usage_status,
+                        exit_code=result.exit_code,
+                        error=(
+                            f"Model {resolution.resolved!r} was rejected by agy and refreshing the catalog "
+                            f"found no different eligible model in quota pool {requested_pool!r} "
+                            "(refusing to drop --model and risk spending another quota pool)."
+                        ),
+                        failure_reason="model_unavailable",
+                        provider_state=result.provider_state,
+                        retry_guidance=(
+                            "Refresh models via list_backends(refresh_models=True), select another model in "
+                            f"quota pool {requested_pool!r}, or pass allow_cross_pool_fallback=True."
+                        ),
+                        stderr_tail=result.stderr_tail,
+                        provider_invoked=result.provider_invoked,
+                    )
+
+                retry_model = different_model
                 notice = (
                     f"Model {resolution.resolved!r} was unavailable; seamlessly refreshed and retried with "
                     f"{retry_model or 'agy default'}."
@@ -1694,15 +1716,13 @@ class CodexRunner:
         if on_activity:
             on_activity(f"running codex ({reported_model})")
 
-        proc = await asyncio.create_subprocess_exec(
+        proc, managed = await spawn_managed_process(
             *cmd,
             cwd=request.cwd,
             stdin=asyncio.subprocess.PIPE if use_stdin_prompt else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **subprocess_creation_kwargs(),
         )
-        managed = ManagedProcess(proc)
         if on_provider_start:
             on_provider_start()
 
@@ -1781,8 +1801,7 @@ class CodexRunner:
                     timeout=wait_budget,
                     managed=managed,
                 )
-                managed.close()
-                process_stopped = not managed.is_alive()
+                process_stopped = await managed.finish()
         except asyncio.TimeoutError:
             timed_out_locally = True
             process_stopped = not managed.is_alive()

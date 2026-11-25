@@ -50,6 +50,7 @@ class RunRequest:
     review_commit: str | None = None
     job_id: str | None = None
     confirm_prior_stopped: bool = False
+    confirm_prior_job_id: str | None = None
     allow_cross_pool_fallback: bool = False
 
 

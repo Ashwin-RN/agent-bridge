@@ -1,4 +1,4 @@
-"""Cross-platform process lifecycle, OS liveness checks, and single-owner tree termination."""
+"""Cross-platform process containment, OS liveness checks, and verified tree termination."""
 
 from __future__ import annotations
 
@@ -19,9 +19,14 @@ logger = logging.getLogger("agent_bridge.process_control")
 # Windows Win32 constants
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
+_PROCESS_SUSPEND_RESUME = 0x0800
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_THREAD_SUSPEND_RESUME = 0x0002
+_TH32CS_SNAPTHREAD = 0x00000004
+_CREATE_SUSPENDED = 0x00000004
 _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
+_JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
@@ -35,6 +40,18 @@ if sys.platform == "win32":
             ("ReadTransferCount", ctypes.c_uint64),
             ("WriteTransferCount", ctypes.c_uint64),
             ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
         ]
 
     class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
@@ -60,6 +77,17 @@ if sys.platform == "win32":
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    class _THREADENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
     _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
@@ -70,6 +98,14 @@ if sys.platform == "win32":
         wintypes.DWORD,
     ]
     _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
     _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _kernel32.OpenProcess.restype = wintypes.HANDLE
     _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
@@ -80,6 +116,64 @@ if sys.platform == "win32":
     _kernel32.CloseHandle.restype = wintypes.BOOL
     _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_THREADENTRY32)]
+    _kernel32.Thread32First.restype = wintypes.BOOL
+    _kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_THREADENTRY32)]
+    _kernel32.Thread32Next.restype = wintypes.BOOL
+    _kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenThread.restype = wintypes.HANDLE
+    _kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    _kernel32.ResumeThread.restype = wintypes.DWORD
+
+    _ntdll = ctypes.WinDLL("ntdll")
+    _ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    _ntdll.NtResumeProcess.restype = ctypes.c_long
+
+
+def _resume_suspended_windows_process(pid: int, proc_handle: int | None = None) -> bool:
+    """Resume a process spawned with `CREATE_SUSPENDED` via NtResumeProcess or Toolhelp thread scan."""
+    if sys.platform != "win32":
+        return True
+    owned_handle = None
+    handle = proc_handle
+    try:
+        if not handle:
+            owned_handle = _kernel32.OpenProcess(_PROCESS_SUSPEND_RESUME, False, int(pid))
+            handle = owned_handle
+        if handle:
+            status = _ntdll.NtResumeProcess(wintypes.HANDLE(handle))
+            if status == 0:
+                return True
+    except Exception as exc:
+        logger.debug("NtResumeProcess failed for pid %s: %s", pid, exc)
+    finally:
+        if owned_handle:
+            _kernel32.CloseHandle(owned_handle)
+
+    # Fallback: enumerate threads via CreateToolhelp32Snapshot and call ResumeThread on matching PID.
+    resumed = False
+    snap = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return False
+    try:
+        entry = _THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(_THREADENTRY32)
+        ok = _kernel32.Thread32First(snap, ctypes.byref(entry))
+        while ok:
+            if int(entry.th32OwnerProcessID) == int(pid):
+                th = _kernel32.OpenThread(_THREAD_SUSPEND_RESUME, False, int(entry.th32ThreadID))
+                if th:
+                    try:
+                        if _kernel32.ResumeThread(th) != 0xFFFFFFFF:
+                            resumed = True
+                    finally:
+                        _kernel32.CloseHandle(th)
+            ok = _kernel32.Thread32Next(snap, ctypes.byref(entry))
+    finally:
+        _kernel32.CloseHandle(snap)
+    return resumed
 
 
 def is_pid_alive(pid: int) -> bool:
@@ -124,9 +218,12 @@ def is_pgid_alive(pgid: int) -> bool:
         return False
 
 
-def subprocess_creation_kwargs() -> dict[str, Any]:
+def subprocess_creation_kwargs(*, suspended: bool = False) -> dict[str, Any]:
     if sys.platform == "win32":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        if suspended:
+            flags |= _CREATE_SUSPENDED
+        return {"creationflags": flags}
     return {"start_new_session": True}
 
 
@@ -173,16 +270,18 @@ CURRENT_PROCESS_TRACKER: contextvars.ContextVar[ProcessTracker | None] = context
 
 
 class ManagedProcess:
-    """Single-owner subprocess wrapper that guarantees descendant cleanup and verifies exit."""
+    """Single-owner subprocess wrapper that guarantees pre-execution containment and verified tree cleanup."""
 
     _POSIX_GRACE_SECONDS: float = 2.5
     _POSIX_KILL_WAIT_SECONDS: float = 3.0
+    _WIN_JOB_WAIT_SECONDS: float = 2.0
 
     def __init__(
         self,
         proc: asyncio.subprocess.Process,
         *,
         tracker: ProcessTracker | None = None,
+        resume_suspended: bool = False,
     ) -> None:
         self.proc = proc
         self._job_handle: int | None = None
@@ -192,51 +291,88 @@ class ManagedProcess:
         self._tracker = tracker if tracker is not None else CURRENT_PROCESS_TRACKER.get()
 
         if sys.platform == "win32":
-            self._attach_windows_job_object(proc.pid)
+            self._attach_windows_job_object(proc.pid, resume_suspended=resume_suspended)
         else:
-            # With start_new_session=True, pgid equals child's pid.
+            # With start_new_session=True, pgid equals child's pid from instruction 0.
             self._pgid = proc.pid
 
         if self._tracker is not None:
             self._tracker.register(self)
 
-    def _attach_windows_job_object(self, pid: int) -> None:
+    def _attach_windows_job_object(self, pid: int, *, resume_suspended: bool = False) -> None:
+        proc_handle = None
+        job = None
         try:
+            access = _PROCESS_SET_QUOTA | _PROCESS_TERMINATE
+            if resume_suspended:
+                access |= _PROCESS_SUSPEND_RESUME
+            proc_handle = _kernel32.OpenProcess(access, False, int(pid))
+
             job = _kernel32.CreateJobObjectW(None, None)
-            if not job:
-                return
-            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            ok = _kernel32.SetInformationJobObject(
-                job,
-                _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                ctypes.byref(info),
-                ctypes.sizeof(info),
-            )
-            if not ok:
-                _kernel32.CloseHandle(job)
-                return
-
-            proc_handle = _kernel32.OpenProcess(
-                _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, int(pid)
-            )
-            if not proc_handle:
-                _kernel32.CloseHandle(job)
-                return
-            try:
-                if not _kernel32.AssignProcessToJobObject(job, proc_handle):
-                    _kernel32.CloseHandle(job)
-                    return
-            finally:
-                _kernel32.CloseHandle(proc_handle)
-
-            self._job_handle = int(job)
+            if job and proc_handle:
+                info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                if _kernel32.SetInformationJobObject(
+                    job,
+                    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    ctypes.byref(info),
+                    ctypes.sizeof(info),
+                ) and _kernel32.AssignProcessToJobObject(job, proc_handle):
+                    self._job_handle = int(job)
+                    job = None  # Ownership transferred to self._job_handle
         except Exception as exc:
             logger.debug("Could not attach Windows Job Object to pid %s: %s", pid, exc)
+        finally:
+            if job:
+                try:
+                    _kernel32.CloseHandle(job)
+                except Exception:
+                    pass
+            if resume_suspended:
+                resumed = _resume_suspended_windows_process(pid, proc_handle)
+                if not resumed:
+                    logger.warning("Failed to resume suspended process pid %s; terminating it.", pid)
+                    if self._job_handle is not None:
+                        try:
+                            _kernel32.TerminateJobObject(wintypes.HANDLE(self._job_handle), 1)
+                        except Exception:
+                            pass
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+            if proc_handle:
+                try:
+                    _kernel32.CloseHandle(proc_handle)
+                except Exception:
+                    pass
+
+    def _windows_job_active_processes(self) -> int | None:
+        if sys.platform != "win32" or self._job_handle is None:
+            return None
+        try:
+            acct = _JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+            ret_len = wintypes.DWORD(0)
+            ok = _kernel32.QueryInformationJobObject(
+                wintypes.HANDLE(self._job_handle),
+                _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                ctypes.byref(acct),
+                ctypes.sizeof(acct),
+                ctypes.byref(ret_len),
+            )
+            if ok:
+                return int(acct.ActiveProcesses)
+        except Exception:
+            pass
+        return None
 
     def is_alive(self) -> bool:
-        """Return True if the child process OR (on POSIX) any descendant in its process group is alive."""
-        if sys.platform != "win32":
+        """Return True if the child process OR any contained descendant is still alive."""
+        if sys.platform == "win32":
+            active = self._windows_job_active_processes()
+            if active is not None and active > 0:
+                return True
+        else:
             pgid = self._pgid or self.proc.pid
             if pgid and is_pgid_alive(pgid):
                 return True
@@ -292,6 +428,7 @@ class ManagedProcess:
                 self._tracker.unregister(self, verified_stopped=True)
             return True
 
+        win_job_drained = True
         try:
             if sys.platform == "win32":
                 if self._job_handle is not None:
@@ -299,12 +436,30 @@ class ManagedProcess:
                         _kernel32.TerminateJobObject(wintypes.HANDLE(self._job_handle), 1)
                     except Exception:
                         pass
-                    finally:
+
+                    # Wait while handle is still open so we can verify ActiveProcesses == 0!
+                    drain_deadline = time.monotonic() + self._WIN_JOB_WAIT_SECONDS
+                    if self.proc.returncode is None:
+                        rem = max(0.0, drain_deadline - time.monotonic())
                         try:
-                            _kernel32.CloseHandle(wintypes.HANDLE(self._job_handle))
-                        except Exception:
+                            await asyncio.wait_for(self.proc.wait(), timeout=rem)
+                        except asyncio.TimeoutError:
                             pass
-                        self._job_handle = None
+                    while time.monotonic() < drain_deadline:
+                        active = self._windows_job_active_processes()
+                        if active is None or active == 0:
+                            break
+                        await asyncio.sleep(min(0.05, max(0.0, drain_deadline - time.monotonic())))
+
+                    active_final = self._windows_job_active_processes()
+                    if active_final is not None and active_final > 0:
+                        win_job_drained = False
+
+                    try:
+                        _kernel32.CloseHandle(wintypes.HANDLE(self._job_handle))
+                    except Exception:
+                        pass
+                    self._job_handle = None
 
                 if self.proc.returncode is None:
                     try:
@@ -398,26 +553,64 @@ class ManagedProcess:
             self.terminate_sync()
             stopped_now = not self.is_alive()
             self._terminated_verified = stopped_now
-            if self._tracker is not None:
-                self._tracker.unregister(self, verified_stopped=stopped_now)
+            if self._tracker is not None and stopped_now:
+                self._tracker.unregister(self, verified_stopped=True)
             raise
 
-        stopped = not self.is_alive()
+        stopped = win_job_drained and (not self.is_alive())
         self._terminated_verified = stopped
         if self._tracker is not None:
-            self._tracker.unregister(self, verified_stopped=stopped)
+            if stopped:
+                self._tracker.unregister(self, verified_stopped=True)
+            else:
+                # Keep tracking unstopped processes so tracker still knows descendants survive!
+                self._tracker._unverified_stop = True
         return stopped
 
+    async def finish(self) -> bool:
+        """Verify no descendants outlived a normal exit; terminate and verify if any remain."""
+        if not self.is_alive():
+            self.close()
+            return True
+        # A descendant survived after the leader exited normally: reap and verify cleanup!
+        return await self.terminate()
+
     def close(self) -> None:
-        """Release kernel handles after a normal exit (also reaps lingering descendants on Windows)."""
+        """Release kernel handles after verified exit; keep tracking if descendants remain alive."""
         if self._closed_cleanly:
             return
-        self._closed_cleanly = True
+        alive_before_close = self.is_alive()
         if sys.platform == "win32" and self._job_handle is not None:
             try:
                 _kernel32.CloseHandle(wintypes.HANDLE(self._job_handle))
             except Exception:
                 pass
             self._job_handle = None
-        if self._tracker is not None:
-            self._tracker.unregister(self, verified_stopped=not self.is_alive())
+        if not alive_before_close:
+            self._closed_cleanly = True
+            if self._tracker is not None:
+                self._tracker.unregister(self, verified_stopped=True)
+        elif self._tracker is not None:
+            self._tracker._unverified_stop = True
+
+
+async def spawn_managed_process(
+    *cmd: str,
+    cwd: str | None = None,
+    stdin: int | None = asyncio.subprocess.DEVNULL,
+    stdout: int | None = asyncio.subprocess.PIPE,
+    stderr: int | None = asyncio.subprocess.PIPE,
+    tracker: ProcessTracker | None = None,
+) -> tuple[asyncio.subprocess.Process, ManagedProcess]:
+    """Spawn a subprocess already contained in a Windows Job Object (via CREATE_SUSPENDED) or POSIX session."""
+    use_suspended = sys.platform == "win32"
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        **subprocess_creation_kwargs(suspended=use_suspended),
+    )
+    managed = ManagedProcess(proc, tracker=tracker, resume_suspended=use_suspended)
+    return proc, managed

@@ -1703,3 +1703,279 @@ sys.exit(0)
     assert res_pool.provider_invoked is False
     assert not spawn_marker.exists(), "agy should NEVER have been spawned on wrong quota pool!"
     await mgr.shutdown()
+
+
+async def test_windows_preexecution_containment_and_normal_exit_descendant_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Audit High #1: pre-execution containment kills children spawned immediately on startup,
+    and normal exit (`managed.finish()`) reaps any lingering descendant before reporting stopped."""
+    from agent_bridge.process_control import is_pid_alive
+
+    # Part A: Worker spawns a grandchild as its VERY FIRST action, then hangs until cancelled.
+    gc_pid_cancel = tmp_path / "gc_cancel.pid"
+    early_spawn_codex = tmp_path / "early_spawn_codex.py"
+    early_spawn_codex.write_text(
+        f"""
+import json, subprocess, sys, time
+from pathlib import Path
+
+g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+Path({str(gc_pid_cancel)!r}).write_text(str(g.pid), encoding="utf-8")
+_ = sys.stdin.read()
+print(json.dumps({{"type": "thread.started", "thread_id": "thr-early"}}), flush=True)
+time.sleep(60)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    mgr = JobManager(settings, codex_runner=StubCodexRunner(settings, early_spawn_codex))
+    j = mgr.start(mgr.prepare_request(backend="codex", prompt="cancel me"))
+
+    dl = time.monotonic() + 6.0
+    while time.monotonic() < dl and not gc_pid_cancel.exists():
+        await asyncio.sleep(0.05)
+    assert gc_pid_cancel.exists(), "grandchild never spawned"
+    gc_pid = int(gc_pid_cancel.read_text(encoding="utf-8").strip())
+    assert is_pid_alive(gc_pid)
+
+    cancelled = await mgr.cancel(j.job_id)
+    assert cancelled.status == "cancelled"
+    assert cancelled.provider_state == "stopped"
+    assert not is_pid_alive(gc_pid), f"Grandchild pid {gc_pid} escaped pre-execution containment!"
+
+    # Part B: Worker spawns a lingering grandchild and exits cleanly with exit code 0!
+    gc_pid_normal = tmp_path / "gc_normal.pid"
+    linger_codex = tmp_path / "linger_normal_codex.py"
+    linger_codex.write_text(
+        f"""
+import json, subprocess, sys
+from pathlib import Path
+
+g = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(60)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+Path({str(gc_pid_normal)!r}).write_text(str(g.pid), encoding="utf-8")
+_ = sys.stdin.read()
+print(json.dumps({{"type": "thread.started", "thread_id": "thr-linger"}}), flush=True)
+print(json.dumps({{"type": "item.completed", "item": {{"id": "i0", "type": "agent_message", "text": "DONE_WITH_CHILD"}}}}), flush=True)
+print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 10, "output_tokens": 5}}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    mgr2 = JobManager(settings, codex_runner=StubCodexRunner(settings, linger_codex))
+    rec2 = await mgr2.run(mgr2.prepare_request(backend="codex", prompt="normal exit with child"))
+    assert rec2.status == "completed"
+    assert rec2.provider_state == "stopped"
+    assert gc_pid_normal.exists()
+    gc_pid2 = int(gc_pid_normal.read_text(encoding="utf-8").strip())
+    assert not is_pid_alive(gc_pid2), f"Lingering grandchild pid {gc_pid2} survived normal exit!"
+    await mgr.shutdown()
+    await mgr2.shutdown()
+
+
+async def test_job_history_pruning_keeps_session_safety_block_and_confirmation_is_turn_bound(
+    tmp_path: Path,
+) -> None:
+    """Audit High #2: durable session_safety_state survives jobs pruning, and confirmation is bound
+    to the exact prior blocking_job_id."""
+    from agent_bridge.models import JobRecord
+
+    fake_agy = tmp_path / "fake_agy_prune_block.py"
+    fake_agy.write_text(
+        """
+import json, sys
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+prompt = [a for a in args if a.startswith("--print=")][0][len("--print="):]
+cid = "conv-prune-safe"
+print(json.dumps({"event": "init", "conversation_id": cid, "init": {"model": "gemini-4-neon-medium"}}), flush=True)
+if "TIMEOUT3" in prompt:
+    sys.stderr.write("print timeout elapsed while turn is still in progress\\n")
+    sys.exit(3)
+print(json.dumps({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": 1, "state": "DONE", "step_type": "agent_response", "text_delta": f"OK:{prompt}", "usage": {"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}}}), flush=True)
+print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": f"OK:{prompt}", "num_turns": 2, "usage": {"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    # Low max_stored_jobs (20) so we can easily prune Turn 1 out of the `jobs` table.
+    settings = _make_settings(tmp_path, max_stored_jobs=20)
+    mgr = JobManager(settings, neon_runner=StubAgyRunner(settings, fake_agy))
+
+    t1 = await mgr.run(mgr.prepare_request(backend="neon", model="neon-medium", prompt="T1_TIMEOUT3"))
+    assert t1.status == "timed_out"
+    assert t1.provider_state == "possibly_running"
+
+    # Backdate `t1` and insert & finalize 25 newer unrelated jobs so `t1` is completely pruned from `jobs`!
+    old_ts = time.time() - 500.0
+    with mgr.store._tx(write=True) as cur:
+        cur.execute(
+            "UPDATE jobs SET created_at = ?, started_at = ?, finished_at = ? WHERE job_id = ?",
+            (old_ts, old_ts, old_ts + 0.1, t1.job_id),
+        )
+    base_ts = time.time() - 100.0
+    for i in range(25):
+        filler = JobRecord(
+            job_id=f"codex-fill{i:03d}",
+            owner_id=mgr.owner_id,
+            backend="codex",
+            cwd=str(tmp_path),
+            mode="read_only",
+            requested_model=None,
+            model="gpt-6.2-sol",
+            prompt_preview=f"fill {i}",
+            status="completed",
+            created_at=base_ts + i,
+            started_at=base_ts + i,
+            finished_at=base_ts + i + 0.1,
+            duration_seconds=0.1,
+            provider_state="stopped",
+            provider_invoked=True,
+        )
+        mgr.store.insert_job(filler)
+        mgr.store.finalize_job(filler, touched_provider=True)
+
+    assert mgr.store.get_job(t1.job_id) is None, "t1 should have been pruned from jobs table"
+
+    # 1. Resume by session_id WITHOUT confirmation MUST STILL BE BLOCKED even after pruning!
+    blocked = await mgr.run(
+        mgr.prepare_request(backend="neon", model="neon-medium", prompt="AFTER_PRUNE", resume_from="conv-prune-safe")
+    )
+    assert blocked.status == "failed"
+    assert blocked.failure_reason == "prior_turn_uncertain"
+    assert t1.job_id in (blocked.error or "")
+
+    # 2. Wrong confirm_prior_job_id MUST STILL BE BLOCKED!
+    wrong_confirm = await mgr.run(
+        mgr.prepare_request(
+            backend="neon",
+            model="neon-medium",
+            prompt="WRONG_CONFIRM",
+            resume_from="conv-prune-safe",
+            confirm_prior_job_id="neon-wrongid",
+        )
+    )
+    assert wrong_confirm.status == "failed"
+    assert wrong_confirm.failure_reason == "prior_turn_uncertain"
+
+    # 3. Confirmed resume for t1 ALSO times out -> new blocker becomes t2 (so confirming t1 again fails!).
+    t2 = await mgr.run(
+        mgr.prepare_request(
+            backend="neon",
+            model="neon-medium",
+            prompt="T2_TIMEOUT3",
+            resume_from="conv-prune-safe",
+            confirm_prior_job_id=t1.job_id,
+        )
+    )
+    assert t2.status == "timed_out"
+    assert t2.provider_state == "possibly_running"
+
+    stale_confirm = await mgr.run(
+        mgr.prepare_request(
+            backend="neon",
+            model="neon-medium",
+            prompt="STALE_CONFIRM",
+            resume_from="conv-prune-safe",
+            confirm_prior_job_id=t1.job_id,
+        )
+    )
+    assert stale_confirm.status == "failed"
+    assert stale_confirm.failure_reason == "prior_turn_uncertain"
+    assert t2.job_id in (stale_confirm.error or "")
+
+    # 4. Exact confirmation for t2 succeeds and clears the durable safety block!
+    t3 = await mgr.run(
+        mgr.prepare_request(
+            backend="neon",
+            model="neon-medium",
+            prompt="T3_OK",
+            resume_from="conv-prune-safe",
+            confirm_prior_job_id=t2.job_id,
+        )
+    )
+    assert t3.status == "completed"
+    assert "OK:T3_OK" in t3.response
+    assert mgr.store.get_session_safety_block("neon", "conv-prune-safe") is None
+    await mgr.shutdown()
+
+
+async def test_runtime_model_retry_never_crosses_quota_pool_when_agy_rejects_advertised_model(
+    tmp_path: Path,
+) -> None:
+    """Audit Medium #3: when agy rejects an advertised Claude model at runtime and refresh finds no
+    different eligible model in agy_claude_gpt, NeonRunner returns model_unavailable instead of
+    dropping --model and spending Gemini quota."""
+    invocations_log = tmp_path / "agy_invocations.log"
+    fake_agy = tmp_path / "fake_agy_retry_pool.py"
+    fake_agy.write_text(
+        f"""
+import json, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("claude-sonnet-5-5-medium\\tClaude Sonnet 5.5 (Medium)")
+    print("gemini-4-neon-high\\tGemini 4 Neon (High)")
+    sys.exit(0)
+
+model = args[args.index("--model") + 1] if "--model" in args else "DEFAULT_GEMINI"
+with Path({str(invocations_log)!r}).open("a", encoding="utf-8") as fh:
+    fh.write(model + "\\n")
+
+if model == "claude-sonnet-5-5-medium":
+    sys.stderr.write("Error: unavailable model claude-sonnet-5-5-medium\\n")
+    sys.exit(1)
+
+print(json.dumps({{
+    "conversation_id": "conv-gem-fb",
+    "status": "SUCCESS",
+    "response": f"RAN:{{model}}",
+    "num_turns": 1,
+    "usage": {{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}},
+}}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    nrunner = StubAgyRunner(settings, fake_agy)
+
+    # Default (allow_cross_pool_fallback=False): MUST NOT drop --model to DEFAULT_GEMINI!
+    res = await nrunner.run(
+        RunRequest(
+            backend="neon",
+            model="claude-sonnet-medium",
+            prompt="hello",
+            cwd=str(tmp_path),
+            allow_cross_pool_fallback=False,
+        )
+    )
+    assert res.status == "failed"
+    assert res.failure_reason == "model_unavailable"
+    calls = invocations_log.read_text(encoding="utf-8").strip().splitlines()
+    assert calls == ["claude-sonnet-5-5-medium"], f"Unexpected cross-pool retry calls: {calls}"
+
+    # Opt-in (allow_cross_pool_fallback=True): allowed to retry without --model.
+    res_opt = await nrunner.run(
+        RunRequest(
+            backend="neon",
+            model="claude-sonnet-medium",
+            prompt="hello",
+            cwd=str(tmp_path),
+            allow_cross_pool_fallback=True,
+        )
+    )
+    assert res_opt.status == "completed"
+    assert "RAN:DEFAULT_GEMINI" in res_opt.response
+    assert res_opt.model_notice is not None

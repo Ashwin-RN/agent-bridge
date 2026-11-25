@@ -89,9 +89,13 @@ class ParallelTaskSpec(BaseModel):
     confirm_prior_stopped: bool = Field(
         default=False,
         description=(
-            "Set True only after confirming a prior timed-out/unknown turn on the same session "
-            "has finished before resuming."
+            "Set True only after confirming the current blocking prior turn on the same session "
+            "has finished before resuming (bound to the current blocking job_id at request time)."
         ),
+    )
+    confirm_prior_job_id: str | None = Field(
+        default=None,
+        description="Explicit prior blocking job_id confirmed as stopped before resuming.",
     )
     allow_cross_pool_fallback: bool = Field(
         default=False,
@@ -186,6 +190,7 @@ def create_server(
         label: str | None = None,
         parent_run: str | None = None,
         confirm_prior_stopped: bool = False,
+        confirm_prior_job_id: str | None = None,
         allow_cross_pool_fallback: bool = False,
     ) -> dict[str, Any]:
         """Run a Neon (`agy`) or Codex (`codex`) subagent synchronously and return its response.
@@ -195,8 +200,8 @@ def create_server(
           running, returns the live `job_id` so you can poll via `check_jobs` without stopping the job.
         - `effort`: optional reasoning effort override (`low`, `medium`, `high`, `xhigh`).
         - `resume_from`: prior `job_id` or `session_id` to continue (turns on the same session serialize).
-        - `confirm_prior_stopped`: required (`True`) to resume a session whose previous turn ended with
-          `provider_state='possibly_running'` or `'unknown'`.
+        - `confirm_prior_job_id` / `confirm_prior_stopped`: confirm the specific prior blocking turn
+          has stopped before resuming a session whose prior turn ended `possibly_running` / `unknown`.
         - `allow_cross_pool_fallback`: opt in (`True`) to allow falling back across Antigravity quota pools.
         """
         req = job_manager.prepare_request(
@@ -213,6 +218,7 @@ def create_server(
             label=label,
             parent_run=parent_run,
             confirm_prior_stopped=confirm_prior_stopped,
+            confirm_prior_job_id=confirm_prior_job_id,
             allow_cross_pool_fallback=allow_cross_pool_fallback,
         )
         record = await job_manager.run(req, wait_seconds=wait_seconds)
@@ -241,6 +247,7 @@ def create_server(
         label: str | None = None,
         parent_run: str | None = None,
         confirm_prior_stopped: bool = False,
+        confirm_prior_job_id: str | None = None,
         allow_cross_pool_fallback: bool = False,
     ) -> dict[str, Any]:
         """Launch a Neon or Codex subagent in the background and immediately return its `job_id`.
@@ -261,6 +268,7 @@ def create_server(
             label=label,
             parent_run=parent_run,
             confirm_prior_stopped=confirm_prior_stopped,
+            confirm_prior_job_id=confirm_prior_job_id,
             allow_cross_pool_fallback=allow_cross_pool_fallback,
         )
         record = job_manager.start(req)
@@ -321,6 +329,7 @@ def create_server(
                 label=spec.label,
                 parent_run=parent_run,
                 confirm_prior_stopped=spec.confirm_prior_stopped,
+                confirm_prior_job_id=spec.confirm_prior_job_id,
                 allow_cross_pool_fallback=spec.allow_cross_pool_fallback,
             )
             for spec in tasks
