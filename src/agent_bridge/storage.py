@@ -280,14 +280,21 @@ def _insert_usage_event_cur(cur: sqlite3.Cursor, record: JobRecord) -> None:
 
 
 def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> bool:
-    """Mark one dead-owner job failed, record usage, release its session claim, and invalidate watermarks."""
+    """Mark one dead-owner job failed, record usage, release its session claim, and invalidate watermarks only if launched."""
     rec = _row_to_job(row)
+    was_queued_never_started = (
+        (not rec.provider_invoked)
+        and (rec.started_at is None)
+        and (str(row["status"]) == "queued")
+    )
     rec.status = "failed"
     rec.failure_reason = "owner_exited"
-    rec.provider_state = "unknown"
+    rec.provider_state = "stopped" if was_queued_never_started else "unknown"
     rec.error = f"Owning bridge process ({rec.owner_id}) exited before job completed."
     rec.retry_guidance = (
-        "Verify whether any provider work or file edits landed before retrying; "
+        "Owning bridge process exited while this job was still queued (never launched); safe to retry."
+        if was_queued_never_started
+        else "Verify whether any provider work or file edits landed before retrying; "
         "for edit tasks inspect git status/diff first."
     )
     rec.finished_at = now
@@ -323,7 +330,8 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
     cur.execute("DELETE FROM session_claims WHERE job_id = ?", (rec.job_id,))
     if changed:
         _insert_usage_event_cur(cur, rec)
-        if rec.backend == "neon" and rec.session_id:
+        # Only invalidate Antigravity's usage checkpoint when the recovered job had actually invoked the provider!
+        if rec.provider_invoked and rec.backend == "neon" and rec.session_id:
             cur.execute(
                 "DELETE FROM session_usage_watermarks WHERE backend = ? AND session_id = ?",
                 (rec.backend, rec.session_id),
@@ -805,11 +813,15 @@ class BridgeStore:
         owner_id: str,
         *,
         is_pid_alive_fn: Callable[[int], bool],
-    ) -> tuple[bool, str | None]:
+        confirm_prior_stopped: bool = False,
+    ) -> tuple[Literal["claimed", "busy", "blocked"], str | None, str | None]:
         """Atomically claim `(backend, session_id)` for `job_id`.
 
-        Returns `(True, None)` if claimed by `job_id`, or `(False, holder_job_id)` if another
-        live job currently holds the session turn. Never deadlocks queued siblings.
+        Returns:
+        - `("claimed", None, None)` if claimed by `job_id`
+        - `("busy", holder_job_id, None)` if another live job currently holds the turn
+        - `("blocked", prior_job_id, prior_provider_state)` if the latest executed turn ended with
+          uncertain provider state (`possibly_running` or `unknown`) and `confirm_prior_stopped` is False.
         """
         now = time.time()
         with self._tx(write=True) as cur:
@@ -824,7 +836,7 @@ class BridgeStore:
             if claim is not None:
                 holder_id = str(claim["job_id"])
                 if holder_id == job_id:
-                    return True, None
+                    return "claimed", None, None
 
                 holder_row = cur.execute(
                     """
@@ -851,8 +863,8 @@ class BridgeStore:
                         )
                     )
                     if holder_alive:
-                        return False, holder_id
-                    # Dead owner held the claim: recover its job atomically and take over.
+                        return "busy", holder_id, None
+                    # Dead owner held the claim: recover its job atomically and continue.
                     _recover_job_row_cur(cur, holder_row, now)
                     if holder_row["owner_pid"] is not None and holder_row["owner_exited_at"] is None:
                         cur.execute(
@@ -891,13 +903,34 @@ class BridgeStore:
                         """,
                         (backend, session_id, str(rrow["job_id"]), str(rrow["owner_id"]), now),
                     )
-                    return False, str(rrow["job_id"])
+                    return "busy", str(rrow["job_id"]), None
                 _recover_job_row_cur(cur, rrow, now)
                 if rrow["owner_pid"] is not None and rrow["owner_exited_at"] is None:
                     cur.execute(
                         "UPDATE owners SET exited_at = ? WHERE owner_id = ? AND exited_at IS NULL",
                         (now, str(rrow["owner_id"])),
                     )
+
+            # Safety gate: never auto-resume over a prior executed turn whose provider state is uncertain!
+            if not confirm_prior_stopped:
+                latest_exec = cur.execute(
+                    """
+                    SELECT job_id, provider_state
+                    FROM jobs
+                    WHERE backend = ? AND session_id = ?
+                      AND provider_invoked = 1
+                      AND status IN ('completed', 'failed', 'cancelled', 'timed_out')
+                      AND job_id != ?
+                    ORDER BY COALESCE(finished_at, created_at) DESC
+                    LIMIT 1
+                    """,
+                    (backend, session_id, job_id),
+                ).fetchone()
+                if latest_exec is not None and str(latest_exec["provider_state"] or "") in {
+                    "possibly_running",
+                    "unknown",
+                }:
+                    return "blocked", str(latest_exec["job_id"]), str(latest_exec["provider_state"])
 
             cur.execute(
                 """
@@ -911,7 +944,7 @@ class BridgeStore:
                 "UPDATE owners SET last_heartbeat = ? WHERE owner_id = ?",
                 (now, owner_id),
             )
-            return True, None
+            return "claimed", None, None
 
     def release_session_claims(self, job_id: str) -> None:
         with self._tx(write=True) as cur:

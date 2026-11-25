@@ -49,6 +49,8 @@ class RunRequest:
     review_base: str | None = None
     review_commit: str | None = None
     job_id: str | None = None
+    confirm_prior_stopped: bool = False
+    allow_cross_pool_fallback: bool = False
 
 
 @dataclass(slots=True)

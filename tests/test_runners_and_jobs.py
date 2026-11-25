@@ -1355,3 +1355,351 @@ elif prompt == "E3":
     assert cached_hit["codex"]["cached"] is True
 
     await mgr.shutdown()
+
+
+async def test_posix_process_group_escalation_when_grandchild_survives_sigterm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit High #1: on POSIX, if leader exits on SIGTERM but a grandchild in pgid survives,
+    terminate() escalates to SIGKILL and only reports stopped once pgid is gone."""
+    import signal
+
+    from agent_bridge import process_control as pc
+
+    sigterm = signal.SIGTERM
+    sigkill = getattr(signal, "SIGKILL", 9)
+
+    monkeypatch.setattr(pc.sys, "platform", "linux")
+    monkeypatch.setattr(pc.ManagedProcess, "_POSIX_GRACE_SECONDS", 0.08)
+    monkeypatch.setattr(pc.ManagedProcess, "_POSIX_KILL_WAIT_SECONDS", 0.1)
+
+    class FakeProc:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.returncode: int | None = None
+
+        async def wait(self) -> int:
+            while self.returncode is None:
+                await asyncio.sleep(0.01)
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    # Case A: Leader dies on SIGTERM, grandchild ignores SIGTERM and dies on SIGKILL -> verified True!
+    state = {"grandchild_alive": True, "signals": []}
+    proc_a = FakeProc(pid=4242)
+
+    def fake_killpg_a(pgid: int, sig: int) -> None:
+        assert pgid == 4242
+        if sig == 0:
+            if state["grandchild_alive"] or proc_a.returncode is None:
+                return
+            raise ProcessLookupError()
+        state["signals"].append(sig)
+        if sig == sigterm:
+            proc_a.returncode = -15  # Leader exits immediately, grandchild stays alive!
+        elif sig == sigkill:
+            state["grandchild_alive"] = False
+
+    monkeypatch.setattr(pc.os, "killpg", fake_killpg_a, raising=False)
+    mp_a = pc.ManagedProcess(proc_a)  # type: ignore[arg-type]
+    stopped_a = await mp_a.terminate()
+    assert stopped_a is True
+    assert state["signals"] == [sigterm, sigkill]
+    assert mp_a.is_alive() is False
+
+    # Case B: Grandchild survives even SIGKILL -> terminate() MUST return False (never lie 'stopped')!
+    proc_b = FakeProc(pid=5353)
+    signals_b: list[int] = []
+
+    def fake_killpg_b(pgid: int, sig: int) -> None:
+        assert pgid == 5353
+        if sig == 0:
+            return  # Grandchild still alive!
+        signals_b.append(sig)
+        if sig == sigterm:
+            proc_b.returncode = -15
+
+    monkeypatch.setattr(pc.os, "killpg", fake_killpg_b, raising=False)
+    mp_b = pc.ManagedProcess(proc_b)  # type: ignore[arg-type]
+    stopped_b = await mp_b.terminate()
+    assert stopped_b is False
+    assert signals_b == [sigterm, sigkill]
+    assert mp_b.is_alive() is True
+
+
+async def test_uncertain_prior_turn_blocks_automatic_resume_until_confirmed(tmp_path: Path) -> None:
+    """Audit High #2: when Turn 1 ends with provider_state=possibly_running, a queued follow-up in
+    another window is blocked with `prior_turn_uncertain` until `confirm_prior_stopped=True`."""
+    calls_log = tmp_path / "agy_calls.log"
+    fake_agy = tmp_path / "fake_agy_uncertain.py"
+    fake_agy.write_text(
+        f"""
+import json, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-medium\\tGemini 4 Neon (Medium)")
+    sys.exit(0)
+
+prompt = [a for a in args if a.startswith("--print=")][0][len("--print="):]
+with Path({str(calls_log)!r}).open("a", encoding="utf-8") as fh:
+    fh.write(prompt + "\\n")
+
+cid = "conv-uncertain-1"
+print(json.dumps({{"event": "init", "conversation_id": cid, "init": {{"model": "gemini-4-neon-medium"}}}}), flush=True)
+if prompt == "T1_TIMEOUT3":
+    time.sleep(0.45)
+    sys.stderr.write("print timeout elapsed while turn is still in progress\\n")
+    sys.exit(3)
+print(json.dumps({{"event": "step_update", "step_update": {{"conversation_id": cid, "step_index": 1, "state": "DONE", "step_type": "agent_response", "text_delta": f"OK:{{prompt}}", "usage": {{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}}}}}}), flush=True)
+print(json.dumps({{"event": "result", "result": {{"conversation_id": cid, "status": "SUCCESS", "response": f"OK:{{prompt}}", "num_turns": 2, "usage": {{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}}}}}}), flush=True)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _make_settings(tmp_path)
+    alive_pids = {6001, 6002}
+    is_alive = lambda pid: pid in alive_pids  # noqa: E731
+
+    mgr1 = JobManager(
+        settings,
+        neon_runner=StubAgyRunner(settings, fake_agy),
+        owner_id="uwin-1",
+        pid=6001,
+        is_pid_alive_fn=is_alive,
+    )
+    mgr2 = JobManager(
+        settings,
+        neon_runner=StubAgyRunner(settings, fake_agy),
+        owner_id="uwin-2",
+        pid=6002,
+        is_pid_alive_fn=is_alive,
+    )
+
+    j1 = mgr1.start(mgr1.prepare_request(backend="neon", model="neon-medium", prompt="T1_TIMEOUT3"))
+    dl = time.monotonic() + 5.0
+    while time.monotonic() < dl and not mgr1.get(j1.job_id).session_id:
+        await asyncio.sleep(0.03)
+    assert mgr1.get(j1.job_id).session_id == "conv-uncertain-1"
+
+    # Window 2 queues a follow-up while Turn 1 is still running!
+    j2 = mgr2.start(
+        mgr2.prepare_request(backend="neon", model="neon-medium", prompt="T2_BLOCKED", resume_from=j1.job_id)
+    )
+    r1 = (await mgr1.wait_for([j1.job_id], wait_seconds=10))[0]
+    r2 = (await mgr2.wait_for([j2.job_id], wait_seconds=10))[0]
+
+    assert r1.status == "timed_out"
+    assert r1.provider_state == "possibly_running"
+    assert r2.status == "failed"
+    assert r2.failure_reason == "prior_turn_uncertain"
+    assert r2.provider_state == "stopped"
+    assert r2.provider_invoked is False
+    assert "confirm_prior_stopped=True" in (r2.retry_guidance or "")
+    # Turn 2 MUST NOT have invoked agy!
+    assert calls_log.read_text(encoding="utf-8").strip().splitlines() == ["T1_TIMEOUT3"]
+
+    # Explicit confirmation unblocks the session cleanly!
+    r3 = await mgr2.run(
+        mgr2.prepare_request(
+            backend="neon",
+            model="neon-medium",
+            prompt="T3_CONFIRMED",
+            resume_from=j1.job_id,
+            confirm_prior_stopped=True,
+        )
+    )
+    assert r3.status == "completed"
+    assert "OK:T3_CONFIRMED" in r3.response
+
+    # Subsequent turn without confirm_prior_stopped now succeeds because T3 completed cleanly!
+    r4 = await mgr2.run(
+        mgr2.prepare_request(backend="neon", model="neon-medium", prompt="T4_NORMAL", resume_from=r3.job_id)
+    )
+    assert r4.status == "completed"
+
+    await mgr1.shutdown()
+    await mgr2.shutdown()
+
+
+async def test_worktree_probes_obey_deadline_and_dead_owner_queued_recovery_keeps_checkpoint_and_pool_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit Medium #3, #4, #5: worktree metadata probes strictly share remaining deadline, dead-owner
+    recovery preserves Antigravity checkpoints for unlaunched queued jobs, and NeonRunner never spawns
+    agy on an unavailable quota pool."""
+    from agent_bridge import runners as runners_mod
+    from agent_bridge.models import JobRecord
+
+    # #3a: Existing worktree reuse probes recalculate remaining deadline across git commands!
+    wt_dir = tmp_path / "existing_wt"
+    wt_dir.mkdir()
+    git_calls = 0
+
+    async def slow_git(args: list[str], *, cwd: str, timeout_seconds: float = 15.0):
+        nonlocal git_calls
+        git_calls += 1
+        await asyncio.sleep(min(0.25, timeout_seconds))
+        raise asyncio.TimeoutError("simulated slow git")
+
+    monkeypatch.setattr(runners_mod, "_run_git", slow_git)
+    t0 = time.monotonic()
+    info = await runners_mod.prepare_codex_worktree(
+        job_id="codex-reuse-dl",
+        cwd=str(wt_dir),
+        state_dir=tmp_path / "state",
+        existing_worktree_path=str(wt_dir),
+        existing_worktree_branch="agent-bridge/persisted",
+        existing_worktree_commit="abc1234",
+        deadline=t0 + 0.18,
+    )
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.35, f"worktree probes overran 0.18s deadline: took {elapsed:.2f}s"
+    assert git_calls == 1  # Stopped after first probe exhausted deadline (didn't run 3x)!
+    assert info["worktree_path"] == str(wt_dir.resolve())
+    assert info["worktree_branch"] == "agent-bridge/persisted"
+    assert info["worktree_commit"] == "abc1234"
+
+    # #3b: Post-run inspection in CodexRunner is skipped when deadline already expired!
+    inspect_called = False
+
+    async def fail_if_called(*args, **kwargs):
+        nonlocal inspect_called
+        inspect_called = True
+        return None, None, None
+
+    monkeypatch.setattr(runners_mod, "_inspect_git_checkout", fail_if_called)
+    slow_codex = tmp_path / "slow_codex_post.py"
+    slow_codex.write_text("import sys, time; _ = sys.stdin.read(); time.sleep(5)\n", encoding="utf-8")
+    settings = _make_settings(tmp_path)
+    crunner = StubCodexRunner(settings, slow_codex)
+    req_wt = RunRequest(
+        backend="codex",
+        prompt="timeout",
+        cwd=str(wt_dir),
+        mode="edit",
+        worktree=True,
+        worktree_path=str(wt_dir),
+        worktree_branch="agent-bridge/persisted",
+        worktree_commit="abc1234",
+        timeout_seconds=10,
+    )
+    res_to = await crunner.run(req_wt, deadline=time.monotonic() + 0.4)
+    assert res_to.status == "timed_out"
+    assert inspect_called is False
+    assert res_to.worktree_path == str(wt_dir)
+    assert res_to.worktree_branch == "agent-bridge/persisted"
+
+    # #4: Dead-owner recovery preserves Antigravity watermark for a queued (provider_invoked=False) job!
+    mgr = JobManager(
+        settings,
+        owner_id="live-rec",
+        pid=7001,
+        is_pid_alive_fn=lambda pid: pid == 7001,
+    )
+    done_t1 = JobRecord(
+        job_id="neon-t1-done",
+        owner_id="live-rec",
+        backend="neon",
+        cwd=str(tmp_path),
+        mode="read_only",
+        requested_model="neon-medium",
+        model="gemini-4-neon-medium",
+        prompt_preview="t1",
+        session_id="conv-rec-wm",
+        status="completed",
+        started_at=time.time() - 5,
+        finished_at=time.time() - 4,
+        duration_seconds=1.0,
+        usage={"input_tokens": 90, "output_tokens": 10, "total_tokens": 100},
+        usage_status="exact",
+        provider_invoked=True,
+    )
+    mgr.store.insert_job(done_t1)
+    mgr.store.finalize_job(
+        done_t1,
+        watermark_cumulative={"input_tokens": 90, "output_tokens": 10, "total_tokens": 100},
+        watermark_turns=1,
+        touched_provider=True,
+    )
+    assert mgr.store.get_session_watermark("neon", "conv-rec-wm") is not None
+
+    # Dead owner left a QUEUED follow-up that never invoked the provider.
+    mgr.store.register_owner("dead-queued-win", 9991)
+    queued_orphan = JobRecord(
+        job_id="neon-q-orphan",
+        owner_id="dead-queued-win",
+        backend="neon",
+        cwd=str(tmp_path),
+        mode="read_only",
+        requested_model="neon-medium",
+        model="gemini-4-neon-medium",
+        prompt_preview="queued orphan",
+        session_id="conv-rec-wm",
+        status="queued",
+        started_at=None,
+        provider_invoked=False,
+    )
+    mgr.store.insert_job(queued_orphan)
+    recovered = mgr.store.recover_dead_owner_jobs("live-rec", is_pid_alive_fn=lambda pid: pid == 7001)
+    assert "neon-q-orphan" in recovered
+    rec_q = mgr.get("neon-q-orphan")
+    assert rec_q.status == "failed"
+    assert rec_q.provider_state == "stopped"
+    # Watermark MUST still be preserved!
+    assert mgr.store.get_session_watermark("neon", "conv-rec-wm") is not None
+
+    # Contrast: dead owner with provider_invoked=True DOES invalidate the watermark!
+    mgr.store.register_owner("dead-run-win", 9992)
+    running_orphan = JobRecord(
+        job_id="neon-r-orphan",
+        owner_id="dead-run-win",
+        backend="neon",
+        cwd=str(tmp_path),
+        mode="read_only",
+        requested_model="neon-medium",
+        model="gemini-4-neon-medium",
+        prompt_preview="running orphan",
+        session_id="conv-rec-wm",
+        status="running",
+        started_at=time.time() - 2,
+        provider_invoked=True,
+    )
+    mgr.store.insert_job(running_orphan)
+    mgr.store.recover_dead_owner_jobs("live-rec", is_pid_alive_fn=lambda pid: pid == 7001)
+    assert mgr.get("neon-r-orphan").provider_state == "unknown"
+    assert mgr.store.get_session_watermark("neon", "conv-rec-wm") is None
+
+    # #5: NeonRunner fails cleanly without spawning agy when requested Claude pool is missing!
+    spawn_marker = tmp_path / "should_not_spawn.txt"
+    gem_only_agy = tmp_path / "gem_only_agy.py"
+    gem_only_agy.write_text(
+        f"""
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-4-neon-high\\tGemini 4 Neon (High)")
+    sys.exit(0)
+Path({str(spawn_marker)!r}).write_text("SPENT_GEMINI", encoding="utf-8")
+sys.exit(0)
+""".strip(),
+        encoding="utf-8",
+    )
+    nrunner = StubAgyRunner(settings, gem_only_agy)
+    res_pool = await nrunner.run(
+        RunRequest(backend="neon", model="claude-sonnet-medium", prompt="hi", cwd=str(tmp_path))
+    )
+    assert res_pool.status == "failed"
+    assert res_pool.failure_reason == "model_unavailable"
+    assert res_pool.provider_invoked is False
+    assert not spawn_marker.exists(), "agy should NEVER have been spawned on wrong quota pool!"
+    await mgr.shutdown()

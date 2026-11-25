@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_bridge.model_resolver import (
+    ModelPoolUnavailableError,
     NeonModelCatalog,
     is_model_unavailable_error,
     is_newer_codex_model_in_same_family,
@@ -239,3 +240,24 @@ def test_codex_same_family_version_comparison() -> None:
     assert is_newer_codex_model_in_same_family("gpt-6.2-sol", "gpt-6.2-sol") is False
     assert is_newer_codex_model_in_same_family("gpt-6.1-sol", "gpt-6.2-sol") is False
     assert is_newer_codex_model_in_same_family("o4-mini", "gpt-6.2-sol") is False
+
+
+async def test_explicit_claude_request_refuses_silent_gemini_pool_fallback(tmp_path: Path) -> None:
+    """Audit Medium #5: explicit agy_claude_gpt request MUST NOT silently fall back to agy_gemini."""
+    async def fetch_gemini_only() -> list[dict[str, str]]:
+        return list(SAMPLE_CATALOG_V4)
+
+    catalog = NeonModelCatalog(fetcher=fetch_gemini_only, cache_path=tmp_path / "gem_only.json")
+
+    with pytest.raises(ModelPoolUnavailableError) as exc_info:
+        await catalog.resolve("claude-sonnet-medium")
+    assert exc_info.value.requested_pool == "agy_claude_gpt"
+    assert "agy_gemini" in exc_info.value.available_pools
+
+    with pytest.raises(ModelPoolUnavailableError):
+        await catalog.resolve("gpt-oss")
+
+    # Explicit opt-in allows cross-pool fallback with disclosure notice.
+    opted_in = await catalog.resolve("claude-sonnet-medium", allow_cross_pool_fallback=True)
+    assert opted_in.resolved == "gemini-4-neon-medium"
+    assert opted_in.notice is not None

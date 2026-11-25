@@ -87,6 +87,27 @@ def is_newer_codex_model_in_same_family(candidate: str | None, baseline: str | N
     return p_cand[0] == p_base[0] and p_cand[1] > p_base[1]
 
 
+class ModelPoolUnavailableError(ValueError):
+    """Raised when an explicitly requested model's quota pool has no matching live model."""
+
+    def __init__(
+        self,
+        *,
+        requested: str,
+        requested_pool: str,
+        available_pools: list[str],
+    ) -> None:
+        self.requested = requested
+        self.requested_pool = requested_pool
+        self.available_pools = available_pools
+        avail_text = ", ".join(available_pools) if available_pools else "none"
+        super().__init__(
+            f"No live agy model in quota pool {requested_pool!r} matched {requested!r} "
+            f"(available pools: {avail_text}). Refusing cross-pool fallback to avoid spending "
+            "a different quota pool; pass allow_cross_pool_fallback=True to opt in."
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedModel:
     model_id: str
@@ -216,12 +237,14 @@ def _select_from_catalog(
     catalog: list[dict[str, str]],
     *,
     effort_override: str | None = None,
+    allow_cross_pool_fallback: bool = False,
 ) -> ResolvedModel | None:
     """Resolve `requested` against a non-empty `agy models` catalog.
 
-    Preserves both the requested provider/pool (`gemini`, `claude`, `gpt`) and effort tier by default,
-    and always attaches a `notice` when substituting a tier, upgrading a retired versioned ID,
-    or falling back to another family.
+    Preserves both the requested quota pool (`agy_gemini` vs `agy_claude_gpt`) and effort tier by
+    default. Refuses silent cross-pool fallback unless `allow_cross_pool_fallback=True`, and always
+    attaches a `notice` when substituting a tier, upgrading a retired versioned ID, or falling back
+    to another family.
     """
     if not catalog:
         return None
@@ -255,12 +278,34 @@ def _select_from_catalog(
         if want_orchestrator or not m.is_orchestrator
     ] or parsed_catalog
 
-    provider_pool = (
-        [m for m in pool if m.provider == desired_provider]
-        if desired_provider
-        else pool
+    requested_quota_pool = (
+        "agy_claude_gpt"
+        if desired_provider in {"claude", "gpt"}
+        else classify_quota_pool("neon", req_clean)
     )
-    active_pool = provider_pool or pool
+    same_quota_pool = [
+        m for m in pool if classify_quota_pool("neon", m.model_id) == requested_quota_pool
+    ]
+
+    if (
+        not same_quota_pool
+        and not allow_cross_pool_fallback
+        and req_lower not in DEFAULT_INTENT_TOKENS
+    ):
+        available_pools = sorted({classify_quota_pool("neon", m.model_id) for m in pool})
+        raise ModelPoolUnavailableError(
+            requested=req_clean,
+            requested_pool=requested_quota_pool,
+            available_pools=available_pools,
+        )
+
+    scoped_pool = same_quota_pool or pool
+    provider_pool = (
+        [m for m in scoped_pool if m.provider == desired_provider]
+        if desired_provider
+        else scoped_pool
+    )
+    active_pool = provider_pool or scoped_pool
 
     family_matches = [m for m in active_pool if family and m.family == family]
     if not family_matches and family:
@@ -273,9 +318,12 @@ def _select_from_catalog(
     candidates = family_matches
     if not candidates:
         if provider_pool:
-            # Stay inside requested provider (e.g., claude or gpt) before ever falling back cross-provider!
+            # Stay inside requested provider (e.g., claude or gpt) before ever falling back across families.
             candidates = provider_pool
             used_family_fallback = req_lower not in {"claude", "gpt", "agy-claude", "agy-gpt"}
+        elif same_quota_pool:
+            candidates = same_quota_pool
+            used_family_fallback = True
         else:
             used_family_fallback = True
             gemini_pool = [m for m in pool if m.provider == "gemini"]
@@ -435,26 +483,47 @@ class NeonModelCatalog:
         effort_override: str | None = None,
         force_refresh: bool = False,
         timeout_seconds: float | None = None,
+        allow_cross_pool_fallback: bool = False,
     ) -> ResolvedModel:
         req = (requested or "").strip()
-        effective = req if req and req.lower() not in DEFAULT_INTENT_TOKENS else default_intent
+        is_explicit_request = bool(req and req.lower() not in DEFAULT_INTENT_TOKENS)
+        effective = req if is_explicit_request else default_intent
 
         catalog = await self.get_models(refresh=force_refresh, timeout_seconds=timeout_seconds)
         if not catalog:
-            _, _, _, _, is_versioned = _parse_intent(effective, effort_override=effort_override)
+            desired_prov, _, _, _, is_versioned = _parse_intent(effective, effort_override=effort_override)
             if is_versioned and not effort_override:
                 return ResolvedModel(requested=requested or effective, resolved=effective)
+            if (
+                is_explicit_request
+                and not allow_cross_pool_fallback
+                and desired_prov in {"claude", "gpt"}
+            ):
+                raise ModelPoolUnavailableError(
+                    requested=effective,
+                    requested_pool="agy_claude_gpt",
+                    available_pools=[],
+                )
             return ResolvedModel(
                 requested=requested or effective,
                 resolved=None,
                 notice="Could not fetch live agy model list; letting agy choose its default model.",
             )
 
-        selected = _select_from_catalog(effective, catalog, effort_override=effort_override)
+        pool_err: ModelPoolUnavailableError | None = None
+        selected: ResolvedModel | None = None
+        try:
+            selected = _select_from_catalog(
+                effective,
+                catalog,
+                effort_override=effort_override,
+                allow_cross_pool_fallback=allow_cross_pool_fallback,
+            )
+        except ModelPoolUnavailableError as exc:
+            pool_err = exc
 
         if (
-            selected is not None
-            and selected.notice is not None
+            (pool_err is not None or (selected is not None and selected.notice is not None))
             and not force_refresh
             and (time.time() - self._fetched_at) > 5.0
         ):
@@ -463,11 +532,16 @@ class NeonModelCatalog:
                 timeout_seconds=timeout_seconds,
             )
             if fresh_catalog:
+                pool_err = None
                 selected = _select_from_catalog(
                     effective,
                     fresh_catalog,
                     effort_override=effort_override,
+                    allow_cross_pool_fallback=allow_cross_pool_fallback,
                 )
+
+        if pool_err is not None:
+            raise pool_err
 
         if selected is None:
             return ResolvedModel(
@@ -509,7 +583,10 @@ class NeonModelCatalog:
         )
         mapping: dict[str, str] = {}
         for alias in shortcuts:
-            res = _select_from_catalog(alias, self._models)
+            try:
+                res = _select_from_catalog(alias, self._models)
+            except ModelPoolUnavailableError:
+                continue
             if res and res.resolved and res.notice is None:
                 mapping[alias] = res.resolved
         return mapping

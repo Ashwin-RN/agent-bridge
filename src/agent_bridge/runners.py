@@ -20,6 +20,7 @@ from typing import Any
 from agent_bridge.config import Settings, read_codex_local_defaults
 from agent_bridge.model_resolver import (
     DEFAULT_INTENT_TOKENS,
+    ModelPoolUnavailableError,
     NeonModelCatalog,
     is_model_unavailable_error,
     is_newer_codex_model_in_same_family,
@@ -479,7 +480,7 @@ async def _run_git(
         managed = ManagedProcess(proc)
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(),
-            timeout=max(0.1, timeout_seconds),
+            timeout=max(0.01, timeout_seconds),
         )
         managed.close()
         return (
@@ -497,36 +498,60 @@ async def _inspect_git_checkout(
     checkout_dir: str,
     *,
     timeout_seconds: float = 5.0,
+    deadline: float | None = None,
+    include_common_dir: bool = True,
 ) -> tuple[str | None, str | None, str | None]:
-    """Return `(branch, head_commit, git_common_dir)` for a git checkout or worktree."""
+    """Return `(branch, head_commit, git_common_dir)` while strictly obeying remaining `deadline`."""
+    inspect_deadline = time.monotonic() + max(0.0, timeout_seconds)
+    if deadline is not None:
+        inspect_deadline = min(inspect_deadline, deadline)
+
+    def _rem() -> float:
+        return inspect_deadline - time.monotonic()
+
     branch: str | None = None
     commit: str | None = None
     common_dir: str | None = None
+
+    rem = _rem()
+    if rem <= 0.02:
+        return branch, commit, common_dir
     try:
         rc_c, out_c, _ = await _run_git(
             ["rev-parse", "HEAD"],
             cwd=checkout_dir,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=rem,
         )
         if rc_c == 0 and out_c:
             commit = out_c.splitlines()[0].strip()
     except Exception:
         pass
+
+    rem = _rem()
+    if rem <= 0.02:
+        return branch, commit, common_dir
     try:
         rc_b, out_b, _ = await _run_git(
             ["branch", "--show-current"],
             cwd=checkout_dir,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=rem,
         )
         if rc_b == 0 and out_b:
             branch = out_b.splitlines()[0].strip() or None
     except Exception:
         pass
+
+    if not include_common_dir:
+        return branch, commit, common_dir
+
+    rem = _rem()
+    if rem <= 0.02:
+        return branch, commit, common_dir
     try:
         rc_g, out_g, _ = await _run_git(
             ["rev-parse", "--git-common-dir"],
             cwd=checkout_dir,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=rem,
         )
         if rc_g == 0 and out_g:
             raw_g = out_g.splitlines()[0].strip()
@@ -547,14 +572,16 @@ async def prepare_codex_worktree(
     cwd: str,
     state_dir: Path,
     existing_worktree_path: str | None = None,
+    existing_worktree_branch: str | None = None,
+    existing_worktree_commit: str | None = None,
     deadline: float | None = None,
     on_worktree_planned: OnWorktreePlannedCallback | None = None,
 ) -> dict[str, str | None]:
     """Deterministically assign or reuse a per-job Git worktree BEFORE launching Codex.
 
     Assigning a dedicated worktree per `job_id` eliminates parallel worktree detection races,
-    applies `deadline` to lock acquisition, and notifies `on_worktree_planned` before invoking Git
-    so any cancellation mid-checkout still reports the checkout path left behind.
+    applies `deadline` to lock acquisition and every Git probe, and notifies `on_worktree_planned`
+    before invoking Git so any cancellation mid-checkout still reports the checkout path left behind.
     """
     def _budget(cap: float = 15.0) -> float:
         if deadline is None:
@@ -564,7 +591,7 @@ async def prepare_codex_worktree(
             raise asyncio.TimeoutError("Job deadline expired before Git worktree could be created.")
         return min(cap, rem)
 
-    # If resuming inside an existing managed worktree, reuse it deterministically.
+    # If resuming inside an existing managed worktree, reuse it deterministically without exceeding deadline.
     if existing_worktree_path and Path(existing_worktree_path).is_dir():
         wt_resolved = Path(existing_worktree_path).resolve()
         cwd_resolved = Path(cwd).resolve()
@@ -573,10 +600,23 @@ async def prepare_codex_worktree(
             effective_cwd = str(cwd_resolved)
         except ValueError:
             effective_cwd = str(wt_resolved)
-        branch, commit, common_dir = await _inspect_git_checkout(
-            str(wt_resolved),
-            timeout_seconds=_budget(5.0),
-        )
+
+        branch = existing_worktree_branch
+        commit = existing_worktree_commit
+        common_dir: str | None = None
+        if deadline is None or (deadline - time.monotonic()) > 0.05:
+            inspected_branch, inspected_commit, inspected_common = await _inspect_git_checkout(
+                str(wt_resolved),
+                timeout_seconds=5.0,
+                deadline=deadline,
+                include_common_dir=True,
+            )
+            if inspected_branch:
+                branch = inspected_branch
+            if inspected_commit:
+                commit = inspected_commit
+            if inspected_common:
+                common_dir = inspected_common
         return {
             "effective_cwd": effective_cwd,
             "worktree_path": str(wt_resolved),
@@ -1314,12 +1354,32 @@ class NeonRunner:
                 )
 
             lookup_budget = min(20.0, rem_before_lookup)
-            resolution = await self.catalog.resolve(
-                request.model,
-                default_intent=self._settings.default_neon_model,
-                effort_override=request.effort,
-                timeout_seconds=lookup_budget,
-            )
+            try:
+                resolution = await self.catalog.resolve(
+                    request.model,
+                    default_intent=self._settings.default_neon_model,
+                    effort_override=request.effort,
+                    timeout_seconds=lookup_budget,
+                    allow_cross_pool_fallback=request.allow_cross_pool_fallback,
+                )
+            except ModelPoolUnavailableError as exc:
+                return RunResult(
+                    status="failed",
+                    session_id=request.session_id,
+                    model=request.model,
+                    effort=request.effort,
+                    effective_cwd=request.cwd,
+                    duration_seconds=0.0,
+                    usage_status="missing",
+                    error=str(exc),
+                    failure_reason="model_unavailable",
+                    provider_state="stopped",
+                    retry_guidance=(
+                        "Refresh models via list_backends(refresh_models=True), select a model in an "
+                        "available quota pool, or pass allow_cross_pool_fallback=True."
+                    ),
+                    provider_invoked=False,
+                )
 
             result = await self._run_once(
                 request,
@@ -1347,13 +1407,33 @@ class NeonRunner:
                     resolution.resolved,
                 )
                 refresh_budget = min(15.0, max(0.5, overall_deadline - time.monotonic()))
-                refreshed = await self.catalog.resolve(
-                    request.model,
-                    default_intent=self._settings.default_neon_model,
-                    effort_override=request.effort,
-                    force_refresh=True,
-                    timeout_seconds=refresh_budget,
-                )
+                try:
+                    refreshed = await self.catalog.resolve(
+                        request.model,
+                        default_intent=self._settings.default_neon_model,
+                        effort_override=request.effort,
+                        force_refresh=True,
+                        timeout_seconds=refresh_budget,
+                        allow_cross_pool_fallback=request.allow_cross_pool_fallback,
+                    )
+                except ModelPoolUnavailableError as exc:
+                    return RunResult(
+                        status="failed",
+                        session_id=result.session_id or request.session_id,
+                        model=request.model,
+                        effort=request.effort,
+                        effective_cwd=request.cwd,
+                        duration_seconds=result.duration_seconds,
+                        usage_status="missing",
+                        error=str(exc),
+                        failure_reason="model_unavailable",
+                        provider_state="stopped",
+                        retry_guidance=(
+                            "Refresh models via list_backends(refresh_models=True), select a model in an "
+                            "available quota pool, or pass allow_cross_pool_fallback=True."
+                        ),
+                        provider_invoked=result.provider_invoked,
+                    )
                 retry_model = (
                     refreshed.resolved
                     if refreshed.resolved != resolution.resolved
@@ -1722,13 +1802,18 @@ class CodexRunner:
         else:
             usage_status = "missing"
 
-        # Refresh commit/branch metadata on the pre-assigned worktree if it exists.
+        # Refresh commit/branch metadata on the pre-assigned worktree ONLY if budget remains!
         effective_cwd = request.cwd
         wt_path = request.worktree_path
         wt_branch = request.worktree_branch
         wt_commit = request.worktree_commit
-        if wt_path and Path(wt_path).is_dir():
-            new_branch, new_commit, _ = await _inspect_git_checkout(wt_path, timeout_seconds=5.0)
+        if wt_path and Path(wt_path).is_dir() and not timed_out_locally and (deadline - time.monotonic()) > 0.05:
+            new_branch, new_commit, _ = await _inspect_git_checkout(
+                wt_path,
+                timeout_seconds=5.0,
+                deadline=deadline,
+                include_common_dir=False,
+            )
             if new_branch:
                 wt_branch = new_branch
             if new_commit:

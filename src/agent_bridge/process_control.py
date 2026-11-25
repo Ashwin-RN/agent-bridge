@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from ctypes import wintypes
 from typing import Any
 
@@ -108,6 +109,21 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
+def is_pgid_alive(pgid: int) -> bool:
+    """POSIX only: return True if ANY process in process group `pgid` is still alive."""
+    if pgid <= 0 or sys.platform == "win32":
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def subprocess_creation_kwargs() -> dict[str, Any]:
     if sys.platform == "win32":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
@@ -158,6 +174,9 @@ CURRENT_PROCESS_TRACKER: contextvars.ContextVar[ProcessTracker | None] = context
 
 class ManagedProcess:
     """Single-owner subprocess wrapper that guarantees descendant cleanup and verifies exit."""
+
+    _POSIX_GRACE_SECONDS: float = 2.5
+    _POSIX_KILL_WAIT_SECONDS: float = 3.0
 
     def __init__(
         self,
@@ -216,7 +235,11 @@ class ManagedProcess:
             logger.debug("Could not attach Windows Job Object to pid %s: %s", pid, exc)
 
     def is_alive(self) -> bool:
-        """Return True if the child process has not yet been confirmed exited."""
+        """Return True if the child process OR (on POSIX) any descendant in its process group is alive."""
+        if sys.platform != "win32":
+            pgid = self._pgid or self.proc.pid
+            if pgid and is_pgid_alive(pgid):
+                return True
         if self.proc.returncode is not None:
             return False
         if self.proc.pid is None:
@@ -246,9 +269,10 @@ class ManagedProcess:
                     pass
         else:
             pgid = self._pgid or self.proc.pid
+            sigkill = getattr(signal, "SIGKILL", 9)
             if pgid:
                 try:
-                    os.killpg(pgid, signal.SIGKILL)
+                    os.killpg(pgid, sigkill)
                 except ProcessLookupError:
                     pass
                 except Exception:
@@ -320,21 +344,47 @@ class ManagedProcess:
                                 self.proc.terminate()
                             except ProcessLookupError:
                                 pass
+
+                # Wait through the grace period until BOTH leader AND entire process group have exited.
+                grace_deadline = time.monotonic() + self._POSIX_GRACE_SECONDS
                 if self.proc.returncode is None:
+                    rem = max(0.0, grace_deadline - time.monotonic())
                     try:
-                        await asyncio.wait_for(self.proc.wait(), timeout=2.5)
+                        await asyncio.wait_for(self.proc.wait(), timeout=rem)
                     except asyncio.TimeoutError:
-                        if pgid:
-                            try:
-                                os.killpg(pgid, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
-                            except Exception:
-                                if self.proc.returncode is None:
-                                    try:
-                                        self.proc.kill()
-                                    except ProcessLookupError:
-                                        pass
+                        pass
+                while pgid and is_pgid_alive(pgid) and time.monotonic() < grace_deadline:
+                    await asyncio.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
+
+                # Escalate to SIGKILL if the leader OR any descendant in the process group survived SIGTERM!
+                if self.proc.returncode is None or (pgid and is_pgid_alive(pgid)):
+                    sigkill = getattr(signal, "SIGKILL", 9)
+                    if pgid:
+                        try:
+                            os.killpg(pgid, sigkill)
+                        except ProcessLookupError:
+                            pass
+                        except Exception:
+                            if self.proc.returncode is None:
+                                try:
+                                    self.proc.kill()
+                                except ProcessLookupError:
+                                    pass
+                    elif self.proc.returncode is None:
+                        try:
+                            self.proc.kill()
+                        except ProcessLookupError:
+                            pass
+
+                    kill_deadline = time.monotonic() + self._POSIX_KILL_WAIT_SECONDS
+                    if self.proc.returncode is None:
+                        rem = max(0.0, kill_deadline - time.monotonic())
+                        try:
+                            await asyncio.wait_for(self.proc.wait(), timeout=rem)
+                        except asyncio.TimeoutError:
+                            pass
+                    while pgid and is_pgid_alive(pgid) and time.monotonic() < kill_deadline:
+                        await asyncio.sleep(min(0.05, max(0.0, kill_deadline - time.monotonic())))
 
             if self.proc.returncode is None:
                 try:

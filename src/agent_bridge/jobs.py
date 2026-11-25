@@ -42,6 +42,20 @@ from agent_bridge.storage import BridgeStore, UsagePeriod
 logger = logging.getLogger("agent_bridge.jobs")
 
 
+class SessionResumeBlockedError(RuntimeError):
+    """Raised when automatic resume is blocked because the prior turn's provider state is uncertain."""
+
+    def __init__(self, *, session_id: str, prior_job_id: str, prior_provider_state: str) -> None:
+        self.session_id = session_id
+        self.prior_job_id = prior_job_id
+        self.prior_provider_state = prior_provider_state
+        super().__init__(
+            f"Automatic resume blocked on session {session_id!r}: prior turn {prior_job_id!r} "
+            f"ended with provider_state={prior_provider_state!r}. Confirm the prior turn has ended "
+            "(and inspect git diff/worktree for edits), then retry with confirm_prior_stopped=True."
+        )
+
+
 def _preview(prompt: str, max_chars: int = 120) -> str:
     flat = " ".join(prompt.split())
     if len(flat) <= max_chars:
@@ -151,6 +165,8 @@ class JobManager:
         review_scope: Literal["uncommitted", "base", "commit"] | None = None,
         review_base: str | None = None,
         review_commit: str | None = None,
+        confirm_prior_stopped: bool = False,
+        allow_cross_pool_fallback: bool = False,
     ) -> RunRequest:
         if not prompt.strip() and review_scope is None:
             raise ValueError("Prompt must be non-empty.")
@@ -235,6 +251,8 @@ class JobManager:
             review_scope=review_scope,
             review_base=review_base,
             review_commit=review_commit,
+            confirm_prior_stopped=bool(confirm_prior_stopped),
+            allow_cross_pool_fallback=bool(allow_cross_pool_fallback),
         )
 
     def start(self, request: RunRequest) -> JobRecord:
@@ -288,30 +306,39 @@ class JobManager:
         record: JobRecord,
         session_id: str,
         deadline: float,
+        *,
+        confirm_prior_stopped: bool = False,
     ) -> None:
         """Atomically claim `(record.backend, session_id)` in SQLite within `deadline`."""
         key = (record.backend, session_id)
         last_holder: str | None = None
         while True:
-            claimed, holder_job_id = self.store.try_claim_session(
+            outcome, other_job_id, prior_state = self.store.try_claim_session(
                 record.backend,
                 session_id,
                 record.job_id,
                 self.owner_id,
                 is_pid_alive_fn=self._is_pid_alive,
+                confirm_prior_stopped=confirm_prior_stopped,
             )
-            if claimed:
+            if outcome == "claimed":
                 return
+            if outcome == "blocked":
+                raise SessionResumeBlockedError(
+                    session_id=session_id,
+                    prior_job_id=other_job_id or "unknown",
+                    prior_provider_state=prior_state or "unknown",
+                )
 
             remaining = deadline - time.monotonic()
             if remaining <= 0.05:
                 raise asyncio.TimeoutError(
-                    f"Timed out waiting for active session {session_id!r} (held by {holder_job_id}) to finish."
+                    f"Timed out waiting for active session {session_id!r} (held by {other_job_id}) to finish."
                 )
 
-            if holder_job_id != last_holder:
-                last_holder = holder_job_id
-                record.last_activity = f"waiting for session turn ({holder_job_id})"
+            if other_job_id != last_holder:
+                last_holder = other_job_id
+                record.last_activity = f"waiting for session turn ({other_job_id})"
                 self.store.update_job_progress(
                     record.job_id,
                     owner_id=self.owner_id,
@@ -446,7 +473,12 @@ class JobManager:
         try:
             # 1. Atomically claim the session in SQLite (works across windows AND same window with no deadlock).
             if request.session_id:
-                await self._acquire_session_claim(record, request.session_id, deadline)
+                await self._acquire_session_claim(
+                    record,
+                    request.session_id,
+                    deadline,
+                    confirm_prior_stopped=request.confirm_prior_stopped,
+                )
                 # Prior turn has now finalized: refresh its final effective_cwd / worktree path!
                 self._refresh_resumed_context(record, request)
 
@@ -481,6 +513,8 @@ class JobManager:
                     cwd=request.cwd,
                     state_dir=self.settings.state_dir,
                     existing_worktree_path=request.worktree_path if not request.explicit_cwd else None,
+                    existing_worktree_branch=request.worktree_branch if not request.explicit_cwd else None,
+                    existing_worktree_commit=request.worktree_commit if not request.explicit_cwd else None,
                     deadline=deadline,
                     on_worktree_planned=on_worktree_planned,
                 )
@@ -543,6 +577,24 @@ class JobManager:
                 self.store.finalize_job(record, touched_provider=record.provider_invoked)
             except Exception as store_exc:
                 logger.warning("Failed to finalize cancelled job %s: %s", record.job_id, store_exc)
+            return
+        except SessionResumeBlockedError as exc:
+            record.status = "failed"
+            record.failure_reason = "prior_turn_uncertain"
+            record.provider_state = "stopped"
+            record.error = str(exc)
+            record.retry_guidance = (
+                f"Prior turn {exc.prior_job_id!r} ended with provider_state={exc.prior_provider_state!r}. "
+                "Confirm the prior turn has stopped (and inspect git status/diff for edits), "
+                "then retry with confirm_prior_stopped=True."
+            )
+            record.finished_at = time.time()
+            record.duration_seconds = 0.0
+            record.last_activity = "prior_turn_uncertain"
+            try:
+                self.store.finalize_job(record, touched_provider=False)
+            except Exception as store_exc:
+                logger.warning("Failed to finalize blocked resume job %s: %s", record.job_id, store_exc)
             return
         except asyncio.TimeoutError as exc:
             stopped = await tracker.terminate_all_and_verify()
