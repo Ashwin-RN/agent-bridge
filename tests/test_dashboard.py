@@ -92,6 +92,7 @@ def _finish(
     metrics: dict[str, Any] | None = None,
     invoked: bool = True,
     failure_reason: str | None = None,
+    provider_state: str | None = None,
     finished_at: float | None = None,
     attempts: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -107,7 +108,21 @@ def _finish(
     record.usage_status = usage_status  # type: ignore[assignment]
     record.provider_metrics = metrics
     record.failure_reason = failure_reason
+    record.provider_state = provider_state  # type: ignore[assignment]
     store.finalize_job(record, touched_provider=invoked, attempts=attempts)
+
+
+def _dump(db_path: Path) -> list[str]:
+    """Every table's schema and rows, as SQL text, read without writing."""
+    conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    try:
+        return list(conn.iterdump())
+    finally:
+        conn.close()
+
+
+def _cannot_tell(d: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {j["job_id"]: j for j in d["not_in_totals"]["cannot_tell"]["jobs"]}
 
 
 def _total(bucket: dict[str, Any]) -> int:
@@ -222,6 +237,9 @@ async def test_a_run_without_a_count_is_marked_by_whether_its_cli_started(tmp_pa
     _finish(manager, "codex-review", status="completed", tokens=None, usage_status="missing")
     _finish(manager, "codex-never", status="cancelled", tokens=None, usage_status="missing", invoked=False)
     _finish(manager, "codex-pruned", status="failed", tokens=None, usage_status="missing")
+    # No launch recorded, but the bridge could not confirm the process tree stopped.
+    _finish(manager, "codex-unconfirmed", status="cancelled", tokens=None, usage_status="missing",
+            invoked=False, provider_state="possibly_running")
     with sqlite3.connect(manager.store.db_path) as conn:
         conn.execute("DELETE FROM jobs WHERE job_id = 'codex-pruned'")
 
@@ -230,30 +248,83 @@ async def test_a_run_without_a_count_is_marked_by_whether_its_cli_started(tmp_pa
     nit = d["not_in_totals"]
     assert nit["cli_started_no_count"]["job_ids"] == ["codex-lost", "codex-review"]
     assert nit["cli_started_no_count"]["by_status"] == {"cancelled": 1, "completed": 1}
-    # A pruned job row says nothing about whether the CLI ran: never read as "nothing spent".
-    assert nit["cannot_tell_if_cli_started"]["job_ids"] == ["codex-pruned"]
+    # Neither a pruned job row nor an unconfirmed end is read as "nothing spent".
+    reasons = {job_id: entry["reason"] for job_id, entry in _cannot_tell(d).items()}
+    assert reasons == {"codex-pruned": "job_row_pruned", "codex-unconfirmed": "end_not_confirmed"}
     assert d["counted_as_nothing_spent"]["job_ids"] == ["codex-never"]
-    assert (d["totals"]["runs"], _total(d["totals"])) == (4, 0)
+    assert (d["totals"]["runs"], _total(d["totals"])) == (5, 0)
     await manager.shutdown()
 
 
-async def test_a_job_whose_window_closed_mid_run_is_not_counted_as_nothing_spent(tmp_path: Path) -> None:
-    gone_pid = 999_999
+GONE_PID = 999_999
+
+
+def _manager_with_a_closed_window(tmp_path: Path) -> JobManager:
+    """A bridge, plus a job left running by another window whose process has since gone."""
     manager = JobManager(
-        _settings(tmp_path), owner_id=ME, pid=os.getpid(), is_pid_alive_fn=lambda pid: pid != gone_pid
+        _settings(tmp_path), owner_id=ME, pid=os.getpid(), is_pid_alive_fn=lambda pid: pid != GONE_PID
     )
-    manager.store.register_owner("owner-gone", gone_pid)
-    # Running, with no launch recorded yet: the bridge cannot know how far it got before its window closed.
+    manager.store.register_owner("owner-gone", GONE_PID)
     left = _record("codex-left", owner="owner-gone", backend="codex", model="gpt-6.2-sol", status="running")
     left.started_at = time.time() - 120
     manager.store.insert_job(left)
+    # It had finished a first attempt before the window closed.
+    manager.store.record_attempt_usage(
+        left,
+        {"status": "failed", "usage_status": "exact", "usage": _usage(300), "duration_seconds": 5.0},
+        attempt_number=1,
+    )
+    return manager
 
-    d = await manager.usage_dashboard(period="all")
+
+async def test_the_tool_writes_nothing_and_lists_a_job_whose_window_closed_under_cannot_tell(tmp_path: Path) -> None:
+    manager = _manager_with_a_closed_window(tmp_path)
+    mcp, _ = create_server(settings=manager.settings, manager=manager)
+    before = _dump(manager.store.db_path)
+
+    raw = await mcp.call_tool("usage_dashboard", {"period": "all"})
+    d = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
+
+    assert _dump(manager.store.db_path) == before
+    stored = manager.store.get_job("codex-left")
+    assert stored is not None and stored.status == "running"  # not recovered: the tool only read
+    entry = _cannot_tell(d)["codex-left"]
+    assert entry["reason"] == "window_closed" and entry["status_on_record"] == "running"
+    assert entry["tokens_recorded_for_earlier_attempts"] == 300
+    assert "closed" in d["not_in_totals"]["cannot_tell"]["reasons"]["window_closed"]
+    assert "codex-left (its window closed" in d["text"]
+    assert d["not_in_totals"]["running_or_queued"]["count"] == 0
+    assert (d["totals"]["runs"], _total(d["totals"]), d["counted_as_nothing_spent"]["count"]) == (0, 0, 0)
+    await manager.shutdown()
+
+
+async def test_get_usage_still_recovers_the_job_and_the_dashboard_reads_it_the_same_after(tmp_path: Path) -> None:
+    manager = _manager_with_a_closed_window(tmp_path)
+
+    await manager.get_usage_summary(period="all")
 
     stored = manager.store.get_job("codex-left")
-    assert stored is not None and (stored.failure_reason, stored.provider_state) == ("owner_exited", "unknown")
-    assert d["not_in_totals"]["cannot_tell_if_cli_started"]["job_ids"] == ["codex-left"]
+    assert stored is not None and (stored.status, stored.failure_reason) == ("failed", "owner_exited")
+    d = await manager.usage_dashboard(period="all")
+    assert _cannot_tell(d)["codex-left"]["reason"] == "window_closed"
     assert d["counted_as_nothing_spent"]["count"] == 0
+    await manager.shutdown()
+
+
+async def test_the_view_says_what_it_does_not_cover(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    d = await manager.usage_dashboard(period="all")
+
+    assert d["covers"] == "Covers jobs run through the bridge only."
+    assert d["not_covered"] == [
+        "the host session's own tokens",
+        "a host's own subagents",
+        "CLI runs made outside the bridge",
+    ]
+    assert (
+        "Covers jobs run through the bridge only. Not in it: the host session's own tokens, "
+        "a host's own subagents, CLI runs made outside the bridge."
+    ) in d["text"].splitlines()
     await manager.shutdown()
 
 

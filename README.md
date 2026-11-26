@@ -410,7 +410,7 @@ What the bridge has run, and optionally how much quota is left.
 
 ### usage_dashboard
 
-A readable account of everything the bridge has run in a period, across every backend, quota pool and model, read from the bridge's own records and nothing else. It is read-only, and it also answers in a bridge that runs inside a bridge job. The [usage dashboard skill](#the-usage-dashboard-skill) is the easy way to call it.
+A readable account of everything the bridge has run in a period, across every backend, quota pool and model, read from the bridge's own records and nothing else. It only reads: it writes nothing to the database. It also answers in a bridge that runs inside a bridge job. The [usage dashboard skill](#the-usage-dashboard-skill) is the easy way to call it.
 
 | Argument | Default | What it does |
 |---|---|---|
@@ -420,6 +420,7 @@ A readable account of everything the bridge has run in a period, across every ba
 What the reply holds:
 
 - `text`: the whole view as fixed-width text, ready to show as it is. It is rendered from the same figures as the rest of the reply.
+- `covers` and `not_covered`: it covers jobs run through the bridge only. Not in it: the host session's own tokens, a host's own subagents, and CLI runs made outside the bridge. The view says so in its third line.
 - `totals`: runs, their outcomes, time and tokens.
 - `this_session` and `other_sessions`: the same figures split between the calling window and every other window. The two add up to `totals`.
 - `by_backend`, `by_quota_pool`, `by_model`: each adds up to `totals`. Every backend and pool is listed, with zeros where nothing ran.
@@ -434,14 +435,15 @@ Rules the figures follow:
 
   | Entry | What it is |
   |---|---|
-  | `running_or_queued` | Jobs not finished yet, from every window, with any tokens already recorded for an earlier attempt |
+  | `running_or_queued` | Jobs not finished yet, in windows that are still open, with any tokens already recorded for an earlier attempt |
   | `partial_counts` | A count for a turn that did not finish cleanly. It is shown, but it may be short |
-  | `cli_started_no_count` | The CLI was started but left no count: cancelled, timed out, failed, window closed, or a CLI that reports none, such as Codex's built-in review |
-  | `cannot_tell_if_cli_started` | No count, and the records cannot say whether the CLI ran: the job's row has been pruned (the newest 500 are kept unless `AGENT_BRIDGE_MAX_STORED_JOBS` says otherwise), or the bridge marked the job's end as uncertain, as it does when a window closes mid-run |
+  | `cli_started_no_count` | The CLI was started but left no count: cancelled, timed out, failed, or a CLI that reports none, such as Codex's built-in review |
+  | `cannot_tell` | Runs the records cannot speak for, each with a `reason`: `window_closed` (the window that ran the job closed before it finished, whether or not a later window has marked it `owner_exited` yet), `job_row_pruned` (no count, and the job's row has been pruned; the newest 500 are kept unless `AGENT_BRIDGE_MAX_STORED_JOBS` says otherwise), or `end_not_confirmed` (no count, and the bridge could not confirm whether the CLI ran or stopped) |
   | `claude_subagents` | Claude runs that started subagents of their own. Claude Code reports the main agent's tokens only |
   | `claude_subagents_not_on_record` | Claude runs that did not record whether they started subagents: written before the bridge kept that count, or Claude Code did not report it |
   | `before_records_begin` | Set when the period reaches back before the bridge's first record. That stretch is not covered, which is not the same as zero |
 
+- A job whose row still says queued or running, but whose window has closed, is found by reading the owners table. Unlike `get_usage`, the dashboard does not mark it failed; it lists it under `cannot_tell` as `window_closed`.
 - Left out on purpose: live quota readings, which come from each CLI (`get_usage` with `include_quota` shows them), and Claude Code's cost estimate, which is not a bill and repeats earlier turns on a resume.
 
 ### list_backends

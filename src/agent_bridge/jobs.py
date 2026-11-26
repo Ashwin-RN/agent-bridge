@@ -1962,25 +1962,20 @@ class JobManager:
         since: str | None = None,
         until: str | None = None,
     ) -> dict[str, Any]:
-        """Everything the bridge has run in a period, from its records only; see `dashboard.py`."""
+        """Everything the bridge has run in a period, from its records only; see `dashboard.py`.
+
+        It reads and never writes. A job left running by a window that has closed is not recovered here,
+        as `get_usage` would: the dashboard lists it under "cannot tell" instead.
+        """
         now_ts = time.time()
         window = resolve_window(period, since, until, now_ts=now_ts)
-        try:
-            # As get_usage does: a job whose window has closed is marked failed first, not shown as running.
-            await self._db(
-                self.store.recover_dead_owner_jobs,
-                self.owner_id,
-                is_pid_alive_fn=self._is_pid_alive,
-                stale_seconds=self.settings.owner_stale_seconds,
-            )
-        except Exception:
-            pass
         records = await self._db(
             self.store.dashboard_records,
             since_ts=window.since_ts,
             until_ts=window.until_ts,
             session_owner_id=self.owner_id,
             only_session=window.only_session,
+            is_pid_alive_fn=self._is_pid_alive,
         )
         return build_dashboard(records, window=window, owner_id=self.owner_id, now_ts=now_ts)
 

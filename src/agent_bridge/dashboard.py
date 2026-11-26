@@ -3,18 +3,24 @@
 A total holds only what the records can vouch for: finished runs whose CLI gave an exact count, or a
 per-turn (delta) count. Everything else is listed apart by job id and never added in:
 
-- jobs still queued or running, with any tokens already recorded for their earlier attempts;
+- jobs still queued or running in a window that is still open, with any tokens already recorded for
+  their earlier attempts;
 - partial counts;
-- runs whose CLI was started but left no count (cancelled, timed out, failed, window closed, or a CLI
-  that reports none, such as Codex's built-in review);
-- runs for which the records cannot say whether their CLI was started: the job row has been pruned, or
-  the bridge marked the job's end as uncertain;
+- runs whose CLI was started but left no count (cancelled, timed out, failed, or a CLI that reports
+  none, such as Codex's built-in review);
+- runs the records cannot speak for: the window that ran the job closed before it finished, the job row
+  has been pruned, or the bridge could not confirm whether the job's CLI ran;
 - Claude runs that started subagents of their own, whose tokens Claude Code does not report, and Claude
   runs that did not say whether they started any;
 - any part of the period from before the bridge's first record.
 
 A run whose CLI was never started is counted, as a run that spent nothing. Live quota readings and Claude
 Code's cost estimate are left out: neither is a record the bridge can add up.
+
+It covers jobs run through the bridge only, and says so in the view.
+
+It reads and never writes: a job left running by a closed window is found by reading the owners table,
+not by marking the job, which `get_usage` still does.
 
 The text view is rendered from the same dict that is returned, so the two cannot disagree.
 """
@@ -43,6 +49,24 @@ OUTCOMES: tuple[str, ...] = ("completed", "failed", "timed_out", "cancelled")
 JOB_LIST_LIMIT = 10
 
 PERIOD_RULE = "A run counts in the period its record was written, which is when it finished."
+COVERS = "Covers jobs run through the bridge only."
+NOT_COVERED: tuple[str, ...] = (
+    "the host session's own tokens",
+    "a host's own subagents",
+    "CLI runs made outside the bridge",
+)
+CANNOT_TELL_REASONS: dict[str, str] = {
+    "window_closed": "The window that ran the job closed before the job finished, so the records cannot say "
+    "how far it got or what it spent.",
+    "job_row_pruned": "No count, and the job's row has been pruned (the newest jobs are kept), so it is not "
+    "known whether its CLI was started.",
+    "end_not_confirmed": "No count, and the bridge could not confirm whether the job's CLI ran or stopped.",
+}
+_REASON_LABELS: dict[str, str] = {
+    "window_closed": "its window closed",
+    "job_row_pruned": "job row pruned",
+    "end_not_confirmed": "end not confirmed",
+}
 LEFT_OUT: tuple[str, ...] = (
     "Live quota readings: they come from each CLI, not from the bridge's records. get_usage with "
     "include_quota shows them.",
@@ -169,7 +193,7 @@ def build_dashboard(
     running_recorded: dict[str, int] = {}
     partial: dict[str, int] = {}
     started_no_count: dict[str, str] = {}
-    cannot_tell: dict[str, None] = {}
+    cannot_tell: dict[str, dict[str, Any]] = {}
     never_started: dict[str, None] = {}
     subagents: dict[str, int] = {}
     subagents_unreported: dict[str, None] = {}
@@ -212,15 +236,19 @@ def build_dashboard(
         if usage_status == "partial":
             partial[job_id] = partial.get(job_id, 0) + int(row["total_tokens"] or 0)
         elif not counted:
-            if row["job_provider_invoked"]:
+            uncertain_end = row["job_provider_state"] in UNCERTAIN_PROVIDER_STATES
+            if job_on_record and row["job_failure_reason"] == "owner_exited" and uncertain_end:
+                # Recovered after its window closed: read the same as one not yet recovered (below).
+                cannot_tell[job_id] = {"job_id": job_id, "reason": "window_closed"}
+            elif row["job_provider_invoked"]:
                 started_no_count[job_id] = status
-            elif job_on_record and row["job_provider_state"] not in UNCERTAIN_PROVIDER_STATES:
+            elif not job_on_record:
+                cannot_tell[job_id] = {"job_id": job_id, "reason": "job_row_pruned"}
+            elif uncertain_end:
+                cannot_tell[job_id] = {"job_id": job_id, "reason": "end_not_confirmed"}
+            else:
                 # The launch is recorded before the CLI starts, and the bridge saw the job stop.
                 never_started[job_id] = None
-            else:
-                # The job row is gone, or the bridge itself marked the job's end as uncertain (its
-                # window closed mid-run, or the process tree could not be checked): never read as zero.
-                cannot_tell[job_id] = None
 
         if backend == "claude" and (counted or usage_status == "partial"):
             spawned = _metrics(row["provider_metrics_json"]).get("native_subagents")
@@ -235,6 +263,14 @@ def build_dashboard(
     for job in records["running_jobs"]:
         job_id = str(job["job_id"])
         if not (window_reaches_now or job_id in running_recorded):
+            continue
+        if not job["owner_alive"]:
+            # Its row still says queued or running, but the window that owned it is gone. The records
+            # cannot say how far it got; it is not shown as running.
+            closed: dict[str, Any] = {"job_id": job_id, "reason": "window_closed", "status_on_record": job["status"]}
+            if job_id in running_recorded:
+                closed["tokens_recorded_for_earlier_attempts"] = running_recorded[job_id]
+            cannot_tell[job_id] = closed
             continue
         began = job["started_at"] if job["started_at"] is not None else job["created_at"]
         entry: dict[str, Any] = {
@@ -288,6 +324,8 @@ def build_dashboard(
             "until_is_future": window.until_ts is not None and window.until_ts > now_ts,
             "rule": PERIOD_RULE,
         },
+        "covers": COVERS,
+        "not_covered": list(NOT_COVERED),
         "records_begin": _iso(first_ts),
         "totals": total,
         "this_session": {"owner_id": owner_id, "started_at": _iso(session_started), **this_session},
@@ -313,11 +351,16 @@ def build_dashboard(
                 "by_status": started_by_status,
                 "why": "The CLI was started, so tokens may have been spent, but no count was recorded.",
             },
-            "cannot_tell_if_cli_started": {
-                **_id_list(list(cannot_tell)),
-                "why": "No count, and the records cannot say whether the CLI was started: the job's row has "
-                "been pruned (the newest jobs are kept), or the bridge marked the job's end as uncertain, "
-                "for example when its window closed mid-run.",
+            "cannot_tell": {
+                "count": len(cannot_tell),
+                "jobs": list(cannot_tell.values())[:JOB_LIST_LIMIT],
+                **({"more": len(cannot_tell) - JOB_LIST_LIMIT} if len(cannot_tell) > JOB_LIST_LIMIT else {}),
+                "by_reason": {
+                    reason: n
+                    for reason in CANNOT_TELL_REASONS
+                    if (n := sum(1 for e in cannot_tell.values() if e["reason"] == reason))
+                },
+                "reasons": dict(CANNOT_TELL_REASONS),
             },
             "claude_subagents": {
                 **_id_list(list(subagents)),
@@ -391,6 +434,7 @@ def render_text(d: dict[str, Any]) -> str:
     lines: list[str] = [
         f"agent-bridge usage, {period['name']}: {_local(period['from'])} to {_local(period['to'])} ({zone})",
         "From the bridge's own records. " + PERIOD_RULE,
+        f"{d['covers']} Not in it: {', '.join(d['not_covered'])}.",
     ]
     if period["until_is_future"]:
         lines.append("The period runs past now; it is shown up to now.")
@@ -485,12 +529,24 @@ def render_text(d: dict[str, Any]) -> str:
     rows.append(
         ["CLI started, no count", _num(lost["count"]), f"{lost_desc}: {_ids(lost)}" if lost["count"] else "none"]
     )
-    unknown = nit["cannot_tell_if_cli_started"]
+    unknown = nit["cannot_tell"]
+    unknown_desc = ", ".join(
+        f"{j['job_id']} ({_REASON_LABELS.get(j['reason'], j['reason'])}"
+        + (
+            f", {_num(j['tokens_recorded_for_earlier_attempts'])} tokens recorded so far"
+            if "tokens_recorded_for_earlier_attempts" in j
+            else ""
+        )
+        + ")"
+        for j in unknown["jobs"]
+    )
+    if unknown.get("more"):
+        unknown_desc += f" and {unknown['more']} more"
     rows.append(
         [
             "cannot tell",
             _num(unknown["count"]),
-            f"records cannot say whether the CLI ran: {_ids(unknown)}" if unknown["count"] else "none",
+            f"the records cannot speak for these: {unknown_desc}" if unknown["count"] else "none",
         ]
     )
     sub = nit["claude_subagents"]

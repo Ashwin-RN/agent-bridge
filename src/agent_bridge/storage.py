@@ -2373,11 +2373,14 @@ class BridgeStore:
         until_ts: float | None,
         session_owner_id: str,
         only_session: bool,
+        is_pid_alive_fn: Callable[[int], bool],
     ) -> dict[str, Any]:
-        """Every record the usage dashboard reads, from one snapshot so that its figures agree.
+        """Every record the usage dashboard reads, from one snapshot so that its figures agree. It writes nothing.
 
         Each usage row comes with what its job row says, when the job row is still kept: whether the job
         is still running, whether its CLI was started, and why it failed. Pruned job rows read as NULL.
+        Each queued or running job says whether the window that owns it is still alive, judged by the same
+        check that `recover_dead_owner_jobs` uses, but without marking anything.
         """
         clauses: list[str] = []
         vals: list[Any] = []
@@ -2391,7 +2394,7 @@ class BridgeStore:
             clauses.append("u.owner_id = ?")
             vals.append(session_owner_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        running_where = "WHERE status IN ('queued', 'running')" + (" AND owner_id = ?" if only_session else "")
+        running_where = "WHERE j.status IN ('queued', 'running')" + (" AND j.owner_id = ?" if only_session else "")
         running_vals: list[Any] = [session_owner_id] if only_session else []
 
         with self._tx(write=False) as cur:
@@ -2419,11 +2422,13 @@ class BridgeStore:
             ).fetchall()
             running_rows = cur.execute(
                 f"""
-                SELECT job_id, owner_id, backend, quota_pool, model, requested_model, status,
-                       created_at, started_at, last_activity
-                FROM jobs
+                SELECT j.job_id, j.owner_id, j.backend, j.quota_pool, j.model, j.requested_model, j.status,
+                       j.created_at, j.started_at, j.last_activity, j.provider_invoked,
+                       o.pid AS owner_pid, o.exited_at AS owner_exited_at
+                FROM jobs j
+                LEFT JOIN owners o ON o.owner_id = j.owner_id
                 {running_where}
-                ORDER BY created_at ASC
+                ORDER BY j.created_at ASC
                 """,
                 running_vals,
             ).fetchall()
@@ -2434,9 +2439,20 @@ class BridgeStore:
             ).fetchone()
             cur.execute("COMMIT")
 
+        running_jobs: list[dict[str, Any]] = []
+        for r in running_rows:
+            job = dict(r)
+            pid = job.pop("owner_pid")
+            exited_at = job.pop("owner_exited_at")
+            # The calling window is alive by definition. Any other: the check recovery uses, read only.
+            job["owner_alive"] = job["owner_id"] == session_owner_id or _is_owner_row_alive(
+                pid, exited_at, is_pid_alive_fn=is_pid_alive_fn
+            )
+            running_jobs.append(job)
+
         return {
             "usage_rows": [dict(r) for r in usage_rows],
-            "running_jobs": [dict(r) for r in running_rows],
+            "running_jobs": running_jobs,
             "first_record_ts": float(first["first_ts"]) if first is not None and first["first_ts"] is not None else None,
             "session_started_at": float(owner["started_at"]) if owner is not None else None,
         }
