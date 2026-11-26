@@ -176,7 +176,8 @@ async def test_tools_refuse_in_process_when_nested_and_read_tools_still_answer(t
     for tool, args in JOB_TOOLS.items():
         with pytest.raises(Exception, match="nested_bridge") as excinfo:
             await mcp.call_tool(tool, args)
-        assert tool in str(excinfo.value)
+        # The tool itself refuses, before it looks at its arguments or reaches the job manager.
+        assert f"`{tool}` is refused" in str(excinfo.value)
     assert manager.store.list_jobs(limit=10) == []
     await manager.shutdown()
 

@@ -188,6 +188,32 @@ def test_claude_backend_names_and_pool_do_not_collide_with_agy_claude_models() -
     assert classify_quota_pool("codex", "gpt-6.2-sol") == "codex"
 
 
+async def test_rows_left_without_a_pool_are_filled_in_by_backend_first(tmp_path: Path) -> None:
+    """A Claude row whose model is named `sonnet` must not be filed under the agy Claude pool."""
+    import sqlite3
+
+    manager = _manager(tmp_path)
+    rec = await manager.run(manager.prepare_request(backend="claude", model="sonnet", prompt="hello"))
+    await manager.shutdown()
+    db_path = manager.store.db_path
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE jobs SET quota_pool = NULL WHERE job_id = ?", (rec.job_id,))
+    conn.execute("UPDATE usage_events SET quota_pool = NULL WHERE job_id = ?", (rec.job_id,))
+    conn.commit()
+    conn.close()
+
+    # Opening the store again runs the same fill-in that an upgrade runs.
+    reopened = JobManager(_make_settings(tmp_path))
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT quota_pool FROM jobs WHERE job_id = ?", (rec.job_id,)).fetchone() == ("claude",)
+    assert conn.execute(
+        "SELECT DISTINCT quota_pool FROM usage_events WHERE job_id = ?", (rec.job_id,)
+    ).fetchall() == [("claude",)]
+    conn.close()
+    await reopened.shutdown()
+
+
 async def test_claude_usage_row_counts_cache_tokens_as_input(tmp_path: Path) -> None:
     usage, metrics = normalize_usage(
         "claude",
