@@ -7,7 +7,8 @@ per-turn (delta) count. Everything else is listed apart by job id and never adde
 - partial counts;
 - runs whose CLI was started but left no count (cancelled, timed out, failed, window closed, or a CLI
   that reports none, such as Codex's built-in review);
-- runs whose job row has been pruned, so that it cannot be told whether their CLI was started;
+- runs for which the records cannot say whether their CLI was started: the job row has been pruned, or
+  the bridge marked the job's end as uncertain;
 - Claude runs that started subagents of their own, whose tokens Claude Code does not report, and Claude
   runs that did not say whether they started any;
 - any part of the period from before the bridge's first record.
@@ -37,6 +38,7 @@ TOKEN_FIELDS: tuple[str, ...] = (
     "total_tokens",
 )
 COUNTED_USAGE: frozenset[str] = frozenset({"exact", "delta"})
+UNCERTAIN_PROVIDER_STATES: frozenset[str] = frozenset({"unknown", "possibly_running"})
 OUTCOMES: tuple[str, ...] = ("completed", "failed", "timed_out", "cancelled")
 JOB_LIST_LIMIT = 10
 
@@ -210,12 +212,15 @@ def build_dashboard(
         if usage_status == "partial":
             partial[job_id] = partial.get(job_id, 0) + int(row["total_tokens"] or 0)
         elif not counted:
-            if not job_on_record:
-                cannot_tell[job_id] = None
-            elif not row["job_provider_invoked"]:
+            if row["job_provider_invoked"]:
+                started_no_count[job_id] = status
+            elif job_on_record and row["job_provider_state"] not in UNCERTAIN_PROVIDER_STATES:
+                # The launch is recorded before the CLI starts, and the bridge saw the job stop.
                 never_started[job_id] = None
             else:
-                started_no_count[job_id] = status
+                # The job row is gone, or the bridge itself marked the job's end as uncertain (its
+                # window closed mid-run, or the process tree could not be checked): never read as zero.
+                cannot_tell[job_id] = None
 
         if backend == "claude" and (counted or usage_status == "partial"):
             spawned = _metrics(row["provider_metrics_json"]).get("native_subagents")
@@ -310,8 +315,9 @@ def build_dashboard(
             },
             "cannot_tell_if_cli_started": {
                 **_id_list(list(cannot_tell)),
-                "why": "No count, and the job's row has been pruned (the newest jobs are kept), so it is not "
-                "known whether its CLI was started.",
+                "why": "No count, and the records cannot say whether the CLI was started: the job's row has "
+                "been pruned (the newest jobs are kept), or the bridge marked the job's end as uncertain, "
+                "for example when its window closed mid-run.",
             },
             "claude_subagents": {
                 **_id_list(list(subagents)),
@@ -484,7 +490,7 @@ def render_text(d: dict[str, Any]) -> str:
         [
             "cannot tell",
             _num(unknown["count"]),
-            f"job row pruned, CLI may have run: {_ids(unknown)}" if unknown["count"] else "none",
+            f"records cannot say whether the CLI ran: {_ids(unknown)}" if unknown["count"] else "none",
         ]
     )
     sub = nit["claude_subagents"]

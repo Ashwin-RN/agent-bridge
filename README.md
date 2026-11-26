@@ -437,7 +437,7 @@ Rules the figures follow:
   | `running_or_queued` | Jobs not finished yet, from every window, with any tokens already recorded for an earlier attempt |
   | `partial_counts` | A count for a turn that did not finish cleanly. It is shown, but it may be short |
   | `cli_started_no_count` | The CLI was started but left no count: cancelled, timed out, failed, window closed, or a CLI that reports none, such as Codex's built-in review |
-  | `cannot_tell_if_cli_started` | No count, and the job's row has been pruned (the newest 500 are kept unless `AGENT_BRIDGE_MAX_STORED_JOBS` says otherwise), so it is not known whether the CLI ran |
+  | `cannot_tell_if_cli_started` | No count, and the records cannot say whether the CLI ran: the job's row has been pruned (the newest 500 are kept unless `AGENT_BRIDGE_MAX_STORED_JOBS` says otherwise), or the bridge marked the job's end as uncertain, as it does when a window closes mid-run |
   | `claude_subagents` | Claude runs that started subagents of their own. Claude Code reports the main agent's tokens only |
   | `claude_subagents_not_on_record` | Claude runs that did not record whether they started subagents: written before the bridge kept that count, or Claude Code did not report it |
   | `before_records_begin` | Set when the period reaches back before the bridge's first record. That stretch is not covered, which is not the same as zero |

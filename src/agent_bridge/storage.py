@@ -2408,7 +2408,8 @@ class BridgeStore:
                        u.input_tokens, u.output_tokens, u.cached_tokens, u.cache_write_tokens,
                        u.reasoning_tokens, u.total_tokens, u.provider_metrics_json,
                        j.job_id AS job_row_id, j.status AS job_status,
-                       j.provider_invoked AS job_provider_invoked, j.failure_reason AS job_failure_reason
+                       j.provider_invoked AS job_provider_invoked, j.failure_reason AS job_failure_reason,
+                       j.provider_state AS job_provider_state
                 FROM usage_events u
                 LEFT JOIN jobs j ON j.job_id = u.job_id
                 {where}

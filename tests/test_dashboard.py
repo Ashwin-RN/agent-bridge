@@ -237,6 +237,26 @@ async def test_a_run_without_a_count_is_marked_by_whether_its_cli_started(tmp_pa
     await manager.shutdown()
 
 
+async def test_a_job_whose_window_closed_mid_run_is_not_counted_as_nothing_spent(tmp_path: Path) -> None:
+    gone_pid = 999_999
+    manager = JobManager(
+        _settings(tmp_path), owner_id=ME, pid=os.getpid(), is_pid_alive_fn=lambda pid: pid != gone_pid
+    )
+    manager.store.register_owner("owner-gone", gone_pid)
+    # Running, with no launch recorded yet: the bridge cannot know how far it got before its window closed.
+    left = _record("codex-left", owner="owner-gone", backend="codex", model="gpt-6.2-sol", status="running")
+    left.started_at = time.time() - 120
+    manager.store.insert_job(left)
+
+    d = await manager.usage_dashboard(period="all")
+
+    stored = manager.store.get_job("codex-left")
+    assert stored is not None and (stored.failure_reason, stored.provider_state) == ("owner_exited", "unknown")
+    assert d["not_in_totals"]["cannot_tell_if_cli_started"]["job_ids"] == ["codex-left"]
+    assert d["counted_as_nothing_spent"]["count"] == 0
+    await manager.shutdown()
+
+
 async def test_claude_subagents_are_marked_and_an_unreported_count_is_not_taken_for_none(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     _finish(manager, "claude-sub", backend="claude", model="claude-sonnet-5-5", tokens=1000,
