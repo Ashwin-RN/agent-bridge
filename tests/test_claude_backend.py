@@ -306,7 +306,10 @@ async def test_claude_read_only_and_edit_runs_get_different_permissions(tmp_path
     for rule in CLAUDE_EDIT_DENY_RULES:
         assert rule in edit_argv
     assert "Write" not in edit_argv and "Edit" not in edit_argv
-    assert "Bash(git push *)" in CLAUDE_EDIT_DENY_RULES
+    # Each form is named here, so that dropping one from the list turns this red.
+    for shell in ("Bash", "PowerShell"):
+        for form in ("git push", "git push *", "git -C * push", "git -C * push *"):
+            assert f"{shell}({form})" in CLAUDE_EDIT_DENY_RULES
 
     for argv in (ro_argv, edit_argv):
         assert argv[0] == "-p"
@@ -604,6 +607,31 @@ def test_advisory_never_urges_spending_the_claude_plan_before_its_reset() -> Non
     )
     assert codex_only["pools"][0]["priority"] == "use_before_reset"
     assert len(codex_only["expiring_weekly_alerts"]) == 1
+
+
+def test_claude_pool_is_never_in_the_recommended_order() -> None:
+    """A full Claude plan beside a half-used Codex one: the order still names Codex only."""
+    from datetime import datetime, timedelta, timezone
+
+    from agent_bridge.quota import build_quota_advisory
+
+    now = datetime(2026, 11, 26, 14, 0, tzinfo=timezone.utc)
+    reset = (now + timedelta(days=6)).isoformat(timespec="seconds")
+    full = {"window": "weekly", "used_percent": 1.0, "remaining_percent": 99.0, "reset_time": reset}
+    half = {"window": "weekly", "used_percent": 50.0, "remaining_percent": 50.0, "reset_time": reset}
+    claude = {"backend": "claude", "pool": "claude", "status": "ok", "windows": [dict(full, id="seven_day")]}
+    codex = {"backend": "codex", "pool": "codex", "status": "ok", "windows": [dict(half, slot="secondary")]}
+
+    both = build_quota_advisory({"claude": claude, "codex": codex}, now_utc=now)
+    assert both["recommended_order"] == ["codex"]
+    assert "Best available pool: codex" in both["summary"]
+    # The pool is still reported, with its reading, for a host that wants to name it.
+    assert {p["pool"] for p in both["pools"]} == {"claude", "codex"}
+
+    claude_only = build_quota_advisory({"claude": claude}, now_utc=now)
+    assert claude_only["recommended_order"] == []
+    assert "No pool to route to" in claude_only["summary"]
+    assert "exhausted" not in claude_only["summary"]
 
 
 async def test_claude_failures_are_classified(tmp_path: Path) -> None:

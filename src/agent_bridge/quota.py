@@ -407,6 +407,8 @@ def build_quota_advisory(
         }
         if has_stale:
             pool_entry["stale"] = True
+        if shared_with_own_use:
+            pool_entry["shared_with_own_use"] = True
         pools_info.append(pool_entry)
 
     # Codex pool
@@ -479,7 +481,9 @@ def build_quota_advisory(
     pools_sorted = sorted(pools_info, key=_pool_sort_key)
     eligible_pools = [p for p in pools_sorted if p.get("priority") not in {"avoid", "stale"}]
     stale_pools = [p for p in pools_sorted if p.get("priority") == "stale"]
-    recommended_order = [p["pool"] for p in eligible_pools]
+    # A pool the user's own sessions run on is never offered for routing. It is used when a job names it.
+    routable_pools = [p for p in eligible_pools if not p.get("shared_with_own_use")]
+    recommended_order = [p["pool"] for p in routable_pools]
     upcoming_resets.sort(key=lambda item: int(item.get("resets_in_seconds") or 10**9))
 
     next_reset = upcoming_resets[0] if upcoming_resets else None
@@ -491,11 +495,17 @@ def build_quota_advisory(
 
     if expiring_weekly_alerts:
         summary_text = "WEEKLY RESET PRIORITY: " + " | ".join(expiring_weekly_alerts)
-    elif eligible_pools:
-        top = eligible_pools[0]
+    elif routable_pools:
+        top = routable_pools[0]
         summary_text = (
             f"Best available pool: {top['pool']} ({top['effective_remaining_percent']}% effective remaining)."
             f"{reset_part}"
+        )
+    elif eligible_pools:
+        own_names = ", ".join(p["pool"] for p in eligible_pools)
+        summary_text = (
+            f"No pool to route to. Only {own_names} has room, and that is the allowance the user's own "
+            f"sessions use: name it in the job to use it.{reset_part}"
         )
     elif stale_pools:
         stale_names = ", ".join(p["pool"] for p in stale_pools)

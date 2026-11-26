@@ -599,7 +599,7 @@ Each window comes back with `used_percent`, `remaining_percent`, `reset_time`, `
 | `avoid` | Exhausted or rate limited |
 | `stale` | The reading is out of date |
 
-`recommended_order` lists the usable pools best first. Pools marked `avoid` or `stale` are left out of it. `upcoming_resets` lists every reset to come, soonest first.
+`recommended_order` lists the usable pools best first. Pools marked `avoid` or `stale` are left out of it. So is the `claude` pool, always: it is the allowance your own Claude sessions run on, so a job uses it only when it names the `claude` backend. `upcoming_resets` lists every reset to come, soonest first.
 
 A quota reading is a snapshot. A few large jobs can use up a 5 hour window that looked nearly full a moment ago.
 
