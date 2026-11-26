@@ -99,10 +99,14 @@ emit({"type": "rate_limit_event", "session_id": sid, "rate_limit_info": {
     "status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 0.86,
     "resetsAt": int(time.time()) + 3 * 86400,
     "unifiedWindows": {"seven_day": {"utilization": 0.86, "resetsAt": int(time.time()) + 3 * 86400}}}})
-emit({"type": "result", "subtype": "success", "is_error": False, "session_id": sid,
-      "result": json.dumps(seen), "num_turns": 2, "total_cost_usd": 0.0034, "permission_denials": [],
-      "usage": {"input_tokens": 4, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 5000,
-                "output_tokens": 132, "output_tokens_details": {"thinking_tokens": 30}}})
+final = {"type": "result", "subtype": "success", "is_error": False, "session_id": sid,
+         "result": json.dumps(seen), "num_turns": 2, "total_cost_usd": 0.0034, "permission_denials": [],
+         "usage": {"input_tokens": 4, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 5000,
+                   "output_tokens": 132, "output_tokens_details": {"thinking_tokens": 30}}}
+if "SPAWNED_NONE" in prompt:
+    # What Claude Code 2.1.332 reports for a run that started no subagents.
+    final["subagent_stats"] = {"spawned": 0, "completed": 0, "failed": 0}
+emit(final)
 '''
 
 
@@ -761,6 +765,20 @@ def test_parse_claude_stream_keeps_the_reply_and_ignores_noise() -> None:
     assert stopped["is_error"] is True
     assert stopped["errors"] == ["claude ended with error_max_turns"]
     assert stopped["response"] == "partial reply"
+
+
+async def test_a_reported_zero_subagents_is_recorded_and_an_unreported_count_is_left_out(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    reported = await manager.run(manager.prepare_request(backend="claude", prompt="SPAWNED_NONE"))
+    unreported = await manager.run(manager.prepare_request(backend="claude", prompt="hello"))
+    assert reported.status == unreported.status == "completed"
+
+    # 0 is a fact Claude Code stated. A run without the key says nothing either way.
+    assert reported.provider_metrics["native_subagents"] == 0
+    assert "native_subagents" not in unreported.provider_metrics
+    stored = manager.store.get_job(reported.job_id)
+    assert stored is not None and stored.provider_metrics["native_subagents"] == 0
+    await manager.shutdown()
 
 
 async def test_list_backends_and_review_code_know_the_claude_backend(tmp_path: Path) -> None:

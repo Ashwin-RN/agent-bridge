@@ -188,7 +188,8 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
     num_turns: int | None = None
     cost_usd: float | None = None
     subtype: str | None = None
-    native_subagents = 0
+    # None when Claude Code did not report it, which is not the same as 0.
+    native_subagents: int | None = None
 
     if result_event is not None:
         subtype = result_event.get("subtype") if isinstance(result_event.get("subtype"), str) else None
@@ -640,7 +641,8 @@ class ClaudeRunner:
             extras["session_cost_usd_estimate"] = parsed["cost_usd"]
         if parsed["num_turns"] is not None:
             extras["num_turns"] = parsed["num_turns"]
-        if parsed["native_subagents"]:
+        if parsed["native_subagents"] is not None:
+            # Kept at 0 too, so that a run without the key reads "not reported" rather than "none".
             # Their tokens are not in the counts above: Claude Code reports the main agent's only.
             extras["native_subagents"] = parsed["native_subagents"]
         if key_source and key_source != "none":

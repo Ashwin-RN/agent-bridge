@@ -610,7 +610,7 @@ Without `include_quota`, `get_usage` reports only what the bridge itself ran: ru
 - `exact` and `delta` counts go into the token totals. `partial` counts are shown apart, and `missing` means the CLI gave no figure.
 - A job that was retried counts as one run with two attempts.
 - Work you do in `codex`, `agy` or `claude` outside the bridge is not in these counts. For `codex` and `agy` it does show in the quota reading.
-- For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.session_cost_usd_estimate` is Claude Code's own estimate at list prices, not a bill; on a resume it covers the earlier turns of the session too. If the job started native subagents of its own, their tokens are not in the counts, and `provider_metrics.native_subagents` says how many there were.
+- For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.session_cost_usd_estimate` is Claude Code's own estimate at list prices, not a bill; on a resume it covers the earlier turns of the session too. If the job started native subagents of its own, their tokens are not in the counts. `provider_metrics.native_subagents` says how many there were, 0 included, whenever Claude Code reports it; a run without it did not say.
 - Codex's built-in review (`review_code` with no `focus`) reports no token counts, so it shows as 0 tokens.
 
 ## A bridge inside a bridge
