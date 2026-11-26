@@ -1,26 +1,33 @@
-"""Fast, lightweight stdio MCP server exposing Neon (`agy`) and Codex (`codex`) subagents."""
+"""Fast, lightweight stdio MCP server exposing Neon (`agy`), Codex (`codex`) and Claude (`claude`) subagents.
+
+Any MCP client can be the host: Claude Code, Codex, Antigravity or another. Nothing here assumes which.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from agent_bridge.config import EffortLevel, Settings, normalize_backend
 from agent_bridge.jobs import JobManager
 from agent_bridge.model_resolver import ModelPoolUnavailableError
+from agent_bridge.nesting import NestedBridgeError, Nesting, ancestor_chain, detect_nesting
 from agent_bridge.storage import UsagePeriod
 
 SERVER_INSTRUCTIONS = """
-`agent-bridge` lets you delegate tasks, reviews, and parallel work across THREE independent
-subscription quota pools over two local CLIs:
+`agent-bridge` lets you delegate tasks, reviews, and parallel work to other AI coding CLIs on this
+machine, whichever CLI you are yourself. It covers FOUR independent subscription quota pools over
+three local CLIs:
 
 1. `codex` (OpenAI Codex CLI — `codex` pool) — defaults to `gpt-6.2-sol` at `high` reasoning
    effort (seamlessly rides newer versions / falls back if retired). Override per call with `effort`
@@ -31,14 +38,22 @@ subscription quota pools over two local CLIs:
    exploration and research, and **Neon** (`neon-medium` / `neon-high`) for builds, architecture,
    and reviews based on task complexity (`flash` for quick lightweight checks).
 3. `agy-claude` / `agy-opus` / `agy-gpt` (`agy_claude_gpt` pool inside `agy`) — SEPARATE 5h +
-   weekly quota pool from both Gemini Models and your Claude Code subscription! Use
+   weekly quota pool from both Gemini Models and the Claude plan below. Use
    `backend="agy-claude"` (Sonnet), `backend="agy-opus"` (Opus), or `backend="agy-gpt"` (GPT-OSS),
    or pass `model="claude-sonnet-high" | "claude-opus-high" | "gpt-oss"` on `backend="neon"`.
+4. `claude` (Claude Code CLI — `claude` pool) — the user's own Claude plan, the same limits their
+   Claude Code and claude.ai use draw on. Defaults to `sonnet` at `high`; pass `model="opus"`,
+   `"haiku"`, `"fable"` or a full model id. `read_only` runs cannot write or run changing commands;
+   `mode="edit"` accepts edits and supports `worktree=True`. Claude subagents get no MCP servers.
+
+If you are one of these CLIs yourself, your own native subagents are usually the better way to reach
+your own models; use the bridge for the others.
 
 Smart Quota & Weekly-Reset Routing:
 - Before substantial fan-out or heavy tasks, call `get_usage(compact=True, cwd=..., include_quota=True)`
-  to check all 3 pools (`by_quota_pool`), exact reset countdowns of all involved models
+  to check all pools (`by_quota_pool`), exact reset countdowns of all involved models
   (`quota_advisory.upcoming_resets`), and `quota_advisory.expiring_weekly_alerts` / `recommended_order`.
+  The `claude` pool has no live read-out: its reading is what the last Claude job reported.
 - If a pool has an `expiring_weekly_alerts` entry (`priority="use_before_reset"`), prioritize routing
   eligible work there so unused weekly quota is leveraged before it resets!
 - Pass `cwd` on new jobs; omit `cwd` on `resume_from` so the bridge inherits the session's recorded
@@ -50,12 +65,21 @@ Smart Quota & Weekly-Reset Routing:
   `parent_run` are inherited automatically unless overridden).
 - Treat `status="completed"` as a lifecycle status and still verify that `response` contains the
   requested deliverable.
+- A subagent started by the bridge may not start bridge jobs itself: there the job-starting tools
+  fail with `nested_bridge`.
+""".strip()
+
+NESTED_INSTRUCTIONS = """
+`agent-bridge` is running INSIDE one of its own jobs: you are a subagent that another session started
+through the bridge. `run_agent`, `start_agent`, `run_parallel` and `review_code` are refused here with
+`nested_bridge`. Do the work yourself and put the answer in your reply. `check_jobs`, `get_usage` and
+`list_backends` still work.
 """.strip()
 
 
 class ParallelTaskSpec(BaseModel):
     backend: str = Field(
-        description="Subagent backend: 'neon' (or 'agy'/'gemini') or 'codex' (or 'gpt')."
+        description="Subagent backend: 'neon' (or 'agy'/'gemini'), 'codex' (or 'gpt') or 'claude'."
     )
     prompt: str = Field(description="Instructions or question for the subagent.")
     cwd: str | None = Field(
@@ -69,8 +93,8 @@ class ParallelTaskSpec(BaseModel):
     model: str | None = Field(
         default=None,
         description=(
-            "Optional model ID or versionless Neon shortcut (e.g. 'neon-medium', 'neon-high', "
-            "'neon-xhigh', 'flash'). Omit for backend default."
+            "Optional model ID or versionless shortcut (Neon: 'neon-medium', 'neon-high', 'flash'; "
+            "Claude: 'sonnet', 'opus', 'haiku', 'fable'). Omit for backend default."
         ),
     )
     effort: EffortLevel | None = Field(
@@ -87,7 +111,7 @@ class ParallelTaskSpec(BaseModel):
     )
     worktree: bool = Field(
         default=False,
-        description="Codex edit mode only: run in an isolated managed Git worktree.",
+        description="Codex or Claude edit mode only: run in an isolated managed Git worktree.",
     )
     extra_dirs: list[str] | None = Field(
         default=None,
@@ -153,13 +177,59 @@ def _build_review_prompt(
     )
 
 
+_ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[Any]])
+
+
+def _reported(fn: _ToolFn) -> _ToolFn:
+    """Let a tool's own refusals reach the caller with their text.
+
+    The MCP library passes on the message of a `ToolError` only. Anything else it treats as a crash and
+    reports as "Error executing tool <name>", with nothing the calling model could act on. The bridge
+    refuses with `ValueError` and `RuntimeError` (an unknown backend, a session that is not safe to
+    resume, a nested bridge), so those are turned into `ToolError` here.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except (ValueError, LookupError, RuntimeError, OSError) as exc:
+            raise ToolError(str(exc) or type(exc).__name__) from exc
+
+    return wrapper  # type: ignore[return-value]
+
+
+def _detect_nesting(job_manager: JobManager) -> Nesting:
+    """Find out, once at startup, whether this bridge runs inside a bridge job. Never raises."""
+    try:
+        return detect_nesting(
+            live_owners=job_manager.store.list_live_owners(),
+            ancestors=ancestor_chain(),
+        )
+    except Exception as exc:
+        logging.getLogger("agent_bridge.server").warning("Nesting check failed: %s", exc)
+        return detect_nesting(live_owners=(), ancestors=())
+
+
 def create_server(
     settings: Settings | None = None,
     manager: JobManager | None = None,
+    nesting: Nesting | None = None,
 ) -> tuple[MCPServer, JobManager]:
-    """Create and configure the MCPServer instance and its backing JobManager."""
+    """Create and configure the MCPServer instance and its backing JobManager.
+
+    `nesting` is worked out from the environment and the process tree unless it is passed in.
+    """
     cfg = settings or Settings.from_env()
     job_manager = manager or JobManager(cfg)
+    nest = nesting if nesting is not None else _detect_nesting(job_manager)
+    job_manager.nesting = nest
+
+    def _refuse_if_nested(tool: str) -> None:
+        if nest.nested:
+            raise NestedBridgeError(nest.refusal(tool))
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
@@ -170,12 +240,13 @@ def create_server(
 
     mcp = MCPServer(
         name="agent-bridge",
-        title="Agent Bridge (Neon & Codex Subagents)",
+        title="Agent Bridge (Neon, Codex & Claude Subagents)",
         description=(
-            "Delegate tasks, parallel work, and code reviews to Antigravity (Neon) "
-            "and Codex CLI subagents with shared SQLite state, dynamic models, and usage/quota visibility."
+            "Delegate tasks, parallel work, and code reviews to Antigravity (Neon), Codex CLI "
+            "and Claude Code subagents from any MCP host, with shared SQLite state, dynamic models, "
+            "and usage/quota visibility."
         ),
-        instructions=SERVER_INSTRUCTIONS,
+        instructions=NESTED_INSTRUCTIONS if nest.nested else SERVER_INSTRUCTIONS,
         lifespan=lifespan,
     )
 
@@ -186,6 +257,7 @@ def create_server(
             openWorldHint=True,
         )
     )
+    @_reported
     async def run_agent(
         backend: str,
         prompt: str,
@@ -205,7 +277,7 @@ def create_server(
         confirm_prior_job_id: str | None = None,
         allow_cross_pool_fallback: bool = False,
     ) -> dict[str, Any]:
-        """Run a Neon (`agy`) or Codex (`codex`) subagent synchronously and return its response.
+        """Run a Neon (`agy`), Codex (`codex`) or Claude (`claude`) subagent synchronously and return its response.
 
         - `timeout_seconds`: overall job deadline (defaults to `AGENT_BRIDGE_DEFAULT_TIMEOUT`).
         - `wait_seconds`: optional shorter MCP wait window; if it expires while the job is still
@@ -218,6 +290,7 @@ def create_server(
           has stopped before resuming a session whose prior turn ended `possibly_running` / `unknown`.
         - `allow_cross_pool_fallback`: opt in (`True`) to allow falling back across Antigravity quota pools.
         """
+        _refuse_if_nested("run_agent")
         req = await job_manager.prepare_request_async(
             backend=backend,
             prompt=prompt,
@@ -248,6 +321,7 @@ def create_server(
             openWorldHint=True,
         )
     )
+    @_reported
     async def start_agent(
         backend: str,
         prompt: str,
@@ -266,10 +340,11 @@ def create_server(
         confirm_prior_job_id: str | None = None,
         allow_cross_pool_fallback: bool = False,
     ) -> dict[str, Any]:
-        """Launch a Neon or Codex subagent in the background and immediately return its `job_id`.
+        """Launch a Neon, Codex or Claude subagent in the background and immediately return its `job_id`.
 
         Use `check_jobs(job_ids=[job_id], wait_seconds=60)` to collect results or monitor progress.
         """
+        _refuse_if_nested("start_agent")
         req = await job_manager.prepare_request_async(
             backend=backend,
             prompt=prompt,
@@ -312,6 +387,7 @@ def create_server(
             openWorldHint=True,
         )
     )
+    @_reported
     async def run_parallel(
         tasks: list[ParallelTaskSpec],
         cwd: str | None = None,
@@ -321,11 +397,12 @@ def create_server(
         wait_seconds: int | None = None,
         parent_run: str | None = None,
     ) -> dict[str, Any]:
-        """Run multiple Neon and/or Codex subagent tasks concurrently in one call.
+        """Run multiple Neon, Codex and/or Claude subagent tasks concurrently in one call.
 
         Set `wait=True` (default) to wait for all tasks (up to `wait_seconds` or `timeout_seconds`),
         or `wait=False` to start them in the background and return their `job_ids` immediately.
         """
+        _refuse_if_nested("run_parallel")
         if not tasks:
             raise ValueError("tasks must contain at least one task.")
         if len(tasks) > 10:
@@ -374,6 +451,7 @@ def create_server(
             openWorldHint=False,
         )
     )
+    @_reported
     async def check_jobs(
         job_ids: list[str] | None = None,
         wait_seconds: int = 0,
@@ -425,6 +503,7 @@ def create_server(
             openWorldHint=False,
         )
     )
+    @_reported
     async def cancel_job(job_id: str) -> dict[str, Any]:
         """Cancel a running or queued background subagent job owned by this bridge process."""
         record = await job_manager.cancel(job_id)
@@ -437,6 +516,7 @@ def create_server(
             openWorldHint=True,
         )
     )
+    @_reported
     async def review_code(
         cwd: str | None = None,
         backends: list[str] | None = None,
@@ -451,13 +531,16 @@ def create_server(
         timeout_seconds: int | None = None,
         wait_seconds: int | None = None,
         parent_run: str | None = None,
+        claude_model: str | None = None,
     ) -> dict[str, Any]:
-        """Run a read-only code review using Neon, Codex, or both in parallel.
+        """Run a read-only code review using Neon, Codex, Claude, or several in parallel.
 
-        - `backends`: defaults to `["neon", "codex"]` for dual-model review.
+        - `backends`: defaults to `["neon", "codex"]` for dual-model review; add `"claude"` to include it.
         - `scope`: `'uncommitted'` (default), `'base'` (with `base="main"`), or `'commit'` (with `commit="<sha>"`).
         - `effort`: optional reasoning effort override applied to selected backends.
         """
+        _refuse_if_nested("review_code")
+        models_by_backend = {"neon": neon_model, "codex": codex_model, "claude": claude_model}
         selected = backends if backends else ["neon", "codex"]
         normalized_backends = []
         for b in selected:
@@ -494,7 +577,7 @@ def create_server(
                     prompt=prompt_for_custom,
                     cwd=cwd,
                     mode="read_only",
-                    model=neon_model if backend == "neon" else codex_model,
+                    model=models_by_backend.get(backend),
                     effort=effort,
                     timeout_seconds=timeout_seconds,
                     label=f"{backend}-review-{scope}",
@@ -526,6 +609,7 @@ def create_server(
             openWorldHint=True,
         )
     )
+    @_reported
     async def get_usage(
         period: UsagePeriod = "today",
         backend: str | None = None,
@@ -537,10 +621,10 @@ def create_server(
         compact: bool = False,
         recent_limit: int = 10,
     ) -> dict[str, Any]:
-        """Inspect usage across all 3 quota pools, in-flight load, coverage, and weekly-reset-aware quota.
+        """Inspect usage across all quota pools, in-flight load, coverage, and weekly-reset-aware quota.
 
         - `period`: `'session'`, `'today'`, `'7d'`, `'30d'`, or `'all'`.
-        - `quota_pool`: optional pool filter (`'agy_gemini'`, `'agy_claude_gpt'`, or `'codex'`).
+        - `quota_pool`: optional pool filter (`'agy_gemini'`, `'agy_claude_gpt'`, `'codex'`, or `'claude'`).
         - `cwd` / `parent_run`: optional filters for project-scoped or workflow-scoped planning.
         - `compact=True`: concise planning view (per-backend & per-quota-pool runs, in-flight, duration, coverage).
         - `include_quota=True`: opt-in cached live quota lookup + `quota_advisory` with weekly-reset alerts,
@@ -565,11 +649,12 @@ def create_server(
             openWorldHint=False,
         )
     )
+    @_reported
     async def list_backends(
         refresh_models: bool = False,
         include_quota: bool = False,
     ) -> dict[str, Any]:
-        """Check CLI discovery, health, live/cached agy pools (Gemini + Claude/GPT), Codex defaults, and optional quota."""
+        """Check CLI discovery, health, live/cached agy pools (Gemini + Claude/GPT), Codex and Claude defaults, and optional quota."""
         async def _probe_neon() -> dict[str, Any]:
             try:
                 neon_health = await job_manager.neon_runner.check_health()
@@ -638,7 +723,31 @@ def create_server(
                 **codex_health,
             }
 
-        neon_info, codex_info = await asyncio.gather(_probe_neon(), _probe_codex())
+        async def _probe_claude() -> dict[str, Any]:
+            try:
+                claude_health = await job_manager.claude_runner.check_health()
+            except Exception as exc:
+                claude_health = {
+                    "command_found": False,
+                    "healthy": False,
+                    "available": False,
+                    "command": None,
+                    "version": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            return {
+                "backend": "claude",
+                "cli": "claude",
+                "quota_pool": "claude",
+                "default_model": cfg.default_claude_model,
+                "default_effort": cfg.default_claude_effort,
+                "model_names": ["sonnet", "opus", "haiku", "fable", "<full model id>"],
+                **claude_health,
+            }
+
+        neon_info, codex_info, claude_info = await asyncio.gather(
+            _probe_neon(), _probe_codex(), _probe_claude()
+        )
 
         out: dict[str, Any] = {
             "owner_id": job_manager.owner_id,
@@ -647,13 +756,15 @@ def create_server(
             "max_concurrent_jobs_per_process": cfg.max_concurrent_jobs,
             "db_path": str(job_manager.store.db_path),
             "session_usage": await job_manager.session_compact_summary_async(),
+            "nesting": nest.to_dict(),
             "backends": {
                 "neon": neon_info,
                 "codex": codex_info,
+                "claude": claude_info,
             },
         }
         if include_quota:
-            quota = await job_manager.get_quota(["neon", "codex"], refresh=refresh_models)
+            quota = await job_manager.get_quota(["neon", "codex", "claude"], refresh=refresh_models)
             out["quota"] = quota
             out["quota_advisory"] = job_manager._build_quota_advisory(quota)
         return out

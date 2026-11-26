@@ -635,6 +635,7 @@ class BridgeStore:
                     """
                     UPDATE jobs SET quota_pool = CASE
                         WHEN backend = 'codex' THEN 'codex'
+                        WHEN backend = 'claude' THEN 'claude'
                         WHEN LOWER(COALESCE(model, requested_model, '')) LIKE '%claude%'
                           OR LOWER(COALESCE(model, requested_model, '')) LIKE '%gpt%'
                           OR LOWER(COALESCE(model, requested_model, '')) LIKE '%opus%'
@@ -742,6 +743,7 @@ class BridgeStore:
                     """
                     UPDATE usage_events SET quota_pool = CASE
                         WHEN backend = 'codex' THEN 'codex'
+                        WHEN backend = 'claude' THEN 'claude'
                         WHEN LOWER(COALESCE(model, '')) LIKE '%claude%'
                           OR LOWER(COALESCE(model, '')) LIKE '%gpt%'
                           OR LOWER(COALESCE(model, '')) LIKE '%opus%'
@@ -1139,6 +1141,14 @@ class BridgeStore:
                 (now, now, owner_id),
             )
             cur.execute("DELETE FROM session_claims WHERE owner_id = ?", (owner_id,))
+
+    def list_live_owners(self) -> list[tuple[str, int, float]]:
+        """`(owner_id, pid, started_at)` for every bridge process not marked as exited."""
+        with self._tx(write=False) as cur:
+            rows = cur.execute(
+                "SELECT owner_id, pid, started_at FROM owners WHERE exited_at IS NULL"
+            ).fetchall()
+        return [(str(r["owner_id"]), int(r["pid"]), float(r["started_at"])) for r in rows]
 
     def is_owner_alive(
         self,
@@ -1920,7 +1930,7 @@ class BridgeStore:
             clauses.append("backend = ?")
             vals.append(backend)
         if quota_pool:
-            clauses.append("COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' ELSE 'agy_gemini' END) = ?")
+            clauses.append("COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END) = ?")
             vals.append(quota_pool)
         if cwd:
             clauses.append("cwd = ?")
@@ -1932,7 +1942,7 @@ class BridgeStore:
         rows = cur.execute(
             f"""
             SELECT backend,
-                   COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' ELSE 'agy_gemini' END) AS pool,
+                   COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END) AS pool,
                    COUNT(*) AS cnt
             FROM jobs
             {where}
@@ -2051,7 +2061,7 @@ class BridgeStore:
             vals.append(backend)
         if quota_pool:
             clauses.append(
-                "COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' ELSE 'agy_gemini' END) = ?"
+                "COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END) = ?"
             )
             vals.append(quota_pool)
         if cwd:
@@ -2063,7 +2073,7 @@ class BridgeStore:
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         recent_n = max(0, min(int(recent_limit), 50))
-        pool_expr = "COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' ELSE 'agy_gemini' END)"
+        pool_expr = "COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END)"
 
         with self._tx(write=False) as cur:
             in_flight, in_flight_by_pool = self._count_in_flight_cur(
@@ -2304,6 +2314,12 @@ class BridgeStore:
             by_backend["codex"]["token_note"] = (
                 "Per-turn Codex tokens (cached_tokens is a subset of input_tokens; "
                 "reasoning_tokens is a subset of output_tokens)."
+            )
+
+        if "claude" in by_backend:
+            by_backend["claude"]["token_note"] = (
+                "Per-run Claude Code tokens (input_tokens includes cache reads and cache writes; "
+                "cached_tokens is the cache-read part)."
             )
 
         by_model: dict[str, dict[str, Any]] = {}

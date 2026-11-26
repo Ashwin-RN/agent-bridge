@@ -14,7 +14,7 @@ def normalize_usage(
     backend: str,
     raw_usage: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Normalize `agy` and `codex` token counters while preserving provider-specific metrics.
+    """Normalize `agy`, `codex` and `claude` token counters while preserving provider-specific metrics.
 
     Returns `(normalized_usage, provider_metrics)`.
     """
@@ -40,6 +40,36 @@ def normalize_usage(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_tokens": cache_read,
+            "thinking_tokens": thinking,
+            "total_tokens": total,
+        }
+        return normalized, provider_metrics
+
+    if backend == "claude":
+        # Claude Code reports uncached input, cache reads and cache writes as three separate counters.
+        # They are added up here so that, as for Codex, `cached_tokens` is a subset of `input_tokens`.
+        uncached = input_tokens
+        cache_read = _to_int(raw_usage, "cache_read_input_tokens")
+        cache_write = _to_int(raw_usage, "cache_creation_input_tokens")
+        details = raw_usage.get("output_tokens_details")
+        thinking = _to_int(details, "thinking_tokens") if isinstance(details, dict) else 0
+        all_input = uncached + cache_read + cache_write
+        total = all_input + output_tokens
+        normalized = {
+            "input_tokens": all_input,
+            "output_tokens": output_tokens,
+            "cached_tokens": cache_read,
+            "reasoning_tokens": thinking,
+            "total_tokens": total,
+        }
+        if cache_write:
+            normalized["cache_write_tokens"] = cache_write
+        provider_metrics = {
+            "provider": "claude",
+            "input_tokens": uncached,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
+            "output_tokens": output_tokens,
             "thinking_tokens": thinking,
             "total_tokens": total,
         }

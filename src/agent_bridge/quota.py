@@ -252,8 +252,9 @@ def build_quota_advisory(
     now_utc: datetime | None = None,
     neon_pool_models: dict[str, list[str]] | None = None,
     codex_default_label: str | None = None,
+    claude_default_label: str | None = None,
 ) -> dict[str, Any]:
-    """Build a unified, weekly-reset-aware routing advisory across all 3 quota pools."""
+    """Build a unified, weekly-reset-aware routing advisory across all quota pools."""
     now = now_utc or datetime.now(timezone.utc)
     pools_info: list[dict[str, Any]] = []
     expiring_weekly_alerts: list[str] = []
@@ -412,6 +413,19 @@ def build_quota_advisory(
             rate_limit_reached=bool(enriched_codex.get("rate_limit_reached")),
         )
 
+    # Claude plan pool: known only from what the last Claude job reported.
+    claude_q = quota_by_backend.get("claude")
+    if isinstance(claude_q, dict) and claude_q.get("status") == "ok":
+        enriched_claude = enrich_quota_reading(claude_q, now_utc=now)
+        _summarize_pool(
+            pool="claude",
+            backend="claude",
+            label="Claude Code",
+            windows=enriched_claude.get("windows") or [],
+            models=[claude_default_label] if claude_default_label else ["sonnet (high)"],
+            rate_limit_reached=bool(enriched_claude.get("rate_limit_reached")),
+        )
+
     # Antigravity pools (both `Gemini Models` AND `Claude and GPT models`!)
     neon_q = quota_by_backend.get("neon")
     if isinstance(neon_q, dict) and neon_q.get("status") == "ok":
@@ -493,6 +507,91 @@ def build_quota_advisory(
         "upcoming_resets": upcoming_resets,
         "summary": summary_text,
     }
+
+
+CLAUDE_QUOTA_NOTE = (
+    "Claude Code has no command that prints the plan limits. This pool's reading comes from the last "
+    "Claude job the bridge ran, and stays unknown until one has run since the last reset. Claude jobs "
+    "draw on the same plan limits as your own Claude Code and claude.ai use."
+)
+
+# The names Claude Code gives its limit windows, as the bridge labels them.
+_CLAUDE_WINDOW_LABELS = {"five_hour": "5h", "seven_day": "weekly"}
+
+
+def claude_quota_from_rate_limit(
+    info: Any,
+    *,
+    fetched_at: str | None = None,
+) -> dict[str, Any] | None:
+    """Turn the `rate_limit_info` of a `claude -p` stream into a quota reading. None if it holds no window."""
+    if not isinstance(info, dict):
+        return None
+
+    raw_windows: dict[str, Any] = {}
+    unified = info.get("unifiedWindows")
+    if isinstance(unified, dict):
+        raw_windows.update({str(k): v for k, v in unified.items() if isinstance(v, dict)})
+    kind = info.get("rateLimitType")
+    if isinstance(kind, str) and kind and kind not in raw_windows:
+        raw_windows[kind] = info
+
+    windows: list[dict[str, Any]] = []
+    for key, raw in raw_windows.items():
+        used = _as_number(raw.get("utilization"))
+        if used is None or used < 0.0:
+            continue
+        used_pct = round(min(100.0, used * 100.0), 1)
+        windows.append(
+            {
+                "id": key,
+                "window": _CLAUDE_WINDOW_LABELS.get(key, key),
+                "used_percent": used_pct,
+                "remaining_percent": round(max(0.0, 100.0 - used_pct), 1),
+                "reset_time": _epoch_to_iso(raw.get("resetsAt")),
+            }
+        )
+    if not windows:
+        return None
+
+    return {
+        "backend": "claude",
+        "pool": "claude",
+        "status": "ok",
+        "source": "last_claude_job",
+        "fetched_at": fetched_at or _iso_now(),
+        "rate_limit_reached": info.get("status") == "rejected",
+        "windows": windows,
+        "note": CLAUDE_QUOTA_NOTE,
+    }
+
+
+def merge_claude_quota(
+    previous: dict[str, Any] | None,
+    new: dict[str, Any],
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """Keep the windows an older reading had and the new one does not mention, while they are still current.
+
+    A Claude job reports only the window that is closest to its limit, so one job's reading is partial.
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    merged = {k: v for k, v in new.items() if k not in {"cached", "cache_age_seconds"}}
+    seen = {str(w.get("id")) for w in merged.get("windows") or []}
+    kept: list[dict[str, Any]] = []
+    if isinstance(previous, dict) and previous.get("status") == "ok":
+        for w in previous.get("windows") or []:
+            if not isinstance(w, dict) or str(w.get("id")) in seen:
+                continue
+            reset_dt = _parse_iso_utc(w.get("reset_time"))
+            if reset_dt is None or (reset_dt - now).total_seconds() <= 0:
+                continue
+            kept.append(
+                {k: w[k] for k in ("id", "window", "used_percent", "remaining_percent", "reset_time") if k in w}
+            )
+    merged["windows"] = [*(merged.get("windows") or []), *kept]
+    return merged
 
 
 def parse_codex_rate_limits(

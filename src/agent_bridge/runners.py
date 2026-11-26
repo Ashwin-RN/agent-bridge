@@ -27,6 +27,7 @@ from agent_bridge.model_resolver import (
     is_newer_codex_model_in_same_family,
 )
 from agent_bridge.models import JobStatus, ProviderState, RunRequest, RunResult, UsageStatus
+from agent_bridge.nesting import subagent_env
 from agent_bridge.process_control import (
     ManagedProcess,
     ProcessContainmentError,
@@ -321,7 +322,8 @@ def classify_failure(
             "failed",
             "auth_error",
             local_state,
-            "CLI authentication failed. Re-authenticate the underlying CLI (`agy` or `codex login`) and retry.",
+            "CLI authentication failed. Re-authenticate the underlying CLI (`agy`, `codex login` or "
+            "`claude auth login`) and retry.",
         )
 
     if any(p.search(combined) for p in _QUOTA_PATTERNS):
@@ -330,7 +332,7 @@ def classify_failure(
             "quota_exceeded",
             local_state,
             "Subscription quota or rate limit reached. Call get_usage(include_quota=True) to check reset "
-            "times or delegate to the other backend.",
+            "times or delegate to another backend.",
         )
 
     if is_model_unavailable_error(combined):
@@ -703,7 +705,7 @@ async def _inspect_git_checkout(
     return branch, commit, common_dir
 
 
-async def prepare_codex_worktree(
+async def prepare_job_worktree(
     *,
     job_id: str,
     cwd: str,
@@ -714,7 +716,9 @@ async def prepare_codex_worktree(
     deadline: float | None = None,
     on_worktree_planned: OnWorktreePlannedCallback | None = None,
 ) -> dict[str, str | None]:
-    """Deterministically assign or reuse a per-job Git worktree BEFORE launching Codex.
+    """Deterministically assign or reuse a per-job Git worktree BEFORE launching the subagent.
+
+    Used by every backend that supports `worktree=True` (Codex and Claude).
 
     Assigning a dedicated worktree per `job_id` eliminates parallel worktree detection races,
     applies `deadline` to lock acquisition and every Git probe, and notifies `on_worktree_planned`
@@ -860,6 +864,10 @@ async def prepare_codex_worktree(
         "worktree_commit": head_commit,
         "git_common_dir": git_common_dir,
     }
+
+
+# The name this had while only Codex could use a worktree.
+prepare_codex_worktree = prepare_job_worktree
 
 
 async def _check_cli_health(cmd: list[str]) -> tuple[bool, str | None, str | None]:
@@ -1066,6 +1074,7 @@ class NeonRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 timeout=max(0.05, deadline - time.monotonic()),
+                env=subagent_env(job_id=request.job_id, owner_id=request.owner_id),
             )
         except asyncio.TimeoutError:
             status, reason, pstate, guidance = classify_failure(
@@ -2031,6 +2040,7 @@ class CodexRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 timeout=max(0.05, deadline - time.monotonic()),
+                env=subagent_env(job_id=request.job_id, owner_id=request.owner_id),
             )
         except asyncio.TimeoutError:
             status, reason, pstate, guidance = classify_failure(

@@ -24,7 +24,9 @@ from agent_bridge.config import (
     read_codex_local_defaults,
     resolve_backend_and_model_hint,
 )
+from agent_bridge.claude_runner import ClaudeRunner
 from agent_bridge.models import JobRecord, RunRequest, RunResult
+from agent_bridge.nesting import NOT_NESTED, NestedBridgeError, Nesting
 from agent_bridge.process_control import (
     CURRENT_PROCESS_TRACKER,
     ProcessContainmentError,
@@ -32,13 +34,20 @@ from agent_bridge.process_control import (
     is_pid_alive,
 )
 from agent_bridge.quota import (
+    CLAUDE_QUOTA_NOTE,
     build_quota_advisory,
+    claude_quota_from_rate_limit,
     enrich_quota_reading,
     fetch_codex_quota,
     fetch_neon_quota,
     has_passed_reset,
+    merge_claude_quota,
 )
-from agent_bridge.runners import CodexRunner, NeonRunner, prepare_codex_worktree
+from agent_bridge.runners import CodexRunner, NeonRunner, prepare_job_worktree
+
+ALL_BACKENDS: tuple[str, ...] = ("neon", "codex", "claude")
+# Backends whose edit jobs can run in a Git worktree the bridge makes for them.
+WORKTREE_BACKENDS: frozenset[str] = frozenset({"codex", "claude"})
 from agent_bridge.storage import BridgeStore, UsagePeriod, is_sqlite_lock_error
 
 logger = logging.getLogger("agent_bridge.jobs")
@@ -122,6 +131,7 @@ class JobManager:
         *,
         neon_runner: NeonRunner | None = None,
         codex_runner: CodexRunner | None = None,
+        claude_runner: ClaudeRunner | None = None,
         store: BridgeStore | None = None,
         owner_id: str | None = None,
         pid: int | None = None,
@@ -138,6 +148,9 @@ class JobManager:
         )
         self.neon_runner = neon_runner or NeonRunner(settings)
         self.codex_runner = codex_runner or CodexRunner(settings)
+        self.claude_runner = claude_runner or ClaudeRunner(settings)
+        # Set by the server at startup when this bridge runs inside a bridge job. Nothing starts then.
+        self.nesting: Nesting = NOT_NESTED
 
         # In-memory state is tracked ONLY for active (or uncommitted terminal) jobs and released on commit.
         self._local_jobs: dict[str, JobRecord] = {}
@@ -159,6 +172,15 @@ class JobManager:
             is_pid_alive_fn=self._is_pid_alive,
             stale_seconds=settings.owner_stale_seconds,
         )
+
+    def _runner_for(self, backend: str) -> NeonRunner | CodexRunner | ClaudeRunner:
+        if backend == "neon":
+            return self.neon_runner
+        if backend == "codex":
+            return self.codex_runner
+        if backend == "claude":
+            return self.claude_runner
+        raise ValueError(f"No runner for backend {backend!r}.")
 
     async def _db(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Run a SQLite store call off the asyncio event loop so lock waits never stall MCP traffic."""
@@ -297,7 +319,9 @@ class JobManager:
         elif inferred_backend is not None:
             resolved_backend = inferred_backend
         else:
-            raise ValueError("backend is required ('neon', 'agy-claude', 'agy-opus', 'agy-gpt', or 'codex').")
+            raise ValueError(
+                "backend is required ('neon', 'agy-claude', 'agy-opus', 'agy-gpt', 'codex', or 'claude')."
+            )
 
         # Also inherit latest executed session context when resuming by raw session_id (or if newer turn exists).
         if resolved_session_id:
@@ -324,8 +348,8 @@ class JobManager:
                     prior_quota_pool = latest_ctx.get("quota_pool")
 
         resolved_mode = normalize_mode(mode)
-        if worktree and resolved_backend != "codex":
-            raise ValueError("worktree=True is only supported for the 'codex' backend.")
+        if worktree and resolved_backend not in WORKTREE_BACKENDS:
+            raise ValueError("worktree=True is only supported for the 'codex' and 'claude' backends.")
         if worktree and resolved_mode != "edit":
             raise ValueError("worktree=True requires mode='edit'.")
 
@@ -456,8 +480,11 @@ class JobManager:
         return await self._db(self.prepare_request, **kwargs)
 
     def _build_and_schedule_job(self, request: RunRequest, *, persist_sync: bool) -> JobRecord:
+        if self.nesting.nested:
+            raise NestedBridgeError(self.nesting.refusal("start a job"))
         job_id = f"{request.backend}-{uuid.uuid4().hex[:8]}"
         request.job_id = job_id
+        request.owner_id = self.owner_id
         preview_source = (
             request.prompt
             if request.prompt.strip()
@@ -882,7 +909,7 @@ class JobManager:
         tracker: ProcessTracker,
         deadline: float,
     ) -> None:
-        runner = self.neon_runner if request.backend == "neon" else self.codex_runner
+        runner = self._runner_for(request.backend)
         progress_pending: list[dict[str, Any]] = []
         progress_flusher: asyncio.Task[None] | None = None
         fatal_progress_exc: BaseException | None = None
@@ -1146,10 +1173,10 @@ class JobManager:
             record.last_activity = starting_activity
 
             # 3. Pre-assign a dedicated Git worktree BEFORE launch and persist planned path before invoking Git.
-            if request.backend == "codex" and request.worktree:
+            if request.backend in WORKTREE_BACKENDS and request.worktree:
                 record.last_activity = "preparing git worktree"
                 _schedule_progress(lock_timeout=0.5, last_activity=record.last_activity)
-                wt_info = await prepare_codex_worktree(
+                wt_info = await prepare_job_worktree(
                     job_id=record.job_id,
                     cwd=request.cwd,
                     state_dir=self.settings.state_dir,
@@ -1467,6 +1494,9 @@ class JobManager:
                 else (round(tracker.total_cleanup_seconds, 2) if tracker.total_cleanup_seconds > 0 else None)
             )
             record.last_activity = record.status
+
+            if record.backend == "claude":
+                await self._remember_claude_rate_limit(result.provider_metrics)
 
             finalized_committed = await self._finalize_job_durable(
                 record,
@@ -1911,10 +1941,12 @@ class JobManager:
                 targets = [norm_backend]
             elif norm_pool == "codex":
                 targets = ["codex"]
+            elif norm_pool == "claude":
+                targets = ["claude"]
             elif norm_pool in {"agy_gemini", "agy_claude_gpt"}:
                 targets = ["neon"]
             else:
-                targets = ["neon", "codex"]
+                targets = list(ALL_BACKENDS)
             quota = await self.get_quota(targets, refresh=refresh_quota)
             summary["quota"] = quota
             summary["quota_advisory"] = self._build_quota_advisory(quota)
@@ -1933,11 +1965,25 @@ class JobManager:
             or local_defaults.get("model_reasoning_effort")
             or "default"
         )
+        claude_model, claude_effort = self.claude_runner.effective_model_and_effort(None, None)
         return build_quota_advisory(
             quota,
             neon_pool_models=self.neon_runner.catalog.group_models_by_quota_pool(),
             codex_default_label=f"{eff_codex_model} (effort={eff_codex_effort})",
+            claude_default_label=f"{claude_model or 'claude-default'} (effort={claude_effort or 'default'})",
         )
+
+    async def _remember_claude_rate_limit(self, provider_metrics: dict[str, Any] | None) -> None:
+        """Keep the plan limits a Claude job reported, as the only quota reading there is for that pool."""
+        info = provider_metrics.get("rate_limit") if isinstance(provider_metrics, dict) else None
+        reading = claude_quota_from_rate_limit(info)
+        if reading is None:
+            return
+        try:
+            previous = await self._db(self.store.get_cached_quota, "claude", float("inf"))
+            await self._db(self.store.set_cached_quota, "claude", merge_claude_quota(previous, reading))
+        except Exception as exc:
+            logger.debug("Could not store Claude rate limit reading: %s", exc)
 
     async def get_quota(
         self,
@@ -1946,6 +1992,20 @@ class JobManager:
         refresh: bool = False,
     ) -> dict[str, Any]:
         async def _probe_one(bname: str) -> tuple[str, dict[str, Any]]:
+            if bname == "claude":
+                # Claude Code has no command that prints the plan limits. The reading is whatever the
+                # last Claude job's output carried, however old, until its reset time passes.
+                last = await self._db(self.store.get_cached_quota, "claude", float("inf"))
+                if last is None or has_passed_reset(last):
+                    return bname, {
+                        "backend": "claude",
+                        "pool": "claude",
+                        "status": "unknown",
+                        "source": "last_claude_job",
+                        "note": CLAUDE_QUOTA_NOTE,
+                    }
+                return bname, enrich_quota_reading(last)
+
             if not refresh:
                 cached = await self._db(
                     self.store.get_cached_quota,

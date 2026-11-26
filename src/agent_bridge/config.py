@@ -9,13 +9,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-BackendName = Literal["neon", "codex"]
-QuotaPool = Literal["agy_gemini", "agy_claude_gpt", "codex"]
+BackendName = Literal["neon", "codex", "claude"]
+QuotaPool = Literal["agy_gemini", "agy_claude_gpt", "codex", "claude"]
 ExecutionMode = Literal["read_only", "edit"]
 EffortLevel = Literal["low", "medium", "high", "xhigh"]
 
 DEFAULT_CODEX_MODEL = "gpt-6.2-sol"
 DEFAULT_CODEX_EFFORT: EffortLevel = "high"
+DEFAULT_CLAUDE_MODEL = "sonnet"
+DEFAULT_CLAUDE_EFFORT: EffortLevel = "high"
+
+# Names the `claude` CLI resolves to its newest model of that family.
+CLAUDE_MODEL_ALIASES: frozenset[str] = frozenset({"sonnet", "opus", "haiku", "fable"})
+_INHERIT_TOKENS: frozenset[str] = frozenset({"auto", "latest", "default", "inherit", "cli"})
 
 BACKEND_ALIASES: dict[str, BackendName] = {
     "neon": "neon",
@@ -33,6 +39,10 @@ BACKEND_ALIASES: dict[str, BackendName] = {
     "codex": "codex",
     "gpt": "codex",
     "openai": "codex",
+    "claude": "claude",
+    "claude-code": "claude",
+    "claude_code": "claude",
+    "anthropic": "claude",
 }
 
 BACKEND_DEFAULT_MODEL_HINTS: dict[str, str] = {
@@ -86,6 +96,10 @@ QUOTA_POOL_ALIASES: dict[str, QuotaPool] = {
     "agy-gpt": "agy_claude_gpt",
     "claude_gpt": "agy_claude_gpt",
     "codex": "codex",
+    "claude": "claude",
+    "claude-code": "claude",
+    "claude_code": "claude",
+    "anthropic": "claude",
 }
 
 _AGY_THIRD_PARTY_MODEL_RE = re.compile(
@@ -103,7 +117,8 @@ def normalize_backend(value: str) -> BackendName:
         valid = ", ".join(sorted(set(BACKEND_ALIASES.values())))
         raise ValueError(
             f"Unknown backend {value!r}. Expected one of: {valid} "
-            f"(aliases: agy, gemini, agy-claude, agy-opus, agy-sonnet, agy-gpt, gpt, openai)."
+            f"(aliases: agy, gemini, agy-claude, agy-opus, agy-sonnet, agy-gpt, gpt, openai, "
+            f"claude-code, anthropic)."
         )
     return BACKEND_ALIASES[key]
 
@@ -127,15 +142,18 @@ def normalize_quota_pool(value: str | None) -> QuotaPool | None:
     key = value.strip().lower()
     if key not in QUOTA_POOL_ALIASES:
         raise ValueError(
-            f"Unknown quota_pool {value!r}. Expected one of: agy_gemini, agy_claude_gpt, codex."
+            f"Unknown quota_pool {value!r}. Expected one of: agy_gemini, agy_claude_gpt, codex, claude."
         )
     return QUOTA_POOL_ALIASES[key]
 
 
 def classify_quota_pool(backend: str, model: str | None = None) -> QuotaPool:
-    """Map `(backend, model)` onto one of the three independent subscription quota pools."""
+    """Map `(backend, model)` onto one of the four independent subscription quota pools."""
     if backend == "codex":
         return "codex"
+    # The backend decides first: `sonnet` on the `claude` backend is the Claude plan, not the agy pool.
+    if backend == "claude":
+        return "claude"
     if model and _AGY_THIRD_PARTY_MODEL_RE.search(model.strip()):
         return "agy_claude_gpt"
     return "agy_gemini"
@@ -161,6 +179,26 @@ def normalize_effort(value: str | None) -> EffortLevel | None:
             f"Unknown effort {value!r}. Expected one of: low, medium, high, xhigh."
         )
     return EFFORT_ALIASES[key]
+
+
+def split_claude_model_and_effort(model: str | None) -> tuple[str | None, EffortLevel | None]:
+    """Split `opus-high` or `claude-sonnet-medium` into `("opus", "high")`; leave full model ids alone.
+
+    The `claude` CLI takes the family name and the effort as separate flags, while the other backends
+    accept `<model>-<effort>` shortcuts. Only a known family name followed by a known effort is split.
+    """
+    if model is None or not model.strip():
+        return None, None
+    raw = model.strip()
+    key = raw.lower()
+    if key.startswith("claude-") and key[len("claude-"):].split("-")[0] in CLAUDE_MODEL_ALIASES:
+        key = key[len("claude-"):]
+    if key in CLAUDE_MODEL_ALIASES:
+        return key, None
+    family, _, tail = key.partition("-")
+    if family in CLAUDE_MODEL_ALIASES and tail in EFFORT_ALIASES:
+        return family, EFFORT_ALIASES[tail]
+    return raw, None
 
 
 def clamp_timeout(timeout_seconds: int | None, default: int) -> int:
@@ -206,6 +244,9 @@ class Settings:
     agy_bin: str | None
     codex_bin: str | None
     default_cwd: Path
+    default_claude_model: str | None = DEFAULT_CLAUDE_MODEL
+    default_claude_effort: EffortLevel | None = DEFAULT_CLAUDE_EFFORT
+    claude_bin: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -229,6 +270,22 @@ class Settings:
         else:
             default_codex_effort = normalize_effort(raw_codex_effort)
 
+        raw_claude_model = os.environ.get("AGENT_BRIDGE_CLAUDE_MODEL")
+        if raw_claude_model is None or not raw_claude_model.strip():
+            default_claude_model: str | None = DEFAULT_CLAUDE_MODEL
+        elif raw_claude_model.strip().lower() in _INHERIT_TOKENS:
+            default_claude_model = None
+        else:
+            default_claude_model = raw_claude_model.strip()
+
+        raw_claude_effort = os.environ.get("AGENT_BRIDGE_CLAUDE_EFFORT")
+        if raw_claude_effort is None or not raw_claude_effort.strip():
+            default_claude_effort: EffortLevel | None = DEFAULT_CLAUDE_EFFORT
+        elif raw_claude_effort.strip().lower() in _INHERIT_TOKENS:
+            default_claude_effort = None
+        else:
+            default_claude_effort = normalize_effort(raw_claude_effort)
+
         default_timeout = int(os.environ.get("AGENT_BRIDGE_DEFAULT_TIMEOUT", "300"))
         max_concurrent = max(1, int(os.environ.get("AGENT_BRIDGE_MAX_CONCURRENT", "8")))
         max_stored = max(20, int(os.environ.get("AGENT_BRIDGE_MAX_STORED_JOBS", "500")))
@@ -243,6 +300,7 @@ class Settings:
         )
         agy_bin = os.environ.get("AGENT_BRIDGE_AGY_BIN", "").strip() or None
         codex_bin = os.environ.get("AGENT_BRIDGE_CODEX_BIN", "").strip() or None
+        claude_bin = os.environ.get("AGENT_BRIDGE_CLAUDE_BIN", "").strip() or None
         default_cwd_raw = os.environ.get("AGENT_BRIDGE_DEFAULT_CWD", "").strip()
         default_cwd = (
             Path(default_cwd_raw).expanduser().resolve()
@@ -264,4 +322,7 @@ class Settings:
             agy_bin=agy_bin,
             codex_bin=codex_bin,
             default_cwd=default_cwd,
+            default_claude_model=default_claude_model,
+            default_claude_effort=default_claude_effort,
+            claude_bin=claude_bin,
         )

@@ -18,6 +18,10 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(tmp_path: Path) -> 
     env["AGENT_BRIDGE_DEFAULT_TIMEOUT"] = "185"
     env["AGENT_BRIDGE_AGY_BIN"] = str(tmp_path / "missing-agy.exe")
     env["AGENT_BRIDGE_CODEX_BIN"] = str(tmp_path / "missing-codex.exe")
+    env["AGENT_BRIDGE_CLAUDE_BIN"] = str(tmp_path / "missing-claude.exe")
+    # This test is about a bridge that a host started, wherever the test run itself was started from.
+    env.pop("AGENT_BRIDGE_PARENT_JOB", None)
+    env.pop("AGENT_BRIDGE_PARENT_OWNER", None)
 
     server_params = StdioServerParameters(
         command=sys.executable,
@@ -73,3 +77,25 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(tmp_path: Path) -> 
             assert lb_payload["backends"]["codex"]["available"] is False
             assert lb_payload["backends"]["codex"]["default_model"] == "gpt-6.2-sol"
             assert lb_payload["backends"]["codex"]["default_effort"] == "high"
+            assert lb_payload["backends"]["claude"]["command_found"] is False
+            assert lb_payload["backends"]["claude"]["available"] is False
+            assert lb_payload["backends"]["claude"]["default_model"] == "sonnet"
+            assert lb_payload["backends"]["claude"]["default_effort"] == "high"
+            assert lb_payload["nesting"] == {"nested": False}
+
+            # The host is not assumed to be any one CLI, and every backend is offered to it.
+            assert "whichever CLI you are yourself" in init.instructions
+            assert "your Claude Code subscription" not in init.instructions
+            for backend_name in ("`codex`", "`neon`", "`claude`"):
+                assert backend_name in init.instructions
+
+            # A refusal reaches the host with its reason, not as a bare "Error executing tool".
+            bad = await session.call_tool("run_agent", {"backend": "bogus", "prompt": "x"})
+            assert bad.is_error
+            assert "Unknown backend 'bogus'" in bad.content[0].text
+            wt = await session.call_tool(
+                "run_agent",
+                {"backend": "neon", "prompt": "x", "mode": "edit", "worktree": True},
+            )
+            assert wt.is_error
+            assert "only supported for the 'codex' and 'claude' backends" in wt.content[0].text

@@ -824,6 +824,7 @@ async def spawn_managed_process(
     stderr: int | None = asyncio.subprocess.PIPE,
     tracker: ProcessTracker | None = None,
     timeout: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[asyncio.subprocess.Process, ManagedProcess]:
     """Spawn and register a contained subprocess as one deadline-bounded, cancellation-safe operation.
 
@@ -912,6 +913,7 @@ async def spawn_managed_process(
                 stdin=stdin,
                 stdout=stdout,
                 stderr=stderr,
+                env=env,
                 **subprocess_creation_kwargs(suspended=use_suspended),
             )
         finally:
