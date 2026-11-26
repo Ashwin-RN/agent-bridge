@@ -53,7 +53,7 @@ What you can do with it:
 | A host: Claude Code, Codex, Antigravity or another MCP client | The CLI that calls the bridge. It needs to run a stdio MCP server, nothing more |
 | `codex` CLI, installed and signed in | For the `codex` backend |
 | `agy` CLI 1.5.7 or newer, installed and signed in | For the Gemini, Claude and GPT models that Antigravity offers. From 1.5.7 a headless run lets shell commands through in `agy`'s own sandbox; the bridge relies on that |
-| `claude` CLI (Claude Code), installed and signed in | For the `claude` backend. See [Claude as a backend](#claude-as-a-backend) for how it uses your plan |
+| `claude` CLI (Claude Code) 2.1.259 or newer, installed and signed in | For the `claude` backend. Older versions lack a flag the bridge passes, and show `available: false`. See [Claude as a backend](#claude-as-a-backend) for how it uses your plan |
 | `git` | Only for worktree edits and code review |
 
 You need at least one of `codex`, `agy` and `claude` besides your host. A CLI that is missing shows `command_found: false` in `list_backends` and its jobs fail; everything else works. The same CLI can be the host in one window and a backend in another.
@@ -241,6 +241,7 @@ For `agy` the effort is part of the model name (`neon-medium`, `claude-opus-high
 - **Default.** `sonnet` at `high`, whatever your own Claude Code default is. Change it with `AGENT_BRIDGE_CLAUDE_MODEL` and `AGENT_BRIDGE_CLAUDE_EFFORT`.
 - **Your plan.** A Claude job draws on the same 5 hour and weekly limits as your own Claude Code and claude.ai use. Anthropic's help page says so: signed in with a plan, "the Claude Agent SDK and `claude -p` still draw from your subscription limits". From a Claude Code host, your own native subagents are usually the better way to reach Claude; this backend is for reaching Claude from Codex, Antigravity or another host.
 - **Sign-in.** The bridge starts the unmodified `claude` binary, signed in the way you signed it in. It never reads, copies or forwards the login token, and it never passes `--bare`. Each person who installs the bridge signs in to Claude Code themselves, under their own agreement with Anthropic. Anthropic's rules for Claude Code say they do not "prevent an end user from signing in to the unmodified Claude Code binary with their own Claude subscription", and they forbid tools that "collect, store, or intermediate" those credentials for others. No page names a local tool that starts the binary for you, so read [their page](https://code.claude.com/docs/en/legal-and-compliance) before building anything on this for other people.
+- **API keys.** With `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` in the host's environment, Claude Code would bill that API account instead of your plan, without saying so. The bridge leaves both out of a Claude job's environment. Set `AGENT_BRIDGE_CLAUDE_AUTH=inherit` to pass them on; a run billed to a key then says so in `model_notice`.
 - **What it loads.** Your `CLAUDE.md` files and settings, so repository rules apply. No MCP servers at all (`--strict-mcp-config`): a Claude subagent cannot reach your connectors, or the bridge.
 - **No model fallback.** If the CLI rejects the model, the job fails with the CLI's message. Only a network or server error on a new `read_only` job is retried, once.
 
@@ -486,7 +487,7 @@ The bridge does not sandbox anything itself. It asks each CLI to, and the CLI's 
 | `codex`, review with no `focus` | Sandbox `read-only` | Read only |
 | `agy`, `read_only` | No mode flag, and an instruction at the top of the prompt: this is a read-only run, change no file, say at the end whether you changed one | Read-only by instruction, not by a sandbox. `agy` is able to write files here, so check `git status` after a run that matters. Shell commands run in `agy`'s own sandbox |
 | `agy`, `edit` | No mode flag | `agy`'s default headless mode: it may edit files in `cwd` and `extra_dirs`, and shell commands run in its own sandbox |
-| `claude`, `read_only` | Permission mode `dontAsk`, and nobody to answer a prompt | It reads, searches and runs shell commands that only read. A write, or a command that changes something, is denied. In a test, `Write` and `echo y > z.txt` were both denied and `git status` ran. No web access |
+| `claude`, `read_only` | Permission mode `dontAsk`, the writing tools removed (`Write`, `Edit`, `NotebookEdit`), and nobody to answer a prompt | It reads and searches, and may run shell commands that only read. It has no tool that writes a file, and a shell command that changes something is denied, unless your own Claude Code settings allow that exact command for good. In tests a write by tool and a write by shell were both refused, and the folder stayed clean. No web access |
 | `claude`, `edit` | Permission mode `auto`, and deny rules for `git push` | File edits are accepted. Claude Code's own classifier decides each shell command. There is no sandbox: a command the classifier lets through runs with your rights, network included |
 | `claude`, `edit`, `worktree=True` | The same, in the new worktree | Edits land in the worktree. In a test the file was made there, the main checkout stayed clean, and `git push origin HEAD` was denied |
 
@@ -609,7 +610,7 @@ Without `include_quota`, `get_usage` reports only what the bridge itself ran: ru
 - `exact` and `delta` counts go into the token totals. `partial` counts are shown apart, and `missing` means the CLI gave no figure.
 - A job that was retried counts as one run with two attempts.
 - Work you do in `codex`, `agy` or `claude` outside the bridge is not in these counts. For `codex` and `agy` it does show in the quota reading.
-- For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.cost_usd_estimate` is Claude Code's own estimate at list prices, not a bill.
+- For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.session_cost_usd_estimate` is Claude Code's own estimate at list prices, not a bill; on a resume it covers the earlier turns of the session too. If the job started native subagents of its own, their tokens are not in the counts, and `provider_metrics.native_subagents` says how many there were.
 - Codex's built-in review (`review_code` with no `focus`) reports no token counts, so it shows as 0 tokens.
 
 ## A bridge inside a bridge
@@ -633,7 +634,7 @@ How a bridge knows:
 
 All three were checked with real runs on Windows: a Codex job and an `agy` job, each with the bridge registered, were refused, and a Claude job reported no MCP tools.
 
-What it does not cover: the process-tree check needs both bridges to use the same state folder, which they do unless you set `AGENT_BRIDGE_STATE_DIR` differently per host. On macOS and Linux the check reads `/proc` or `ps`; those paths have unit tests for their parsing but were not run on a real machine here.
+What it does not cover: the process-tree check needs both bridges to use the same state folder, which they do unless you set `AGENT_BRIDGE_STATE_DIR` differently per host. A parent process whose start time cannot be read is not counted as a bridge, so that a process id left over from a dead bridge can never lock an ordinary host out; the price is that such a parent is missed. On macOS and Linux the check reads `/proc` or `ps`; those paths have unit tests for their parsing but were not run on a real machine here.
 
 ## Optional instructions snippet
 
@@ -698,6 +699,7 @@ AGENT_BRIDGE_DEFAULT_TIMEOUT = "900"
 | `AGENT_BRIDGE_CODEX_EFFORT` | `high` | The Codex effort: `low`, `medium`, `high`, `xhigh`. `inherit`, `cli`, `default` or `auto` uses `~/.codex/config.toml`. An unknown value stops the bridge from starting |
 | `AGENT_BRIDGE_CLAUDE_MODEL` | `sonnet` | The model for `backend="claude"` when none is named. `auto`, `latest`, `default`, `inherit` or `cli` leaves the choice to Claude Code |
 | `AGENT_BRIDGE_CLAUDE_EFFORT` | `high` | The Claude effort: `low`, `medium`, `high`, `xhigh`. `inherit`, `cli`, `default` or `auto` leaves it to Claude Code. An unknown value stops the bridge from starting |
+| `AGENT_BRIDGE_CLAUDE_AUTH` | `plan` | `plan` leaves `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` out of a Claude job, so it runs on the plan `claude` is signed in to. `inherit` passes them on. An unknown value stops the bridge from starting |
 | `AGENT_BRIDGE_DEFAULT_TIMEOUT` | `300` | The job deadline in seconds when a call gives none. Kept within 10 to 3600 |
 | `AGENT_BRIDGE_MAX_CONCURRENT` | `8` | Jobs running at once in one window. At least 1 |
 | `AGENT_BRIDGE_MAX_STORED_JOBS` | `500` | Jobs kept in the database. At least 20 |
@@ -781,6 +783,9 @@ Run the line for each host you registered it in. Then remove any worktrees you n
 | In Antigravity, a tool call is denied or waits for approval | MCP tools are in Ask mode until allowed. Add `"mcp(agent-bridge/*)"` to `permissions.allow` |
 | `nested_bridge` | The call came from a subagent that the bridge itself started. That is refused on purpose: see [A bridge inside a bridge](#a-bridge-inside-a-bridge). If it comes from your own chat, `AGENT_BRIDGE_PARENT_JOB` is set in that host's environment: unset it |
 | A tool error that reads only "Error executing tool ..." | A crash inside the bridge, not a refusal. The bridge's log on stderr has the traceback |
+| The `claude` backend shows `available: false` and "too old" | Claude Code is older than 2.1.259. Update it |
+| "... is a shell shim, which the bridge will not start" | On Windows, `claude` resolved to a `.cmd` file with no script the bridge could run directly. Set `AGENT_BRIDGE_CLAUDE_BIN` to `claude.exe` |
+| Every `claude` job fails at once on a managed machine | The bridge passes `--strict-mcp-config`. Claude Code's docs describe setups with a managed MCP file where that flag is not accepted; not tested here |
 | A `claude` job fails with `auth_error` | Claude Code is not signed in for that user. Run `claude auth login`, or `claude` and `/login` |
 | A `claude` job in `read_only` ends with "denied" in its reply | It tried to write or to run a changing command. That is the mode working. Use `mode="edit"` if you meant it to change things |
 | `command_found: false` for a backend | That CLI is not on `PATH`. Install it, or set `AGENT_BRIDGE_AGY_BIN` or `AGENT_BRIDGE_CODEX_BIN` |
