@@ -10,8 +10,8 @@ per-turn (delta) count. Everything else is listed apart by job id and never adde
   none, such as Codex's built-in review);
 - runs the records cannot speak for: the window that ran the job closed before it finished, the job row
   has been pruned, or the bridge could not confirm whether the job's CLI ran;
-- Claude runs that started subagents of their own, whose tokens Claude Code does not report, and Claude
-  runs that did not say whether they started any;
+- Claude subagent tokens outside the reported counts, and Claude runs that did not say whether they
+  started subagents;
 - any part of the period from before the bridge's first record.
 
 A run whose CLI was never started is counted, as a run that spent nothing. Live quota readings and Claude
@@ -251,9 +251,10 @@ def build_dashboard(
                 never_started[job_id] = None
 
         if backend == "claude" and (counted or usage_status == "partial"):
-            spawned = _metrics(row["provider_metrics_json"]).get("native_subagents")
+            metrics = _metrics(row["provider_metrics_json"])
+            spawned = metrics.get("native_subagents")
             if isinstance(spawned, int) and not isinstance(spawned, bool):
-                if spawned > 0:
+                if spawned > 0 and metrics.get("usage_scope") != "whole_job":
                     subagents[job_id] = subagents.get(job_id, 0) + spawned
             else:
                 subagents_unreported[job_id] = None
@@ -365,8 +366,8 @@ def build_dashboard(
             "claude_subagents": {
                 **_id_list(list(subagents)),
                 "subagents": sum(subagents.values()),
-                "why": "Claude Code reports the main agent's tokens only. Its subagents' tokens are spent "
-                "but not counted.",
+                "why": "These runs counted the main agent's tokens only. Whole-job counts from new "
+                "sessions include subagent usage when Claude Code reports it.",
             },
             "claude_subagents_not_on_record": {
                 **_id_list(list(subagents_unreported)),

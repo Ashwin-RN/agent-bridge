@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from agent_bridge.config import EffortLevel, Settings, normalize_backend
 from agent_bridge.jobs import JobManager
 from agent_bridge.model_resolver import ModelPoolUnavailableError
-from agent_bridge.nesting import NestedBridgeError, Nesting, ancestor_chain, detect_nesting
+from agent_bridge.nesting import UNKNOWN_NESTING, NestedBridgeError, Nesting, detect_nesting
 from agent_bridge.storage import UsagePeriod
 
 DashboardPeriod = Literal["today", "7d", "30d", "all", "session"]
@@ -212,15 +212,13 @@ def _reported(fn: _ToolFn) -> _ToolFn:
 
 
 def _detect_nesting(job_manager: JobManager) -> Nesting:
-    """Find out, once at startup, whether this bridge runs inside a bridge job. Never raises."""
+    """Try to find out whether this bridge runs inside a bridge job."""
     try:
-        return detect_nesting(
-            live_owners=job_manager.store.list_live_owners(),
-            ancestors=ancestor_chain(),
-        )
+        return detect_nesting(live_owners=job_manager.store.list_live_owners())
     except Exception as exc:
         logging.getLogger("agent_bridge.server").warning("Nesting check failed: %s", exc)
-        return detect_nesting(live_owners=(), ancestors=())
+        marker = detect_nesting(ancestors=())
+        return marker if marker.nested else UNKNOWN_NESTING
 
 
 def create_server(
@@ -238,6 +236,9 @@ def create_server(
     job_manager.nesting = nest
 
     def _refuse_if_nested(tool: str) -> None:
+        nest = job_manager.nesting
+        if nest.nested is None:
+            nest = job_manager.nesting = _detect_nesting(job_manager)
         if nest.nested:
             raise NestedBridgeError(nest.refusal(tool))
 
@@ -792,7 +793,7 @@ def create_server(
             "max_concurrent_jobs_per_process": cfg.max_concurrent_jobs,
             "db_path": str(job_manager.store.db_path),
             "session_usage": await job_manager.session_compact_summary_async(),
-            "nesting": nest.to_dict(),
+            "nesting": job_manager.nesting.to_dict(),
             "backends": {
                 "neon": neon_info,
                 "codex": codex_info,

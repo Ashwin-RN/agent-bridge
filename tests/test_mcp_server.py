@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -11,8 +10,10 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
-async def test_stdio_mcp_handshake_tools_and_default_timeout(tmp_path: Path) -> None:
-    env = dict(os.environ)
+async def test_stdio_mcp_handshake_tools_and_default_timeout(
+    tmp_path: Path, plain_host_env: dict[str, str],
+) -> None:
+    env = plain_host_env
     env["AGENT_BRIDGE_STATE_DIR"] = str(tmp_path / "state")
     env["AGENT_BRIDGE_DEFAULT_CWD"] = str(tmp_path)
     env["AGENT_BRIDGE_DEFAULT_TIMEOUT"] = "185"

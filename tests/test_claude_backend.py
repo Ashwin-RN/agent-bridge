@@ -6,6 +6,7 @@ backend is pointed at a path that does not exist.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -106,7 +107,21 @@ final = {"type": "result", "subtype": "success", "is_error": False, "session_id"
 if "SPAWNED_NONE" in prompt:
     # What Claude Code 2.1.332 reports for a run that started no subagents.
     final["subagent_stats"] = {"spawned": 0, "completed": 0, "failed": 0}
+if "SPAWNED_SUBAGENT" in prompt:
+    final["subagent_stats"] = {"spawned": 1}
+    final["usage"] = {"input_tokens": 4, "output_tokens": 248,
+                      "cache_read_input_tokens": 49131, "cache_creation_input_tokens": 14814}
+    final["modelUsage"] = {
+        "main": {"inputTokens": 4, "outputTokens": 248,
+                 "cacheReadInputTokens": 49131, "cacheCreationInputTokens": 14814},
+        "subagent": {"inputTokens": 2, "outputTokens": 4,
+                     "cacheReadInputTokens": 0, "cacheCreationInputTokens": 24031},
+    }
+if "CANCEL_ERROR" in prompt:
+    final.update(subtype="error_during_execution", is_error=True, result="interrupted")
 emit(final)
+if "CANCEL_" in prompt:
+    time.sleep(60)
 '''
 
 
@@ -779,6 +794,57 @@ async def test_a_reported_zero_subagents_is_recorded_and_an_unreported_count_is_
     stored = manager.store.get_job(reported.job_id)
     assert stored is not None and stored.provider_metrics["native_subagents"] == 0
     await manager.shutdown()
+
+
+@pytest.mark.parametrize("prompt,usage_status", [("CANCEL_SUCCESS", "exact"), ("CANCEL_ERROR", "partial")])
+async def test_cancelled_claude_keeps_result_usage(tmp_path: Path, prompt: str, usage_status: str) -> None:
+    manager = _manager(tmp_path)
+    try:
+        job = await manager.start_async(manager.prepare_request(backend="claude", prompt=prompt))
+        async with asyncio.timeout(10):
+            while manager._local_jobs[job.job_id].last_activity != "finishing":
+                await asyncio.sleep(0.01)
+        await manager.cancel(job.job_id)
+        stored = manager.store.get_job(job.job_id)
+        assert stored is not None and stored.status == "cancelled"
+        assert stored.usage_status == usage_status
+        assert stored.usage is not None and stored.usage["total_tokens"] == 6136
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+async def test_claude_subagent_token_scope(tmp_path: Path, resumed: bool) -> None:
+    manager = _manager(tmp_path)
+    try:
+        resume_from = None
+        if resumed:
+            first = await manager.run(manager.prepare_request(backend="claude", prompt="hello"))
+            assert first.session_id
+            resume_from = first.job_id
+        record = await manager.run(
+            manager.prepare_request(backend="claude", prompt="SPAWNED_SUBAGENT", resume_from=resume_from)
+        )
+        assert record.status == "completed" and record.usage_status == "exact"
+        assert record.usage == {
+            "input_tokens": 63949 if resumed else 87982,
+            "output_tokens": 248 if resumed else 252,
+            "cached_tokens": 49131,
+            "cache_write_tokens": 14814 if resumed else 38845,
+            "reasoning_tokens": 0,
+            "total_tokens": 64197 if resumed else 88234,
+        }
+        metrics = record.provider_metrics
+        assert metrics is not None and metrics["native_subagents"] == 1
+        assert metrics.get("usage_scope") == ("main_agent" if resumed else "whole_job")
+        assert {key: metrics[key] for key in (
+            "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+        )} == {
+            "input_tokens": 4, "output_tokens": 248,
+            "cache_read_input_tokens": 49131, "cache_creation_input_tokens": 14814,
+        }
+    finally:
+        await manager.shutdown()
 
 
 async def test_list_backends_and_review_code_know_the_claude_backend(tmp_path: Path) -> None:

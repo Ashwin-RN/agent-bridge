@@ -61,6 +61,15 @@ class ProcessContainmentError(RuntimeError):
         self.process_still_alive = process_still_alive
         super().__init__(message)
 
+
+class ProcessStartupTimeout(TimeoutError):
+    """Startup exceeded its deadline, with the outcome of any required cleanup."""
+
+    def __init__(self, message: str, *, process_stopped: bool) -> None:
+        self.process_stopped = process_stopped
+        super().__init__(message)
+
+
 # Windows Win32 constants
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
@@ -833,15 +842,17 @@ async def spawn_managed_process(
       still kills and verifies the full process group (POSIX) or suspended process (Windows).
     - Applies `timeout` to startup itself so delayed launches cannot overrun a short deadline.
     """
+    launch_deadline = time.monotonic() + timeout if timeout is not None else None
     _ensure_spawn_capture_hook()
     use_suspended = sys.platform == "win32"
     resolved_tracker = tracker if tracker is not None else CURRENT_PROCESS_TRACKER.get()
     caller_cancelled = False
+    process_stopped = True
     early_popen: Any = None
     early_pid: int | None = None
 
-    if timeout is not None and timeout <= 0:
-        raise asyncio.TimeoutError("Execution deadline expired before subprocess launch.")
+    if launch_deadline is not None and launch_deadline <= time.monotonic():
+        raise ProcessStartupTimeout("Execution deadline expired before subprocess launch.", process_stopped=True)
 
     def _capture_popen(popen_obj: Any) -> None:
         nonlocal early_popen, early_pid
@@ -903,8 +914,11 @@ async def spawn_managed_process(
                 resolved_tracker.add_cleanup_seconds(time.monotonic() - c0)
 
     async def _launch() -> tuple[asyncio.subprocess.Process, ManagedProcess] | None:
+        nonlocal process_stopped
         if caller_cancelled:
             return None
+        if launch_deadline is not None and launch_deadline <= time.monotonic():
+            raise ProcessStartupTimeout("Execution deadline expired before subprocess launch.", process_stopped=True)
         tok = _SPAWN_CAPTURE.set(_capture_popen)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -920,7 +934,7 @@ async def spawn_managed_process(
             _SPAWN_CAPTURE.reset(tok)
 
         if caller_cancelled and use_suspended:
-            await _reap_failed_windows_proc(proc)
+            process_stopped = not await _reap_failed_windows_proc(proc)
             return None
         try:
             managed = ManagedProcess(
@@ -941,15 +955,17 @@ async def spawn_managed_process(
     )
     timed_out_during_spawn = False
     try:
-        if timeout is None:
+        if launch_deadline is None:
             result = await asyncio.shield(launch_task)
         else:
-            done, _ = await asyncio.wait({launch_task}, timeout=max(0.0, timeout))
+            done, _ = await asyncio.wait({launch_task}, timeout=max(0.0, launch_deadline - time.monotonic()))
             if launch_task not in done:
                 timed_out_during_spawn = True
                 raise asyncio.TimeoutError("Execution deadline expired during subprocess startup.")
             result = launch_task.result()
-    except BaseException:
+    except ProcessStartupTimeout:
+        raise  # The deadline check inside _launch ran before creating a process.
+    except BaseException as exc:
         caller_cancelled = True
 
         # On timeout, cancel immediately; on cancellation, wait briefly for atomic registration
@@ -989,40 +1005,33 @@ async def spawn_managed_process(
                 pass
 
             if early_popen is not None or early_pid is not None:
-                stopped_early = await _cleanup_early_captured()
-                if not stopped_early and resolved_tracker is not None:
-                    resolved_tracker.mark_unverified_stop()
+                process_stopped = await _cleanup_early_captured()
             elif not launch_task.done() or not launch_task.cancelled():
-                if resolved_tracker is not None:
-                    resolved_tracker.mark_unverified_stop()
-            raise
-
-        if not launch_task.cancelled():
+                process_stopped = False
+        elif not launch_task.cancelled():
             launch_exc = launch_task.exception()
             if launch_exc is None:
                 launched = launch_task.result()
                 if launched is not None:
                     _, managed = launched
                     try:
-                        await managed.terminate()
+                        process_stopped = await managed.terminate()
                     except BaseException:
                         managed.terminate_sync()
-                        if managed.is_alive() and resolved_tracker is not None:
-                            resolved_tracker.mark_unverified_stop()
+                        process_stopped = managed.verified_stopped and not managed.is_alive()
             elif early_popen is not None or early_pid is not None:
-                stopped_early = await _cleanup_early_captured()
-                if not stopped_early and resolved_tracker is not None:
-                    resolved_tracker.mark_unverified_stop()
+                process_stopped = await _cleanup_early_captured()
             elif not isinstance(
                 launch_exc,
                 (FileNotFoundError, PermissionError, NotADirectoryError, ProcessContainmentError),
             ):
-                if resolved_tracker is not None:
-                    resolved_tracker.mark_unverified_stop()
+                process_stopped = False
         elif early_popen is not None or early_pid is not None:
-            stopped_early = await _cleanup_early_captured()
-            if not stopped_early and resolved_tracker is not None:
-                resolved_tracker.mark_unverified_stop()
+            process_stopped = await _cleanup_early_captured()
+        if not process_stopped and resolved_tracker is not None:
+            resolved_tracker.mark_unverified_stop()
+        if isinstance(exc, asyncio.TimeoutError):
+            raise ProcessStartupTimeout(str(exc), process_stopped=process_stopped) from exc
         raise
 
     if result is None:

@@ -26,11 +26,12 @@ from agent_bridge.model_resolver import (
     is_model_unavailable_error,
     is_newer_codex_model_in_same_family,
 )
-from agent_bridge.models import JobStatus, ProviderState, RunRequest, RunResult, UsageStatus
+from agent_bridge.models import JobStatus, ProviderState, RunCancelled, RunRequest, RunResult, UsageStatus
 from agent_bridge.nesting import subagent_env
 from agent_bridge.process_control import (
     ManagedProcess,
     ProcessContainmentError,
+    ProcessStartupTimeout,
     communicate_managed,
     run_managed_process_io,
     spawn_managed_process,
@@ -1066,24 +1067,29 @@ class NeonRunner:
         # Commit launch intent in SQLite BEFORE spawning the provider subprocess!
         await _maybe_await(on_provider_start)
 
+        env = subagent_env(job_id=request.job_id, owner_id=request.owner_id)
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProcessStartupTimeout("Job deadline expired before execution started.", process_stopped=True)
             proc, managed = await spawn_managed_process(
                 *cmd,
                 cwd=request.cwd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                timeout=max(0.05, deadline - time.monotonic()),
-                env=subagent_env(job_id=request.job_id, owner_id=request.owner_id),
+                timeout=remaining,
+                env=env,
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            process_stopped = isinstance(exc, ProcessStartupTimeout) and exc.process_stopped
             status, reason, pstate, guidance = classify_failure(
                 backend="neon",
                 exit_code=None,
                 error_text=f"Neon subagent timed out during startup after {request.timeout_seconds}s.",
                 stderr_text=None,
                 timed_out_locally=True,
-                process_stopped=True,
+                process_stopped=process_stopped,
             )
             return RunResult(
                 status=status,
@@ -1098,7 +1104,7 @@ class NeonRunner:
                 failure_reason=reason,
                 provider_state=pstate,
                 retry_guidance=guidance,
-                provider_invoked=False,
+                provider_invoked=not process_stopped,
             )
         except ProcessContainmentError as exc:
             return RunResult(
@@ -1231,6 +1237,7 @@ class NeonRunner:
                     break
                 stderr_chunks.append(chunk)
 
+        cancelled = False
         timed_out_locally = False
         process_stopped = True
         try:
@@ -1250,6 +1257,8 @@ class NeonRunner:
         except asyncio.TimeoutError:
             timed_out_locally = True
             process_stopped = managed.verified_stopped and (not managed.is_alive())
+        except asyncio.CancelledError:
+            cancelled = True
 
         # Measure work duration separately from process-tree cleanup time!
         work_end = managed.work_stopped_at if managed.work_stopped_at is not None else time.monotonic()
@@ -1268,8 +1277,10 @@ class NeonRunner:
         raw_status = str(envelope.get("status", "")).upper() if isinstance(envelope, dict) else ""
         turn_completed_cleanly = (
             (not timed_out_locally)
-            and (proc.returncode == 0)
-            and (envelope is None or raw_status in {"", "SUCCESS", "OK"})
+            and (
+                (not cancelled and proc.returncode == 0 and raw_status in {"", "SUCCESS", "OK"})
+                or (cancelled and raw_status in {"SUCCESS", "OK"})
+            )
         )
 
         # Determine per-turn usage accurately without double-counting or labeling interrupted turns exact.
@@ -1327,6 +1338,12 @@ class NeonRunner:
                 if provider_metrics is not None:
                     provider_metrics["cumulative_only"] = True
                 usage_status = "partial"
+
+        if cancelled:
+            raise RunCancelled(
+                RunResult(status="cancelled", session_id=session_id, usage=usage,
+                          provider_metrics=provider_metrics, usage_status=usage_status)
+            )
 
         # Only publish a new cumulative checkpoint when this turn completed cleanly with valid,
         # non-zero, monotonic counters and an explicit turn count.
@@ -2032,24 +2049,29 @@ class CodexRunner:
         # Commit launch intent in SQLite BEFORE spawning the provider subprocess!
         await _maybe_await(on_provider_start)
 
+        env = subagent_env(job_id=request.job_id, owner_id=request.owner_id)
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProcessStartupTimeout("Job deadline expired before execution started.", process_stopped=True)
             proc, managed = await spawn_managed_process(
                 *cmd,
                 cwd=request.cwd,
                 stdin=asyncio.subprocess.PIPE if use_stdin_prompt else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                timeout=max(0.05, deadline - time.monotonic()),
-                env=subagent_env(job_id=request.job_id, owner_id=request.owner_id),
+                timeout=remaining,
+                env=env,
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            process_stopped = isinstance(exc, ProcessStartupTimeout) and exc.process_stopped
             status, reason, pstate, guidance = classify_failure(
                 backend="codex",
                 exit_code=None,
                 error_text=f"Codex subagent timed out during startup after {request.timeout_seconds}s.",
                 stderr_text=None,
                 timed_out_locally=True,
-                process_stopped=True,
+                process_stopped=process_stopped,
             )
             return RunResult(
                 status=status,
@@ -2067,7 +2089,7 @@ class CodexRunner:
                 failure_reason=reason,
                 provider_state=pstate,
                 retry_guidance=guidance,
-                provider_invoked=False,
+                provider_invoked=not process_stopped,
             )
         except ProcessContainmentError as exc:
             return RunResult(
@@ -2161,6 +2183,7 @@ class CodexRunner:
                     break
                 stderr_chunks.append(chunk)
 
+        cancelled = False
         timed_out_locally = False
         process_stopped = True
         try:
@@ -2181,6 +2204,8 @@ class CodexRunner:
         except asyncio.TimeoutError:
             timed_out_locally = True
             process_stopped = managed.verified_stopped and (not managed.is_alive())
+        except asyncio.CancelledError:
+            cancelled = True
 
         work_end = managed.work_stopped_at if managed.work_stopped_at is not None else time.monotonic()
         elapsed = round(max(0.0, work_end - started), 2)
@@ -2193,7 +2218,8 @@ class CodexRunner:
         session_id = parsed["session_id"] or request.session_id
         response = parsed["response"]
         errors = parsed["errors"]
-        turn_completed_cleanly = (not timed_out_locally) and (proc.returncode == 0) and (not errors)
+        # Codex emits the usage on turn.completed, so a count from that event is final.
+        turn_completed_cleanly = (not timed_out_locally) and (proc.returncode == 0 or cancelled) and (not errors)
 
         usage, provider_metrics = normalize_usage("codex", parsed["usage"])
         if usage is not None:
@@ -2206,17 +2232,23 @@ class CodexRunner:
         wt_path = request.worktree_path
         wt_branch = request.worktree_branch
         wt_commit = request.worktree_commit
-        if wt_path and Path(wt_path).is_dir() and not timed_out_locally and (deadline - time.monotonic()) > 0.05:
-            new_branch, new_commit, _ = await _inspect_git_checkout(
-                wt_path,
-                timeout_seconds=5.0,
-                deadline=deadline,
-                include_common_dir=False,
+        if not cancelled and not timed_out_locally and wt_path and Path(wt_path).is_dir():
+            if deadline - time.monotonic() > 0.05:
+                try:
+                    new_branch, new_commit, _ = await _inspect_git_checkout(
+                        wt_path, timeout_seconds=5.0, deadline=deadline, include_common_dir=False,
+                    )
+                except asyncio.CancelledError:
+                    cancelled = True
+                else:
+                    wt_branch = new_branch or wt_branch
+                    wt_commit = new_commit or wt_commit
+
+        if cancelled:
+            raise RunCancelled(
+                RunResult(status="cancelled", session_id=session_id, usage=usage,
+                          provider_metrics=provider_metrics, usage_status=usage_status)
             )
-            if new_branch:
-                wt_branch = new_branch
-            if new_commit:
-                wt_commit = new_commit
 
         if timed_out_locally:
             status, reason, pstate, guidance = classify_failure(

@@ -439,7 +439,7 @@ Rules the figures follow:
   | `partial_counts` | A count for a turn that did not finish cleanly. It is shown, but it may be short |
   | `cli_started_no_count` | The CLI was started but left no count: cancelled, timed out, failed, or a CLI that reports none, such as Codex's built-in review |
   | `cannot_tell` | Runs the records cannot speak for, each with a `reason`: `window_closed` (the window that ran the job closed before it finished, whether or not a later window has marked it `owner_exited` yet), `job_row_pruned` (no count, and the job's row has been pruned; the newest 500 are kept unless `AGENT_BRIDGE_MAX_STORED_JOBS` says otherwise), or `end_not_confirmed` (no count, and the bridge could not confirm whether the CLI ran or stopped) |
-  | `claude_subagents` | Claude runs that started subagents of their own. Claude Code reports the main agent's tokens only |
+  | `claude_subagents` | Claude runs that started subagents whose tokens are outside the reported count, including resumed sessions |
   | `claude_subagents_not_on_record` | Claude runs that did not record whether they started subagents: written before the bridge kept that count, or Claude Code did not report it |
   | `before_records_begin` | Set when the period reaches back before the bridge's first record. That stretch is not covered, which is not the same as zero |
 
@@ -651,7 +651,7 @@ Without `include_quota`, `get_usage` reports only what the bridge itself ran: ru
 - `exact` and `delta` counts go into the token totals. `partial` counts are shown apart, and `missing` means the CLI gave no figure.
 - A job that was retried counts as one run with two attempts.
 - Work you do in `codex`, `agy` or `claude` outside the bridge is not in these counts. For `codex` and `agy` it does show in the quota reading.
-- For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.session_cost_usd_estimate` is Claude Code's own estimate at list prices, not a bill; on a resume it covers the earlier turns of the session too. If the job started native subagents of its own, their tokens are not in the counts. `provider_metrics.native_subagents` says how many there were, 0 included, whenever Claude Code reports it; a run without it did not say.
+- For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.session_cost_usd_estimate` is Claude Code's own list-price estimate. On a resume the estimate includes earlier turns. For new sessions with native subagents, the bridge sums Claude Code's per-model token counts when available and sets `provider_metrics.usage_scope` to `whole_job`. Resumed sessions use the main agent's per-turn counts. Provider metrics retain the main agent's token figures and report the number of native subagents in `native_subagents` when Claude Code supplies it, including zero.
 - Codex's built-in review (`review_code` with no `focus`) reports no token counts, so it shows as 0 tokens.
 
 ## The usage dashboard skill
@@ -716,7 +716,7 @@ not start further bridge jobs, so `run_agent` is refused. ...
 How a bridge knows:
 
 - **A marker variable.** Every subagent is started with `AGENT_BRIDGE_PARENT_JOB` set to its job id. A bridge that sees it is nested. `agy` passes its environment on to the MCP servers it starts, so this is what catches it there.
-- **The process tree.** Codex passes only a fixed list of variables to its MCP servers, and the marker is not on it. So the bridge also looks at its own parent processes: if one of them is a live bridge process (a row in the shared database), it is nested. This is what catches it under Codex.
+- **The process tree.** Codex passes only a fixed list of variables to its MCP servers. The bridge checks its ancestors for a live owner in its database or a `python -m agent_bridge` command line. The command line also identifies bridges with separate state directories. If the process tree is unavailable, job-starting calls retry the check and proceed while the answer is unknown.
 - **No MCP servers.** A Claude subagent is started with none, so it has no bridge to call.
 
 All three were checked with real runs on Windows: a Codex job and an `agy` job, each with the bridge registered, were refused, and a Claude job reported no MCP tools.

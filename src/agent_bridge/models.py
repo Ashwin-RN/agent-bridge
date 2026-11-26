@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -88,6 +89,14 @@ class RunResult:
     stderr_tail: str | None = None
     provider_invoked: bool = False
     attempts: list[dict[str, Any]] = field(default_factory=list)
+
+
+class RunCancelled(asyncio.CancelledError):
+    """A cancelled runner with the output it had already counted."""
+
+    def __init__(self, result: RunResult) -> None:
+        self.result = result
+        super().__init__()
 
 
 @dataclass(slots=True)

@@ -346,6 +346,18 @@ async def test_claude_subagents_are_marked_and_an_unreported_count_is_not_taken_
     await manager.shutdown()
 
 
+async def test_claude_whole_job_usage_includes_subagents_in_dashboard_totals(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    _finish(manager, "claude-full", backend="claude", tokens=1200,
+            metrics={"provider": "claude", "native_subagents": 2, "usage_scope": "whole_job"})
+
+    dashboard = await manager.usage_dashboard(period="all")
+
+    assert _total(dashboard["totals"]) == 1200
+    assert dashboard["not_in_totals"]["claude_subagents"]["job_ids"] == []
+    await manager.shutdown()
+
+
 async def test_since_and_until_pick_the_period_and_a_date_until_takes_in_the_whole_day(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     day = date.today() - timedelta(days=2)

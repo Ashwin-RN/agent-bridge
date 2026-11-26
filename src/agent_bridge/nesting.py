@@ -7,18 +7,21 @@ Two signals are used, because neither is enough alone:
 
 - A marker variable set in every subagent's environment. Cheap, but a CLI may not pass its
   environment on to the MCP servers it starts (Codex passes only a fixed list).
-- The process tree. A bridge whose ancestor is a live bridge process (a row in `owners`) is nested,
-  whatever happened to the environment on the way down.
+- The process tree. An ancestor can be identified by a live owner row or its server command line,
+  even when it uses a separate state directory.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 ENV_PARENT_JOB = "AGENT_BRIDGE_PARENT_JOB"
@@ -55,14 +58,14 @@ class NestedBridgeError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Nesting:
-    nested: bool
+    nested: bool | None
     via: str | None = None  # "env" or "ancestry"
     parent_job: str | None = None
     parent_owner: str | None = None
     parent_pid: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"nested": self.nested}
+        out: dict[str, Any] = {"nested": self.nested is True}
         if self.nested:
             out["via"] = self.via
             if self.parent_job:
@@ -88,6 +91,7 @@ class Nesting:
 
 
 NOT_NESTED = Nesting(nested=False)
+UNKNOWN_NESTING = Nesting(nested=None)
 
 
 def subagent_env(
@@ -182,6 +186,128 @@ def _windows_start_time(pid: int) -> float | None:
         k32.CloseHandle(handle)
 
 
+def _windows_command_line(pid: int) -> list[str] | None:
+    import ctypes
+    from ctypes import wintypes
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.USHORT),
+            ("MaximumLength", wintypes.USHORT),
+            ("Buffer", ctypes.c_void_p),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    query = ctypes.WinDLL("ntdll").NtQueryInformationProcess
+    query.argtypes = [
+        wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG),
+    ]
+    query.restype = wintypes.LONG
+    split = ctypes.WinDLL("shell32").CommandLineToArgvW
+    split.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    split.restype = ctypes.POINTER(wintypes.LPWSTR)
+
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        needed = wintypes.ULONG()
+        info_class = 60  # ProcessCommandLineInformation
+        query(handle, info_class, None, 0, ctypes.byref(needed))
+        if needed.value < ctypes.sizeof(UNICODE_STRING):
+            return None
+        buffer = ctypes.create_string_buffer(needed.value)
+        if query(handle, info_class, buffer, len(buffer), ctypes.byref(needed)) != 0:
+            return None
+        command = UNICODE_STRING.from_buffer(buffer)
+        if not command.Length:
+            return []
+        line = ctypes.wstring_at(command.Buffer, command.Length // ctypes.sizeof(ctypes.c_wchar))
+    finally:
+        kernel32.CloseHandle(handle)
+
+    argc = ctypes.c_int()
+    argv = split(line, ctypes.byref(argc))
+    if not argv:
+        return None
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        kernel32.LocalFree(argv)
+
+
+def _is_own_windows_python_launcher(pid: int, argv: list[str]) -> bool:
+    # The venv redirector changes argv[0] to the base interpreter and forwards the arguments.
+    if sys.platform != "win32" or pid != os.getppid() or sys.executable == sys._base_executable:
+        return False
+    if argv[1:] != sys.orig_argv[1:]:
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    image_name = kernel32.QueryFullProcessImageNameW
+    image_name.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    image_name.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        path = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(path))
+        if not image_name(handle, 0, path, ctypes.byref(size)):
+            return False
+        return os.path.normcase(path.value) == os.path.normcase(sys.executable)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_command_line(pid: int) -> list[str] | None:
+    try:
+        if sys.platform == "win32":
+            return _windows_command_line(pid)
+        if os.path.isdir("/proc/self"):
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0")
+            return [os.fsdecode(arg) for arg in raw.split(b"\0")] if raw else []
+        out = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout
+        return shlex.split(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _is_bridge_command(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    executable = re.split(r"[/\\]", argv[0])[-1].lower()
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?w?(?:\.exe)?", executable):
+        return False
+    # Scan Python's options only, so a script, -c program or another module cannot
+    # be mistaken for the bridge merely because its arguments mention "-m agent_bridge".
+    args = iter(argv[1:])
+    for arg in args:
+        if arg == "-m":
+            return next(args, None) == "agent_bridge"
+        if arg.startswith("-m"):
+            return arg[2:] == "agent_bridge"
+        if arg in {"-W", "-X"}:
+            next(args, None)
+        elif not arg.startswith("-") or arg.startswith("-c") or arg in {"-", "--"}:
+            break
+    return False
+
+
 def parse_proc_stat(text: str) -> tuple[int, int] | None:
     """Return `(ppid, starttime_ticks)` from the text of `/proc/<pid>/stat`."""
     # The command name sits in brackets and may itself hold spaces or brackets: split after the last one.
@@ -245,7 +371,7 @@ def _linux_boot_time() -> float | None:
     return None
 
 
-def _posix_ancestors(pid: int) -> list[tuple[int, float | None]]:
+def _posix_ancestors(pid: int) -> list[tuple[int, float | None]] | None:
     chain: list[tuple[int, float | None]] = []
     if os.path.isdir("/proc/self"):
         boot = _linux_boot_time()
@@ -260,9 +386,9 @@ def _posix_ancestors(pid: int) -> list[tuple[int, float | None]]:
                 with open(f"/proc/{current}/stat", encoding="utf-8", errors="replace") as fh:
                     parsed = parse_proc_stat(fh.read())
             except OSError:
-                break
+                return chain or None
             if parsed is None:
-                break
+                return chain or None
             parent = parsed[0]
             if parent <= 0 or parent in seen:
                 break
@@ -285,11 +411,13 @@ def _posix_ancestors(pid: int) -> list[tuple[int, float | None]]:
             capture_output=True,
             text=True,
             timeout=5,
-            check=False,
+            check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return chain
+        return None
     table = parse_ps_table(out)
+    if pid not in table:
+        return None
     now = time.time()
     current = pid
     seen = {pid}
@@ -304,11 +432,10 @@ def _posix_ancestors(pid: int) -> list[tuple[int, float | None]]:
     return chain
 
 
-def ancestor_chain(pid: int | None = None) -> list[tuple[int, float | None]]:
-    """`(pid, start_time)` for each ancestor of `pid`, nearest first. Empty when it cannot be read.
+def ancestor_chain(pid: int | None = None) -> list[tuple[int, float | None]] | None:
+    """`(pid, start_time)` for each ancestor of `pid`, nearest first. None when unavailable.
 
-    `start_time` is wall-clock seconds, or None where it cannot be read. An ancestor with no start time
-    is never taken for a bridge (see `detect_nesting`).
+    `start_time` is wall-clock seconds, or None where it cannot be read.
     """
     own = os.getpid() if pid is None else int(pid)
     try:
@@ -316,13 +443,15 @@ def ancestor_chain(pid: int | None = None) -> list[tuple[int, float | None]]:
             return _posix_ancestors(own)
 
         table = _windows_process_table()
+        if own not in table:
+            return None
         chain: list[tuple[int, float | None]] = []
         seen = {own}
         current = own
         current_start = _windows_start_time(own)
         while len(chain) < _MAX_ANCESTORS:
             parent = table.get(current, 0)
-            if parent <= 0 or parent in seen:
+            if parent <= 0 or parent in seen or parent not in table:
                 break
             parent_start = _windows_start_time(parent)
             # Windows keeps the parent's pid after the parent has gone, and pids are reused. A "parent"
@@ -339,7 +468,7 @@ def ancestor_chain(pid: int | None = None) -> list[tuple[int, float | None]]:
             current_start = parent_start
         return chain
     except Exception:
-        return []
+        return None
 
 
 def detect_nesting(
@@ -369,11 +498,13 @@ def detect_nesting(
         if int(pid) == me:
             continue
         owners_by_pid.setdefault(int(pid), []).append((str(owner_id), float(started_at)))
-    if not owners_by_pid:
-        return NOT_NESTED
-
     chain = ancestor_chain(me) if ancestors is None else list(ancestors)
+    if chain is None:
+        return UNKNOWN_NESTING
+    command_line_unavailable = False
     for pid, start_time in chain:
+        if pid == me:
+            continue
         for owner_id, registered_at in owners_by_pid.get(int(pid), ()):
             # An owner row can outlive its process, and its pid can then be given to anything, a terminal
             # or the host itself included. Taking that for a bridge would refuse every job in an ordinary
@@ -382,4 +513,9 @@ def detect_nesting(
             if start_time is None or start_time > registered_at + _PID_REUSE_SLACK_SECONDS:
                 continue
             return Nesting(nested=True, via="ancestry", parent_owner=owner_id, parent_pid=int(pid))
-    return NOT_NESTED
+        argv = _process_command_line(pid)
+        if argv is None:
+            command_line_unavailable = True
+        elif _is_bridge_command(argv) and not _is_own_windows_python_launcher(pid, argv):
+            return Nesting(nested=True, via="ancestry", parent_pid=pid)
+    return UNKNOWN_NESTING if command_line_unavailable else NOT_NESTED

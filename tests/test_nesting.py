@@ -14,6 +14,7 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from agent_bridge import nesting
 from agent_bridge.config import Settings
 from agent_bridge.jobs import JobManager
 from agent_bridge.nesting import (
@@ -88,7 +89,10 @@ def test_marker_in_the_environment_means_nested() -> None:
     assert "nested_bridge" in found.refusal("run_agent") and "codex-1a2b3c4d" in found.refusal("run_agent")
 
 
-def test_live_bridge_among_the_ancestors_means_nested_even_with_no_marker() -> None:
+def test_live_bridge_among_the_ancestors_means_nested_even_with_no_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(nesting, "_process_command_line", lambda _pid: [])
     now = time.time()
     owners = [("pid-500-aaa", 500, now - 60.0), ("pid-900-bbb", 900, now - 60.0)]
 
@@ -248,12 +252,63 @@ async def test_real_bridge_under_a_live_bridge_process_refuses_with_no_marker(tm
             assert nesting["parent_pid"] == os.getpid()
 
 
-async def test_real_bridge_started_by_a_plain_host_is_not_nested(tmp_path: Path) -> None:
+def test_bridge_ancestor_with_different_state_is_detected_from_its_command(tmp_path: Path) -> None:
+    # The launcher plays a parent bridge with the same invocation and a separate state directory.
+    launcher = tmp_path / "launcher"
+    package = launcher / "agent_bridge"
+    package.mkdir(parents=True)
+    (package / "__init__.py").touch()
+    (package / "__main__.py").write_text(
+        "import os, subprocess, sys\n"
+        "print(os.getpid(), flush=True)\n"
+        "env = {**os.environ, 'AGENT_BRIDGE_STATE_DIR': sys.argv[1]}\n"
+        "subprocess.run([sys.executable, '-c', sys.argv[2]], cwd=sys.argv[3], env=env, check=True)\n",
+        encoding="utf-8",
+    )
+    code = (
+        "import json; from agent_bridge.server import create_server; "
+        "_, manager = create_server(); print(json.dumps(manager.nesting.to_dict()))"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-m", "agent_bridge", str(tmp_path / "other-state"), code, str(tmp_path)],
+        cwd=launcher, env=_server_env(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    with parent:
+        stdout, stderr = parent.communicate(timeout=30)
+    assert parent.returncode == 0, stderr
+    parent_pid, detected = stdout.splitlines()
+    assert json.loads(detected) == {"nested": True, "via": "ancestry", "parent_pid": int(parent_pid)}
+
+
+async def test_job_start_retries_unknown_ancestry_and_accepts_it_while_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chain = None
+    monkeypatch.setattr(nesting, "ancestor_chain", lambda _pid: chain)
+    mcp, manager = create_server(settings=_make_settings(tmp_path))
+    try:
+        assert manager.nesting.nested is None
+        result = await mcp.call_tool("run_agent", JOB_TOOLS["run_agent"])
+        assert "AGENT_BRIDGE_CLAUDE_BIN" in str(result)
+        assert manager.nesting.nested is None
+
+        manager.store.register_owner("outer", 12345)
+        chain = [(12345, time.time() - 1)]
+        with pytest.raises(Exception, match="nested_bridge"):
+            await mcp.call_tool("run_agent", JOB_TOOLS["run_agent"])
+        assert manager.nesting.parent_owner == "outer"
+    finally:
+        await manager.shutdown()
+
+
+async def test_real_bridge_started_by_a_plain_host_is_not_nested(
+    tmp_path: Path, plain_host_env: dict[str, str],
+) -> None:
     """The control for the two tests above: same setup, no marker, no bridge above it."""
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "agent_bridge"],
-        env=_server_env(tmp_path),
+        env=_server_env(tmp_path, PYTHONPATH=plain_host_env.get("PYTHONPATH", "")),
     )
     async with stdio_client(params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:

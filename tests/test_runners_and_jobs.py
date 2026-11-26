@@ -7,10 +7,12 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent_bridge.config import Settings
+from agent_bridge.claude_runner import ClaudeRunner
 from agent_bridge.jobs import JobManager
 from agent_bridge.models import RunRequest
 from agent_bridge.runners import (
@@ -35,8 +37,9 @@ def _make_settings(tmp_path: Path, **overrides: object) -> Settings:
         quota_cache_ttl_seconds=120.0,
         owner_stale_seconds=30.0,
         state_dir=tmp_path / "state",
-        agy_bin=None,
-        codex_bin=None,
+        agy_bin=str(tmp_path / "missing-agy.exe"),
+        codex_bin=str(tmp_path / "missing-codex.exe"),
+        claude_bin=str(tmp_path / "missing-claude.exe"),
         default_cwd=tmp_path,
     )
     base.update(overrides)
@@ -62,6 +65,104 @@ class StubCodexRunner(CodexRunner):
 
     def resolve_command(self) -> list[str]:
         return [sys.executable, str(self._script_path)]
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "neon"])
+@pytest.mark.parametrize("deadline_expires_before_spawn", [True, False])
+async def test_runner_startup_deadline_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, deadline_expires_before_spawn: bool,
+) -> None:
+    from agent_bridge import claude_runner, process_control, runners
+
+    settings = _make_settings(tmp_path)
+    script = tmp_path / "stand_in.py"
+    script.write_text("raise AssertionError('must not start')", encoding="utf-8")
+    runner = {
+        "claude": ClaudeRunner(settings),
+        "codex": StubCodexRunner(settings, script),
+        "neon": StubAgyRunner(settings, script),
+    }[backend]
+    monkeypatch.setattr(runner, "resolve_command", lambda: [sys.executable, str(script)])
+    module = claude_runner if backend == "claude" else runners
+    now = 100.0
+    deadline = 100.125
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: now))
+    spawned = False
+
+    async def fake_spawn(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        process_control._SPAWN_CAPTURE.get()(SimpleNamespace(pid=123))
+        await asyncio.Event().wait()
+
+    async def unverified_cleanup(*_args):
+        return False
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr(process_control, "_terminate_windows_early", unverified_cleanup)
+    monkeypatch.setattr(process_control, "_terminate_posix_pgid", unverified_cleanup)
+
+    async def launch_bookkeeping():
+        nonlocal now
+        if deadline_expires_before_spawn:
+            now = deadline
+
+    request = RunRequest(backend=backend, prompt="test", cwd=str(tmp_path), timeout_seconds=1)
+    kwargs = dict(
+        deadline=deadline, model_notice=None, on_session=None, on_activity=None,
+        on_model=None, on_provider_start=launch_bookkeeping,
+    )
+    if backend == "neon":
+        result = await runner._run_once(
+            request, resolved_model=None, prompt_text="test", extra_dirs=[], prior_watermark=None, **kwargs,
+        )
+    else:
+        result = await runner._run_once(request, effective_model=None, effective_effort=None, **kwargs)
+    assert spawned is not deadline_expires_before_spawn
+    assert result.status == "timed_out"
+    assert result.provider_state == ("stopped" if deadline_expires_before_spawn else "possibly_running")
+
+
+@pytest.mark.parametrize(
+    "backend,event,activity,expected_status",
+    [
+        ("codex", {"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 3}},
+         "turn completed", "exact"),
+        ("neon", {"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "agent_response", "state": "DONE",
+            "usage": {"input_tokens": 7, "output_tokens": 3},
+        }}, "agent_response (DONE)", "partial"),
+    ],
+)
+async def test_cancelled_job_keeps_streamed_usage(
+    tmp_path: Path, backend: str, event: dict, activity: str, expected_status: str,
+) -> None:
+    script = tmp_path / "stand_in.py"
+    script.write_text(
+        "import sys, time\n"
+        "if 'models' in sys.argv:\n"
+        "    print('gemini-4-neon-high\\tGemini 4 Neon (High)')\n"
+        "    sys.exit(0)\n"
+        f"print({json.dumps(event)!r}, flush=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    settings = _make_settings(tmp_path)
+    manager = JobManager(
+        settings, codex_runner=StubCodexRunner(settings, script), neon_runner=StubAgyRunner(settings, script),
+    )
+    try:
+        job = await manager.start_async(manager.prepare_request(backend=backend, prompt="test"))
+        async with asyncio.timeout(10):
+            while manager._local_jobs[job.job_id].last_activity != activity:
+                await asyncio.sleep(0.01)
+        await manager.cancel(job.job_id)
+        stored = manager.store.get_job(job.job_id)
+        assert stored is not None and stored.status == "cancelled"
+        assert stored.usage_status == expected_status
+        assert stored.usage is not None and stored.usage["total_tokens"] == 10
+    finally:
+        await manager.shutdown()
 
 
 def test_parse_agy_json_output_and_codex_jsonl() -> None:

@@ -18,10 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_bridge.config import Settings, split_claude_model_and_effort
-from agent_bridge.models import RunRequest, RunResult, UsageStatus
+from agent_bridge.models import RunCancelled, RunRequest, RunResult, UsageStatus
 from agent_bridge.nesting import CLAUDE_SESSION_ENV, subagent_env
 from agent_bridge.process_control import (
     ProcessContainmentError,
+    ProcessStartupTimeout,
     run_managed_process_io,
     spawn_managed_process,
 )
@@ -182,6 +183,7 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
 
     errors: list[str] = []
     usage: dict[str, Any] | None = None
+    model_usage: dict[str, Any] | None = None
     is_error = False
     response = last_text
     denials: list[str] = []
@@ -196,6 +198,8 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
         is_error = bool(result_event.get("is_error")) or (subtype is not None and subtype != "success")
         raw_usage = result_event.get("usage")
         usage = raw_usage if isinstance(raw_usage, dict) and raw_usage else None
+        raw_model_usage = result_event.get("modelUsage")
+        model_usage = raw_model_usage if isinstance(raw_model_usage, dict) else None
         result_text = result_event.get("result")
         if isinstance(result_text, str) and result_text.strip():
             if is_error:
@@ -240,6 +244,7 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
         "model": model,
         "response": response.strip(),
         "usage": usage,
+        "model_usage": model_usage,
         "result_seen": result_event is not None,
         "is_error": is_error,
         "errors": errors,
@@ -251,6 +256,28 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
         "api_key_source": api_key_source,
         "native_subagents": native_subagents,
     }
+
+
+def _sum_model_usage(model_usage: dict[str, Any] | None) -> dict[str, int] | None:
+    """Return whole-job counters only when every model reports its token counts."""
+    if not model_usage:
+        return None
+    fields = {
+        "inputTokens": "input_tokens",
+        "outputTokens": "output_tokens",
+        "cacheReadInputTokens": "cache_read_input_tokens",
+        "cacheCreationInputTokens": "cache_creation_input_tokens",
+    }
+    totals = dict.fromkeys(fields.values(), 0)
+    for counters in model_usage.values():
+        if not isinstance(counters, dict):
+            return None
+        for field, name in fields.items():
+            count = counters.get(field)
+            if type(count) is not int or count < 0:
+                return None
+            totals[name] += count
+    return totals
 
 
 def _describe_claude_event(event: dict[str, Any]) -> str | None:
@@ -402,6 +429,7 @@ class ClaudeRunner:
             state: str,
             guidance: str,
             status: str = "failed",
+            provider_invoked: bool = False,
         ) -> RunResult:
             return RunResult(
                 status=status,  # type: ignore[arg-type]
@@ -419,7 +447,7 @@ class ClaudeRunner:
                 failure_reason=reason,
                 provider_state=state,  # type: ignore[arg-type]
                 retry_guidance=guidance,
-                provider_invoked=False,
+                provider_invoked=provider_invoked,
             )
 
         if deadline - started <= 0.05:
@@ -467,17 +495,22 @@ class ClaudeRunner:
         # Commit launch intent in SQLite BEFORE spawning the provider subprocess.
         await _maybe_await(on_provider_start)
 
+        env = self.build_env(request)
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProcessStartupTimeout("Job deadline expired before execution started.", process_stopped=True)
             proc, managed = await spawn_managed_process(
                 *cmd,
                 cwd=request.cwd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                timeout=max(0.05, deadline - time.monotonic()),
-                env=self.build_env(request),
+                timeout=remaining,
+                env=env,
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            process_stopped = isinstance(exc, ProcessStartupTimeout) and exc.process_stopped
             message = f"Claude subagent timed out during startup after {request.timeout_seconds}s."
             status, reason, pstate, guidance = classify_failure(
                 backend="claude",
@@ -485,9 +518,12 @@ class ClaudeRunner:
                 error_text=message,
                 stderr_text=None,
                 timed_out_locally=True,
-                process_stopped=True,
+                process_stopped=process_stopped,
             )
-            return _early(error=message, reason=reason, state=pstate, guidance=guidance, status=status)
+            return _early(
+                error=message, reason=reason, state=pstate, guidance=guidance, status=status,
+                provider_invoked=not process_stopped,
+            )
         except ProcessContainmentError as exc:
             return _early(
                 error=str(exc),
@@ -576,6 +612,7 @@ class ClaudeRunner:
                     break
                 stderr_chunks.append(chunk)
 
+        cancelled = False
         timed_out_locally = False
         process_stopped = True
         try:
@@ -596,6 +633,8 @@ class ClaudeRunner:
         except asyncio.TimeoutError:
             timed_out_locally = True
             process_stopped = managed.verified_stopped and (not managed.is_alive())
+        except asyncio.CancelledError:
+            cancelled = True
 
         work_end = managed.work_stopped_at if managed.work_stopped_at is not None else time.monotonic()
         elapsed = round(max(0.0, work_end - started), 2)
@@ -616,7 +655,7 @@ class ClaudeRunner:
             errors = ["claude ended without a result event; its output was cut short"]
         turn_completed_cleanly = (
             (not timed_out_locally)
-            and proc.returncode == 0
+            and (proc.returncode == 0 or cancelled)
             and parsed["result_seen"]
             and (not parsed["is_error"])
             and (not errors)
@@ -630,10 +669,6 @@ class ClaudeRunner:
             model_notice = f"{model_notice} {billing_notice}" if model_notice else billing_notice
 
         usage, provider_metrics = normalize_usage("claude", parsed["usage"])
-        if usage is not None:
-            usage_status: UsageStatus = "exact" if turn_completed_cleanly else "partial"
-        else:
-            usage_status = "missing"
         extras: dict[str, Any] = {}
         if parsed["cost_usd"] is not None:
             # Claude Code works this out itself from list prices. It is not a bill. On a resumed
@@ -643,8 +678,16 @@ class ClaudeRunner:
             extras["num_turns"] = parsed["num_turns"]
         if parsed["native_subagents"] is not None:
             # Kept at 0 too, so that a run without the key reads "not reported" rather than "none".
-            # Their tokens are not in the counts above: Claude Code reports the main agent's only.
             extras["native_subagents"] = parsed["native_subagents"]
+            if parsed["native_subagents"] > 0:
+                extras["usage_scope"] = "main_agent"
+                # modelUsage may span earlier turns when resuming. Keep the per-turn usage then.
+                if not request.session_id and (whole_job := _sum_model_usage(parsed["model_usage"])) is not None:
+                    usage, _ = normalize_usage("claude", whole_job)
+                    extras["usage_scope"] = "whole_job"
+        usage_status: UsageStatus = "missing"
+        if usage is not None:
+            usage_status = "exact" if turn_completed_cleanly else "partial"
         if key_source and key_source != "none":
             extras["api_key_source"] = key_source
         if parsed["permission_denials"]:
@@ -658,17 +701,23 @@ class ClaudeRunner:
         wt_path = request.worktree_path
         wt_branch = request.worktree_branch
         wt_commit = request.worktree_commit
-        if wt_path and Path(wt_path).is_dir() and not timed_out_locally and (deadline - time.monotonic()) > 0.05:
-            new_branch, new_commit, _ = await _inspect_git_checkout(
-                wt_path,
-                timeout_seconds=5.0,
-                deadline=deadline,
-                include_common_dir=False,
+        if not cancelled and not timed_out_locally and wt_path and Path(wt_path).is_dir():
+            if deadline - time.monotonic() > 0.05:
+                try:
+                    new_branch, new_commit, _ = await _inspect_git_checkout(
+                        wt_path, timeout_seconds=5.0, deadline=deadline, include_common_dir=False,
+                    )
+                except asyncio.CancelledError:
+                    cancelled = True
+                else:
+                    wt_branch = new_branch or wt_branch
+                    wt_commit = new_commit or wt_commit
+
+        if cancelled:
+            raise RunCancelled(
+                RunResult(status="cancelled", session_id=session_id, usage=usage,
+                          provider_metrics=provider_metrics, usage_status=usage_status)
             )
-            if new_branch:
-                wt_branch = new_branch
-            if new_commit:
-                wt_commit = new_commit
 
         def _final(**fields: Any) -> RunResult:
             return RunResult(

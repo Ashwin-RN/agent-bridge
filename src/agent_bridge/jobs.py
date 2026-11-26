@@ -26,7 +26,7 @@ from agent_bridge.config import (
 )
 from agent_bridge.claude_runner import ClaudeRunner
 from agent_bridge.dashboard import build_dashboard, resolve_window
-from agent_bridge.models import JobRecord, RunRequest, RunResult
+from agent_bridge.models import JobRecord, RunCancelled, RunRequest, RunResult
 from agent_bridge.nesting import NOT_NESTED, NestedBridgeError, Nesting
 from agent_bridge.process_control import (
     CURRENT_PROCESS_TRACKER,
@@ -1079,6 +1079,21 @@ class JobManager:
                 if sid not in committed_session_ids:
                     self._uncommitted_session_ids.add(record.job_id)
 
+        def _keep_cancelled_usage(result: RunResult | None) -> None:
+            _prepare_session_for_finalization(result.session_id if result else None)
+            if result is None:
+                return
+            if recorded_attempts and result.attempts:
+                last_attempt = result.attempts[-1]
+                if last_attempt.get("usage") is not None:
+                    record.usage = last_attempt["usage"]
+                    record.usage_status = last_attempt["usage_status"]
+                    record.provider_metrics = last_attempt.get("provider_metrics")
+            elif result.usage is not None:
+                record.usage = result.usage
+                record.usage_status = result.usage_status
+                record.provider_metrics = result.provider_metrics
+
         def _attach_interrupted_attempts() -> list[dict[str, Any]] | None:
             if not recorded_attempts:
                 return None
@@ -1094,8 +1109,12 @@ class JobManager:
                 "quota_pool": record.quota_pool
                 or classify_quota_pool(record.backend, record.model or record.requested_model),
                 "duration_seconds": rem_dur,
-                "usage_status": "missing",
+                "usage_status": record.usage_status,
             }
+            if record.usage is not None:
+                final_att["usage"] = record.usage
+            if record.provider_metrics is not None:
+                final_att["provider_metrics"] = record.provider_metrics
             if record.effort:
                 final_att["effort"] = record.effort
             if record.failure_reason:
@@ -1104,11 +1123,10 @@ class JobManager:
                 final_att["error"] = record.error
             combined = [*recorded_attempts, final_att]
             record.attempts = combined
-            if record.usage is None:
-                agg_usage = _sum_attempt_usage(recorded_attempts)
-                if agg_usage is not None:
-                    record.usage = agg_usage
-                    record.usage_status = "partial"
+            agg_usage = _sum_attempt_usage(combined)
+            if agg_usage is not None:
+                record.usage = agg_usage
+                record.usage_status = "partial"
             return combined
 
         def on_worktree_planned(planned: dict[str, str | None]) -> None:
@@ -1136,6 +1154,7 @@ class JobManager:
             )
 
         acquired_sem: asyncio.Semaphore | None = None
+        result: RunResult | None = None
         finalized_committed = False
         tracker_token = CURRENT_PROCESS_TRACKER.set(tracker)
 
@@ -1231,7 +1250,7 @@ class JobManager:
                 )
             )
             try:
-                result: RunResult = await active_runner_task
+                result = await active_runner_task
             except asyncio.CancelledError:
                 if fatal_progress_exc is not None:
                     raise fatal_progress_exc from None
@@ -1244,14 +1263,14 @@ class JobManager:
             await _drain_progress()
             if fatal_progress_exc is not None:
                 raise fatal_progress_exc
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             self._cancelled_ids.discard(record.job_id)
             work_stop_wall = time.time()
             c0 = time.monotonic()
             stopped = await tracker.terminate_all_and_verify()
             cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
             await _drain_progress(cancel_session_claims=True)
-            _prepare_session_for_finalization(None)
+            _keep_cancelled_usage(exc.result if isinstance(exc, RunCancelled) else result)
             record.status = "cancelled"
             record.failure_reason = "cancelled"
             record.provider_state = "stopped" if stopped else "possibly_running"
@@ -1406,7 +1425,7 @@ class JobManager:
                 stopped = await tracker.terminate_all_and_verify()
                 cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
                 await _drain_progress(cancel_session_claims=True)
-                _prepare_session_for_finalization(result.session_id)
+                _keep_cancelled_usage(result)
                 record.status = "cancelled"
                 record.failure_reason = "cancelled"
                 record.provider_state = "stopped" if stopped else "possibly_running"
