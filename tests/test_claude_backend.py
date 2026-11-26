@@ -53,7 +53,18 @@ def emit(obj):
     print(json.dumps(obj), flush=True)
 
 emit({"type": "system", "subtype": "init", "session_id": sid, "model": live_model,
-      "permissionMode": flag("--permission-mode"), "mcp_servers": []})
+      "permissionMode": flag("--permission-mode"), "mcp_servers": [],
+      "apiKeySource": "ANTHROPIC_API_KEY" if "ANTHROPIC_API_KEY" in os.environ else "none"})
+
+if "CUT_SHORT" in prompt:
+    emit({"type": "assistant", "session_id": sid, "parent_tool_use_id": None,
+          "message": {"content": [{"type": "text", "text": "half an answer"}]}})
+    sys.exit(0)
+
+if "ERRORS_LIST" in prompt:
+    emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "session_id": sid,
+          "errors": ["503 Service unavailable"]})
+    sys.exit(1)
 
 if "FAIL_AUTH" in prompt:
     emit({"type": "result", "subtype": "success", "is_error": True, "session_id": sid,
@@ -79,6 +90,8 @@ seen = {
     "has_claudecode": "CLAUDECODE" in os.environ,
     "has_session_id": "CLAUDE_CODE_SESSION_ID" in os.environ,
     "has_oauth_token": "CLAUDE_CODE_OAUTH_TOKEN" in os.environ,
+    "has_api_key": "ANTHROPIC_API_KEY" in os.environ,
+    "has_auth_token": "ANTHROPIC_AUTH_TOKEN" in os.environ,
 }
 emit({"type": "assistant", "session_id": sid, "parent_tool_use_id": None,
       "message": {"content": [{"type": "text", "text": "thinking aloud"}]}})
@@ -126,6 +139,7 @@ class StubClaudeRunner(ClaudeRunner):
 
 
 def _manager(tmp_path: Path, **settings_overrides: object) -> JobManager:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     script = tmp_path / "fake_claude.py"
     script.write_text(FAKE_CLAUDE.strip(), encoding="utf-8")
     settings = _make_settings(tmp_path, **settings_overrides)
@@ -240,7 +254,7 @@ async def test_claude_usage_row_counts_cache_tokens_as_input(tmp_path: Path) -> 
     assert rec.usage_status == "exact"
     assert rec.usage is not None and rec.usage["total_tokens"] == 6136
     assert rec.provider_metrics is not None
-    assert rec.provider_metrics["cost_usd_estimate"] == pytest.approx(0.0034)
+    assert rec.provider_metrics["session_cost_usd_estimate"] == pytest.approx(0.0034)
     assert rec.provider_metrics["num_turns"] == 2
 
     summary = await manager.get_usage_summary(period="session")
@@ -280,13 +294,18 @@ async def test_claude_read_only_and_edit_runs_get_different_permissions(tmp_path
 
     ro_argv = _seen(read_only)["argv"]
     assert _value_after(ro_argv, "--permission-mode") == "dontAsk"
-    assert "--disallowedTools" not in ro_argv
+    # The writing tools are taken away outright: an allow rule in the user's own settings cannot
+    # hand them back to a read-only run.
+    removed = ro_argv[ro_argv.index("--disallowedTools") + 1 : ro_argv.index("--disallowedTools") + 4]
+    assert removed == ["Write", "Edit", "NotebookEdit"]
+    assert "Bash(git push *)" not in ro_argv
 
     edit_argv = _seen(edit)["argv"]
     assert _value_after(edit_argv, "--permission-mode") == "auto"
     assert "--disallowedTools" in edit_argv
     for rule in CLAUDE_EDIT_DENY_RULES:
         assert rule in edit_argv
+    assert "Write" not in edit_argv and "Edit" not in edit_argv
     assert "Bash(git push *)" in CLAUDE_EDIT_DENY_RULES
 
     for argv in (ro_argv, edit_argv):
@@ -360,9 +379,142 @@ async def test_claude_subagent_gets_the_nesting_marker_and_not_the_parent_sessio
     assert seen["owner"] == manager.owner_id
     assert seen["has_claudecode"] is False
     assert seen["has_session_id"] is False
-    # How the user signed in is not the bridge's business: it is passed on untouched.
+    # How the user signed in to their plan is not the bridge's business: it is passed on untouched.
     assert seen["has_oauth_token"] is True
     await manager.shutdown()
+
+
+async def test_claude_job_runs_on_the_plan_unless_told_to_inherit_an_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An API key in the host's environment would make `claude` bill that account without a word."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-real")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-test-not-real")
+
+    plan = _manager(tmp_path / "plan")
+    rec = await plan.run(plan.prepare_request(backend="claude", prompt="env"))
+    assert _seen(rec)["has_api_key"] is False and _seen(rec)["has_auth_token"] is False
+    assert rec.model_notice is None
+    await plan.shutdown()
+
+    inherit = _manager(tmp_path / "inherit", claude_auth="inherit")
+    rec = await inherit.run(inherit.prepare_request(backend="claude", prompt="env"))
+    assert _seen(rec)["has_api_key"] is True and _seen(rec)["has_auth_token"] is True
+    # The stand-in reports, as the real CLI does, that it authenticated with the key. The job says so.
+    assert "billed to an API key (ANTHROPIC_API_KEY)" in (rec.model_notice or "")
+    assert rec.provider_metrics is not None and rec.provider_metrics["api_key_source"] == "ANTHROPIC_API_KEY"
+    await inherit.shutdown()
+
+
+async def test_claude_output_that_stops_before_its_result_is_a_failure_that_keeps_the_partial_reply(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    rec = await manager.run(manager.prepare_request(backend="claude", prompt="CUT_SHORT"))
+    assert rec.status == "failed"
+    assert rec.failure_reason == "cli_error"
+    assert "without a result event" in (rec.error or "")
+    assert rec.response == "half an answer"
+    assert rec.session_id
+    await manager.shutdown()
+
+
+async def test_claude_error_text_that_comes_only_in_a_list_is_kept_and_classified(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    rec = await manager.run(manager.prepare_request(backend="claude", prompt="ERRORS_LIST", mode="edit"))
+    assert rec.status == "failed"
+    assert "503 Service unavailable" in (rec.error or "")
+    assert rec.failure_reason == "transient_service"
+    await manager.shutdown()
+
+
+async def test_cancel_while_the_quota_reading_is_stored_still_leaves_a_finished_job_finished(
+    tmp_path: Path,
+) -> None:
+    """The reading is stored after the job's row. A cancel landing there must not strand the job."""
+    import asyncio
+
+    manager = _manager(tmp_path)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    committed_when_entered: list[str | None] = []
+
+    async def slow_remember(_metrics: Any) -> None:
+        stored = manager.store.list_jobs(limit=5)
+        committed_when_entered.append(stored[0].status if stored else None)
+        entered.set()
+        await release.wait()
+
+    manager._remember_claude_rate_limit = slow_remember  # type: ignore[method-assign]
+    started = await manager.start_async(manager.prepare_request(backend="claude", prompt="quota"))
+    await asyncio.wait_for(entered.wait(), timeout=30)
+    # The terminal row was already in the database when the quota step began.
+    assert committed_when_entered == ["completed"]
+
+    cancelled = await manager.cancel(started.job_id)
+    release.set()
+    assert cancelled.status == "completed"
+    stored = manager.store.get_job(started.job_id)
+    assert stored is not None and stored.status == "completed"
+    assert manager.store.find_active_session_job("claude", stored.session_id or "") is None
+    await manager.shutdown()
+
+
+def test_claude_cmd_shim_is_never_started_through_a_shell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_bridge.claude_runner as cr
+
+    monkeypatch.setattr(cr.sys, "platform", "win32")
+    shim = tmp_path / "npm" / "claude.cmd"
+    shim.parent.mkdir()
+    shim.write_text("@echo off", encoding="utf-8")
+
+    # A shim with nothing behind it is refused, whether it was configured or found on PATH.
+    monkeypatch.setattr(cr.shutil, "which", lambda name: str(shim) if name == "claude" else None)
+    monkeypatch.setattr(cr.Path, "home", classmethod(lambda cls: tmp_path / "no-home"))
+    with pytest.raises(FileNotFoundError, match="shell shim"):
+        cr.resolve_claude_command(str(shim))
+    with pytest.raises(FileNotFoundError, match="shell shim"):
+        cr.resolve_claude_command(None)
+
+    # With the script it wraps and a node to run it, the script is started directly.
+    cli_js = shim.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
+    cli_js.parent.mkdir(parents=True)
+    cli_js.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        cr.shutil, "which", lambda name: {"claude": str(shim), "node": "C:/node/node.exe"}.get(name)
+    )
+    assert cr.resolve_claude_command(str(shim)) == ["C:/node/node.exe", str(cli_js)]
+    assert cr.resolve_claude_command(None) == ["C:/node/node.exe", str(cli_js)]
+
+    # A real executable is used as it is.
+    exe = tmp_path / "claude.exe"
+    exe.write_text("", encoding="utf-8")
+    assert cr.resolve_claude_command(str(exe)) == [str(exe)]
+
+
+async def test_claude_cli_too_old_for_the_flags_the_bridge_passes_is_reported_unavailable(
+    tmp_path: Path,
+) -> None:
+    from agent_bridge.claude_runner import parse_claude_version
+
+    assert parse_claude_version("2.1.332 (Claude Code)") == (2, 1, 332)
+    assert parse_claude_version("no version here") is None
+
+    old = tmp_path / "old_claude.py"
+    old.write_text('print("2.1.100 (Claude Code)")', encoding="utf-8")
+    settings = _make_settings(tmp_path)
+    health = await StubClaudeRunner(settings, old).check_health()
+    assert health["healthy"] is True and health["available"] is False
+    assert "2.1.259 or newer" in health["error"]
+
+    current = tmp_path / "fake_claude.py"
+    current.write_text(FAKE_CLAUDE.strip(), encoding="utf-8")
+    health = await StubClaudeRunner(settings, current).check_health()
+    assert health["available"] is True and health["error"] is None and health["auth"] == "plan"
 
 
 async def test_claude_quota_is_what_the_last_job_reported(tmp_path: Path) -> None:
@@ -511,9 +663,18 @@ def test_claude_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     monkeypatch.setenv("AGENT_BRIDGE_STATE_DIR", str(tmp_path / "state"))
     for name in ("AGENT_BRIDGE_CLAUDE_MODEL", "AGENT_BRIDGE_CLAUDE_EFFORT", "AGENT_BRIDGE_CLAUDE_BIN"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("AGENT_BRIDGE_CLAUDE_AUTH", raising=False)
     defaults = Settings.from_env()
     assert (defaults.default_claude_model, defaults.default_claude_effort) == ("sonnet", "high")
     assert defaults.claude_bin is None
+    assert defaults.claude_auth == "plan"
+
+    monkeypatch.setenv("AGENT_BRIDGE_CLAUDE_AUTH", "Inherit")
+    assert Settings.from_env().claude_auth == "inherit"
+    monkeypatch.setenv("AGENT_BRIDGE_CLAUDE_AUTH", "sometimes")
+    with pytest.raises(ValueError, match="AGENT_BRIDGE_CLAUDE_AUTH"):
+        Settings.from_env()
+    monkeypatch.delenv("AGENT_BRIDGE_CLAUDE_AUTH")
 
     monkeypatch.setenv("AGENT_BRIDGE_CLAUDE_MODEL", "inherit")
     monkeypatch.setenv("AGENT_BRIDGE_CLAUDE_EFFORT", "med")
@@ -543,6 +704,23 @@ def test_parse_claude_stream_keeps_the_reply_and_ignores_noise() -> None:
     assert cut_short["session_id"] == "s1" and cut_short["model"] == "claude-x"
     assert cut_short["result_seen"] is False
     assert cut_short["response"] == "partial reply"
+
+    listed = parse_claude_stream_events(
+        [
+            *lines,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "errors": ["first", {"message": "second"}, 3],
+                    "subagent_stats": {"spawned": 2},
+                }
+            ),
+        ]
+    )
+    assert listed["errors"] == ["first", "second"]
+    assert listed["native_subagents"] == 2
 
     done = parse_claude_stream_events(
         [*lines, json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "final"})]

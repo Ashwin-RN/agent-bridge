@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -197,17 +198,39 @@ def parse_proc_stat(text: str) -> tuple[int, int] | None:
         return None
 
 
-def parse_ps_table(text: str) -> dict[int, int]:
-    """Map pid to parent pid from the output of `ps -axo pid=,ppid=`."""
-    table: dict[int, int] = {}
+def parse_etime(text: str) -> float | None:
+    """Seconds from a `ps` elapsed time: `[[dd-]hh:]mm:ss`."""
+    days = 0
+    rest = text.strip()
+    if "-" in rest:
+        day_part, _, rest = rest.partition("-")
+        if not day_part.isdigit():
+            return None
+        days = int(day_part)
+    parts = rest.split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return float(days * 86_400 + seconds)
+
+
+def parse_ps_table(text: str) -> dict[int, tuple[int, float | None]]:
+    """Map pid to `(parent pid, seconds since it started)` from `ps -axo pid=,ppid=,etime=`.
+
+    The elapsed time is None where the column is missing or cannot be read.
+    """
+    table: dict[int, tuple[int, float | None]] = {}
     for line in text.splitlines():
         parts = line.split()
         if len(parts) < 2:
             continue
         try:
-            table[int(parts[0])] = int(parts[1])
+            pid, ppid = int(parts[0]), int(parts[1])
         except ValueError:
             continue
+        table[pid] = (ppid, parse_etime(parts[2]) if len(parts) > 2 else None)
     return table
 
 
@@ -258,7 +281,7 @@ def _posix_ancestors(pid: int) -> list[tuple[int, float | None]]:
 
     try:
         out = subprocess.run(
-            ["ps", "-axo", "pid=,ppid="],
+            ["ps", "-axo", "pid=,ppid=,etime="],
             capture_output=True,
             text=True,
             timeout=5,
@@ -267,13 +290,15 @@ def _posix_ancestors(pid: int) -> list[tuple[int, float | None]]:
     except (OSError, subprocess.SubprocessError):
         return chain
     table = parse_ps_table(out)
+    now = time.time()
     current = pid
     seen = {pid}
     while len(chain) < _MAX_ANCESTORS:
-        parent = table.get(current, 0)
+        parent = table.get(current, (0, None))[0]
         if parent <= 0 or parent in seen:
             break
-        chain.append((parent, None))
+        elapsed = table.get(parent, (0, None))[1]
+        chain.append((parent, now - elapsed if elapsed is not None else None))
         seen.add(parent)
         current = parent
     return chain
@@ -282,7 +307,8 @@ def _posix_ancestors(pid: int) -> list[tuple[int, float | None]]:
 def ancestor_chain(pid: int | None = None) -> list[tuple[int, float | None]]:
     """`(pid, start_time)` for each ancestor of `pid`, nearest first. Empty when it cannot be read.
 
-    `start_time` is wall-clock seconds, or None where the platform does not give it cheaply.
+    `start_time` is wall-clock seconds, or None where it cannot be read. An ancestor with no start time
+    is never taken for a bridge (see `detect_nesting`).
     """
     own = os.getpid() if pid is None else int(pid)
     try:
@@ -349,9 +375,11 @@ def detect_nesting(
     chain = ancestor_chain(me) if ancestors is None else list(ancestors)
     for pid, start_time in chain:
         for owner_id, registered_at in owners_by_pid.get(int(pid), ()):
-            # An owner row can outlive its process. If the ancestor started after the row was written,
-            # the pid was reused by something that is not that bridge.
-            if start_time is not None and start_time > registered_at + _PID_REUSE_SLACK_SECONDS:
+            # An owner row can outlive its process, and its pid can then be given to anything, a terminal
+            # or the host itself included. Taking that for a bridge would refuse every job in an ordinary
+            # host. So the ancestor must be shown to be older than the row: a process that started after
+            # the row was written, or whose start cannot be read, is not counted.
+            if start_time is None or start_time > registered_at + _PID_REUSE_SLACK_SECONDS:
                 continue
             return Nesting(nested=True, via="ancestry", parent_owner=owner_id, parent_pid=int(pid))
     return NOT_NESTED

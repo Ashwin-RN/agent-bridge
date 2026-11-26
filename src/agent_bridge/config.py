@@ -247,6 +247,9 @@ class Settings:
     default_claude_model: str | None = DEFAULT_CLAUDE_MODEL
     default_claude_effort: EffortLevel | None = DEFAULT_CLAUDE_EFFORT
     claude_bin: str | None = None
+    # "plan": leave API credentials out of a Claude job's environment, so it runs on the signed-in plan.
+    # "inherit": pass the environment on as it is.
+    claude_auth: str = "plan"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -285,6 +288,12 @@ class Settings:
             default_claude_effort = None
         else:
             default_claude_effort = normalize_effort(raw_claude_effort)
+
+        raw_claude_auth = os.environ.get("AGENT_BRIDGE_CLAUDE_AUTH", "").strip().lower() or "plan"
+        if raw_claude_auth not in {"plan", "inherit"}:
+            raise ValueError(
+                f"Unknown AGENT_BRIDGE_CLAUDE_AUTH {raw_claude_auth!r}. Expected 'plan' or 'inherit'."
+            )
 
         default_timeout = int(os.environ.get("AGENT_BRIDGE_DEFAULT_TIMEOUT", "300"))
         max_concurrent = max(1, int(os.environ.get("AGENT_BRIDGE_MAX_CONCURRENT", "8")))
@@ -325,4 +334,5 @@ class Settings:
             default_claude_model=default_claude_model,
             default_claude_effort=default_claude_effort,
             claude_bin=claude_bin,
+            claude_auth=raw_claude_auth,
         )

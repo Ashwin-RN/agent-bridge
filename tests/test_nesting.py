@@ -23,6 +23,7 @@ from agent_bridge.nesting import (
     Nesting,
     ancestor_chain,
     detect_nesting,
+    parse_etime,
     parse_proc_stat,
     parse_ps_table,
     subagent_env,
@@ -114,10 +115,11 @@ def test_live_bridge_among_the_ancestors_means_nested_even_with_no_marker() -> N
     assert detect_nesting(
         environ={}, live_owners=[("pid-700-old", 700, now - 5000.0)], ancestors=[(700, now - 5.0)], own_pid=800
     ).nested is False
-    # Where the start time cannot be read, the pid alone decides.
+    # Where the start time cannot be read, a matching pid proves nothing: an ordinary host whose
+    # terminal happens to carry a dead bridge's pid must not be locked out.
     assert detect_nesting(
         environ={}, live_owners=[("pid-700-old", 700, now - 5000.0)], ancestors=[(700, None)], own_pid=800
-    ).nested is True
+    ).nested is False
 
 
 def test_subagent_env_carries_the_marker_and_drops_what_it_is_told_to() -> None:
@@ -142,7 +144,14 @@ def test_process_table_parsers() -> None:
     assert parse_proc_stat("garbage") is None
     assert parse_proc_stat("1 (x) S 2") is None
 
-    assert parse_ps_table("  1     0\n 200     1\nbad line\n 300   200\n") == {1: 0, 200: 1, 300: 200}
+    table = parse_ps_table("  1     0 12-03:04:05\n 200     1    01:02:03\nbad line\n 300   200       00:07\n 400 300\n")
+    assert table == {
+        1: (0, 12 * 86400 + 3 * 3600 + 4 * 60 + 5.0),
+        200: (1, 3723.0),
+        300: (200, 7.0),
+        400: (300, None),
+    }
+    assert parse_etime("x-01:02") is None and parse_etime("1:2:3:4") is None
 
 
 def test_ancestor_chain_of_a_real_child_includes_this_process() -> None:

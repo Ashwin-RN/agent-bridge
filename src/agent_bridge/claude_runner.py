@@ -47,9 +47,18 @@ from agent_bridge.usage import normalize_usage
 
 logger = logging.getLogger("agent_bridge.claude_runner")
 
+# `--permission-prompts none` needs this version. An older CLI passes `--version` and then fails every job.
+CLAUDE_MIN_VERSION: tuple[int, int, int] = (2, 1, 259)
+
 # `dontAsk` denies whatever would need an approval: writes and commands that change things.
 # Reads, searches and read-only shell commands still run.
 CLAUDE_READ_ONLY_PERMISSION_MODE = "dontAsk"
+# `dontAsk` still honours the allow rules in the user's own settings, and a user may well have allowed
+# `Edit` there. So a read-only run does not get the writing tools at all: a bare name removes the tool.
+# A shell command the user has allowed for good in their settings does still run.
+CLAUDE_READ_ONLY_REMOVED_TOOLS: tuple[str, ...] = ("Write", "Edit", "NotebookEdit")
+# Credentials that make `claude` bill an API account instead of the plan it is signed in to.
+CLAUDE_API_CREDENTIAL_ENV: tuple[str, ...] = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # `auto` accepts file edits and lets Claude Code's own classifier decide each shell command.
 CLAUDE_EDIT_PERMISSION_MODE = "auto"
 # The classifier allows a push that the prompt asked for, and a subagent has no sandbox to stop the
@@ -69,42 +78,65 @@ CLAUDE_EDIT_DENY_RULES: tuple[str, ...] = (
 _CLAUDE_LIMIT_RE = re.compile(r"\b(hit|reached)\s+your\s+(\w+\s+)?limit\b|\bout\s+of\s+extra\s+usage\b", re.I)
 
 
+def _without_shell_shim(path: Path) -> list[str]:
+    """Return a command for `path` that Windows can start without a shell, or raise.
+
+    An npm install leaves a `.cmd` shim. Windows starts a batch file through `cmd.exe`, which would read
+    the job's own arguments (a model name, a session id) as shell text. So the script behind the shim is
+    run with `node` instead, and a shim that cannot be resolved that way is refused.
+    """
+    if sys.platform != "win32" or path.suffix.lower() not in {".cmd", ".bat", ".ps1"}:
+        return [str(path)]
+    cli_js = path.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
+    node_bin = shutil.which("node")
+    if cli_js.exists() and node_bin:
+        return [node_bin, str(cli_js)]
+    raise FileNotFoundError(
+        f"{str(path)!r} is a shell shim, which the bridge will not start. Set AGENT_BRIDGE_CLAUDE_BIN to "
+        "claude.exe (the native install puts it in ~/.local/bin)."
+    )
+
+
 def resolve_claude_command(configured: str | None = None) -> list[str]:
     """Locate the `claude` executable without going through a shell."""
     if configured:
         cand = Path(configured).expanduser()
         if cand.exists():
-            return [str(cand)]
+            return _without_shell_shim(cand)
         found_cfg = shutil.which(configured)
         if found_cfg:
-            return [found_cfg]
+            return _without_shell_shim(Path(found_cfg))
         raise FileNotFoundError(
             f"Configured AGENT_BRIDGE_CLAUDE_BIN does not exist: {configured!r}"
         )
 
+    native = Path.home() / ".local" / "bin" / ("claude.exe" if sys.platform == "win32" else "claude")
     found = shutil.which("claude")
     if not found:
-        native = Path.home() / ".local" / "bin" / ("claude.exe" if sys.platform == "win32" else "claude")
         if native.exists():
             return [str(native)]
         raise FileNotFoundError(
             "Could not find `claude` CLI in PATH. Install Claude Code or set AGENT_BRIDGE_CLAUDE_BIN."
         )
+    try:
+        return _without_shell_shim(Path(found))
+    except FileNotFoundError:
+        if native.exists():
+            return [str(native)]
+        raise
 
-    found_path = Path(found)
-    if sys.platform == "win32" and found_path.suffix.lower() in {".cmd", ".bat", ".ps1"}:
-        # An npm install leaves a `.cmd` shim, which cannot be started without a shell. Run its script.
-        cli_js = found_path.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
-        node_bin = shutil.which("node")
-        if cli_js.exists() and node_bin:
-            return [node_bin, str(cli_js)]
-    return [str(found_path)]
+
+def parse_claude_version(text: str | None) -> tuple[int, ...] | None:
+    """`2.1.332 (Claude Code)` -> `(2, 1, 332)`."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(g) for g in match.groups()) if match else None
 
 
 def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
     """Reduce `claude -p --output-format stream-json` output to what the bridge records."""
     session_id: str | None = None
     model: str | None = None
+    api_key_source: str | None = None
     last_text = ""
     result_event: dict[str, Any] | None = None
     rate_limit: dict[str, Any] | None = None
@@ -126,6 +158,8 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
         if etype == "system" and event.get("subtype") == "init":
             if isinstance(event.get("model"), str) and event["model"]:
                 model = event["model"]
+            if isinstance(event.get("apiKeySource"), str) and event["apiKeySource"]:
+                api_key_source = event["apiKeySource"]
         elif etype == "assistant":
             if event.get("parent_tool_use_id"):
                 continue  # text written by a subagent of the subagent, not the reply
@@ -154,6 +188,7 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
     num_turns: int | None = None
     cost_usd: float | None = None
     subtype: str | None = None
+    native_subagents = 0
 
     if result_event is not None:
         subtype = result_event.get("subtype") if isinstance(result_event.get("subtype"), str) else None
@@ -166,9 +201,20 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
                 errors.append(result_text.strip())
             else:
                 response = result_text
+        # Some failures carry their text only in an `errors` list.
+        listed = result_event.get("errors")
+        if is_error and isinstance(listed, list):
+            for item in listed:
+                text = item if isinstance(item, str) else (item.get("message") if isinstance(item, dict) else None)
+                if isinstance(text, str) and text.strip() and text.strip() not in errors:
+                    errors.append(text.strip())
         api_status = result_event.get("api_error_status")
         if api_status not in (None, "", 0):
             errors.append(f"API error {api_status}")
+        stats = result_event.get("subagent_stats")
+        spawned = stats.get("spawned") if isinstance(stats, dict) else None
+        if isinstance(spawned, int) and not isinstance(spawned, bool):
+            native_subagents = spawned
         if is_error and not errors:
             errors.append(f"claude ended with {subtype or 'an error'}")
         raw_denials = result_event.get("permission_denials")
@@ -201,6 +247,8 @@ def parse_claude_stream_events(lines: list[str]) -> dict[str, Any]:
         "num_turns": num_turns,
         "cost_usd": cost_usd,
         "subtype": subtype,
+        "api_key_source": api_key_source,
+        "native_subagents": native_subagents,
     }
 
 
@@ -244,12 +292,21 @@ class ClaudeRunner:
                 "error": str(exc),
             }
         healthy, version, err = await _check_cli_health(cmd)
+        available = healthy
+        parsed = parse_claude_version(version)
+        if healthy and parsed is not None and parsed < CLAUDE_MIN_VERSION:
+            available = False
+            err = (
+                f"Claude Code {'.'.join(map(str, parsed))} is too old for the bridge: it needs "
+                f"{'.'.join(map(str, CLAUDE_MIN_VERSION))} or newer (for --permission-prompts). Update it."
+            )
         return {
             "command_found": True,
             "healthy": healthy,
-            "available": healthy,
+            "available": available,
             "command": cmd,
             "version": version,
+            "auth": self._settings.claude_auth,
             "error": err,
         }
 
@@ -298,7 +355,9 @@ class ClaudeRunner:
             "--permission-mode",
             CLAUDE_READ_ONLY_PERMISSION_MODE if request.mode == "read_only" else CLAUDE_EDIT_PERMISSION_MODE,
         ]
-        if request.mode != "read_only":
+        if request.mode == "read_only":
+            args.extend(["--disallowedTools", *CLAUDE_READ_ONLY_REMOVED_TOOLS])
+        else:
             args.extend(["--disallowedTools", *CLAUDE_EDIT_DENY_RULES])
         if effective_model:
             args.extend(["--model", effective_model])
@@ -311,11 +370,12 @@ class ClaudeRunner:
         return args
 
     def build_env(self, request: RunRequest) -> dict[str, str]:
-        return subagent_env(
-            job_id=request.job_id,
-            owner_id=request.owner_id,
-            drop=CLAUDE_SESSION_ENV,
-        )
+        drop: tuple[str, ...] = CLAUDE_SESSION_ENV
+        if self._settings.claude_auth != "inherit":
+            # With one of these set, `claude` bills that API account even when it is signed in to a plan.
+            # The job is filed under the plan's pool, so the variable is left out unless asked for.
+            drop = (*drop, *CLAUDE_API_CREDENTIAL_ENV)
+        return subagent_env(job_id=request.job_id, owner_id=request.owner_id, drop=drop)
 
     async def _run_once(
         self,
@@ -549,12 +609,24 @@ class ClaudeRunner:
         errors: list[str] = parsed["errors"]
         if parsed["model"]:
             reported_model = parsed["model"]
+        if (not timed_out_locally) and proc.returncode == 0 and not parsed["result_seen"] and not errors:
+            # A run that ends well always ends with a `result` event. Without one the output was cut
+            # short, whatever the exit code says. Any partial reply is kept on the failed job.
+            errors = ["claude ended without a result event; its output was cut short"]
         turn_completed_cleanly = (
             (not timed_out_locally)
             and proc.returncode == 0
+            and parsed["result_seen"]
             and (not parsed["is_error"])
             and (not errors)
         )
+        key_source = parsed["api_key_source"]
+        if key_source and key_source != "none":
+            billing_notice = (
+                f"This run was billed to an API key ({key_source}), not to the Claude plan the `claude` "
+                "pool stands for."
+            )
+            model_notice = f"{model_notice} {billing_notice}" if model_notice else billing_notice
 
         usage, provider_metrics = normalize_usage("claude", parsed["usage"])
         if usage is not None:
@@ -563,10 +635,16 @@ class ClaudeRunner:
             usage_status = "missing"
         extras: dict[str, Any] = {}
         if parsed["cost_usd"] is not None:
-            # Claude Code works this out itself from list prices. It is not a bill.
-            extras["cost_usd_estimate"] = parsed["cost_usd"]
+            # Claude Code works this out itself from list prices. It is not a bill. On a resumed
+            # session it covers the earlier turns too, unlike the token counts.
+            extras["session_cost_usd_estimate"] = parsed["cost_usd"]
         if parsed["num_turns"] is not None:
             extras["num_turns"] = parsed["num_turns"]
+        if parsed["native_subagents"]:
+            # Their tokens are not in the counts above: Claude Code reports the main agent's only.
+            extras["native_subagents"] = parsed["native_subagents"]
+        if key_source and key_source != "none":
+            extras["api_key_source"] = key_source
         if parsed["permission_denials"]:
             extras["permission_denials"] = parsed["permission_denials"]
         if parsed["rate_limit"]:

@@ -195,7 +195,14 @@ def _reported(fn: _ToolFn) -> _ToolFn:
             return await fn(*args, **kwargs)
         except ToolError:
             raise
-        except (ValueError, LookupError, RuntimeError, OSError) as exc:
+        except (ValueError, NestedBridgeError) as exc:
+            raise ToolError(str(exc) or type(exc).__name__) from exc
+        except (LookupError, RuntimeError, OSError) as exc:
+            # These may be refusals too (a session that is not safe to resume, a missing worktree), or a
+            # fault. The caller gets the text either way; the log keeps the traceback in case it is a fault.
+            logging.getLogger("agent_bridge.server").warning(
+                "Tool %s failed with %s", fn.__name__, type(exc).__name__, exc_info=True
+            )
             raise ToolError(str(exc) or type(exc).__name__) from exc
 
     return wrapper  # type: ignore[return-value]

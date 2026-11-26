@@ -1495,9 +1495,6 @@ class JobManager:
             )
             record.last_activity = record.status
 
-            if record.backend == "claude":
-                await self._remember_claude_rate_limit(result.provider_metrics)
-
             finalized_committed = await self._finalize_job_durable(
                 record,
                 request_session_id=request.session_id,
@@ -1506,6 +1503,10 @@ class JobManager:
                 touched_provider=record.provider_invoked,
                 attempts=result.attempts if len(result.attempts) > 1 else None,
             )
+            # Only after the job's terminal row is committed: a quota reading is a nicety, and nothing
+            # that happens while storing it (a lock, a cancel) may stand between a finished job and its row.
+            if finalized_committed and record.backend == "claude":
+                await self._remember_claude_rate_limit(result.provider_metrics)
         finally:
             CURRENT_PROCESS_TRACKER.reset(tracker_token)
             if tracker.has_alive_processes():
@@ -1975,11 +1976,11 @@ class JobManager:
 
     async def _remember_claude_rate_limit(self, provider_metrics: dict[str, Any] | None) -> None:
         """Keep the plan limits a Claude job reported, as the only quota reading there is for that pool."""
-        info = provider_metrics.get("rate_limit") if isinstance(provider_metrics, dict) else None
-        reading = claude_quota_from_rate_limit(info)
-        if reading is None:
-            return
         try:
+            info = provider_metrics.get("rate_limit") if isinstance(provider_metrics, dict) else None
+            reading = claude_quota_from_rate_limit(info)
+            if reading is None:
+                return
             previous = await self._db(self.store.get_cached_quota, "claude", float("inf"))
             await self._db(self.store.set_cached_quota, "claude", merge_claude_quota(previous, reading))
         except Exception as exc:
