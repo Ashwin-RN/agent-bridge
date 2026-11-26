@@ -698,7 +698,7 @@ With no period it shows today. `session` shows only the window you are typing in
 
 ### What was checked
 
-On 2026-11-26 the skill was run headless in each host, against a bridge started from a test folder: Claude Code 2.1.332 (`claude -p "/bridge-usage 7d"`), Codex 0.172.0 (`codex exec '$bridge-usage 7d'`) and `agy` 1.5.18 (`agy -p "/bridge-usage 7d"`). Each loaded the skill from the project folder in the table, called the tool with `period="7d"`, and printed the 50-line view exactly as the tool returned it, with nothing added. `codex exec` called it with no approval setting, because the tool is marked read-only. The same tests found that the hosts hand a tool result to their model differently: Claude Code passes only the structured part, and Codex and Antigravity pass the text. That is why `usage_dashboard` returns one object, which the bridge sends as both.
+On 2026-11-26 the skill was run headless in each host, against a bridge started from a test folder: Claude Code 2.1.332 (`claude -p "/bridge-usage 7d"`), Codex 0.172.0 (`codex exec '$bridge-usage 7d'`) and `agy` 1.5.18 (`agy -p "/bridge-usage 7d"`). Each loaded the skill from the project folder in the table, called the tool with `period="7d"`, and printed the view exactly as the tool returned it, with nothing added. `codex exec` called it with no approval setting, because the tool is marked read-only. The same tests found that the hosts hand a tool result to their model differently: Claude Code passes only the structured part, and Codex and Antigravity pass the text. That is why `usage_dashboard` returns one object, which the bridge sends as both.
 
 ## A bridge inside a bridge
 
