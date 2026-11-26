@@ -268,6 +268,7 @@ def build_quota_advisory(
         windows: list[dict[str, Any]],
         models: list[str],
         rate_limit_reached: bool = False,
+        shared_with_own_use: bool = False,
     ) -> None:
         win_5h = next((w for w in windows if w.get("window_kind") == "5h"), None)
         win_weekly = next((w for w in windows if w.get("window_kind") == "weekly"), None)
@@ -339,6 +340,15 @@ def build_quota_advisory(
                 else ""
             )
             rec = f"Quota exhausted on {label};{reset_note}. Route to another eligible pool until reset."
+        elif shared_with_own_use and (wk_sig == "expiring_soon_use_it" or w5_sig == "expiring_soon_use_it"):
+            # What is left of this plan before its reset is also what the user's own sessions run on.
+            # Say what is there, and never urge a host to spend it.
+            priority = "normal"
+            rec = (
+                f"{label} has weekly {wk_rem if wk_rem is not None else '?'}% left, resetting in "
+                f"{win_weekly.get('resets_in') if win_weekly else 'unknown'}. It is the same allowance the "
+                "user's own Claude sessions use: spend it only when the task calls for Claude."
+            )
         elif wk_sig == "expiring_soon_use_it" and (w5_rem is None or w5_rem > 5.0):
             priority = "use_before_reset"
             rec = (
@@ -424,6 +434,7 @@ def build_quota_advisory(
             windows=enriched_claude.get("windows") or [],
             models=[claude_default_label] if claude_default_label else ["sonnet (high)"],
             rate_limit_reached=bool(enriched_claude.get("rate_limit_reached")),
+            shared_with_own_use=True,
         )
 
     # Antigravity pools (both `Gemini Models` AND `Claude and GPT models`!)

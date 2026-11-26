@@ -423,6 +423,37 @@ def test_claude_rate_limit_reading_and_merge() -> None:
     assert [w["window"] for w in merge_claude_quota(stale, five)["windows"]] == ["5h"]
 
 
+def test_advisory_never_urges_spending_the_claude_plan_before_its_reset() -> None:
+    """13% left with a day to go reads "use it before reset" on the other pools. Not on this one."""
+    from datetime import datetime, timedelta, timezone
+
+    from agent_bridge.quota import build_quota_advisory
+
+    now = datetime(2026, 11, 26, 14, 0, tzinfo=timezone.utc)
+    reset = (now + timedelta(hours=21)).isoformat(timespec="seconds")
+    window = {"window": "weekly", "used_percent": 87.0, "remaining_percent": 13.0, "reset_time": reset}
+
+    claude_only = build_quota_advisory(
+        {"claude": {"backend": "claude", "pool": "claude", "status": "ok", "windows": [dict(window, id="seven_day")]}},
+        now_utc=now,
+    )
+    pool = claude_only["pools"][0]
+    assert pool["pool"] == "claude"
+    assert pool["weekly"]["signal"] == "expiring_soon_use_it"
+    assert pool["priority"] == "normal"
+    assert "same allowance" in pool["recommendation"]
+    assert claude_only["expiring_weekly_alerts"] == []
+    assert "WEEKLY RESET PRIORITY" not in claude_only["summary"]
+
+    # The same numbers on Codex do raise the alert: the rule is unchanged for the other pools.
+    codex_only = build_quota_advisory(
+        {"codex": {"backend": "codex", "pool": "codex", "status": "ok", "windows": [dict(window, slot="secondary")]}},
+        now_utc=now,
+    )
+    assert codex_only["pools"][0]["priority"] == "use_before_reset"
+    assert len(codex_only["expiring_weekly_alerts"]) == 1
+
+
 async def test_claude_failures_are_classified(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
 
