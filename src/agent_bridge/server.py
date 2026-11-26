@@ -24,6 +24,8 @@ from agent_bridge.model_resolver import ModelPoolUnavailableError
 from agent_bridge.nesting import NestedBridgeError, Nesting, ancestor_chain, detect_nesting
 from agent_bridge.storage import UsagePeriod
 
+DashboardPeriod = Literal["today", "7d", "30d", "all", "session"]
+
 SERVER_INSTRUCTIONS = """
 `agent-bridge` lets you delegate tasks, reviews, and parallel work to other AI coding CLIs on this
 machine, whichever CLI you are yourself. It covers FOUR independent subscription quota pools over
@@ -65,6 +67,7 @@ Smart Quota & Weekly-Reset Routing:
   `parent_run` are inherited automatically unless overridden).
 - Treat `status="completed"` as a lifecycle status and still verify that `response` contains the
   requested deliverable.
+- For an account of what the bridge has run, call `usage_dashboard` and show its `text` unchanged.
 - A subagent started by the bridge may not start bridge jobs itself: there the job-starting tools
   fail with `nested_bridge`.
 """.strip()
@@ -72,8 +75,8 @@ Smart Quota & Weekly-Reset Routing:
 NESTED_INSTRUCTIONS = """
 `agent-bridge` is running INSIDE one of its own jobs: you are a subagent that another session started
 through the bridge. `run_agent`, `start_agent`, `run_parallel` and `review_code` are refused here with
-`nested_bridge`. Do the work yourself and put the answer in your reply. `check_jobs`, `get_usage` and
-`list_backends` still work.
+`nested_bridge`. Do the work yourself and put the answer in your reply. `check_jobs`, `get_usage`,
+`usage_dashboard` and `list_backends` still work.
 """.strip()
 
 
@@ -648,6 +651,32 @@ def create_server(
             compact=compact,
             recent_limit=recent_limit,
         )
+
+    @mcp.tool(
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            openWorldHint=False,
+        )
+    )
+    @_reported
+    async def usage_dashboard(
+        period: DashboardPeriod | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict[str, Any]:
+        """A readable account of everything the bridge has run in a period, from its own records only.
+
+        - `period`: `'today'` (the default), `'7d'`, `'30d'`, `'all'`, or `'session'` (this window only).
+        - `since` / `until`: instead of `period`, a local date (`2026-11-25`) or an ISO time. A date alone as
+          `until` takes in that whole day.
+
+        Totals hold only finished runs with exact or delta counts. Everything the records cannot vouch for
+        (running jobs, partial counts, runs that left no count, Claude subagents, time before the first
+        record) is listed apart under `not_in_totals` and never added in. Show `text` to the user as it is:
+        every figure in it is already worked out.
+        """
+        return await job_manager.usage_dashboard(period=period, since=since, until=until)
 
     @mcp.tool(
         annotations=ToolAnnotations(

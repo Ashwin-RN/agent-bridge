@@ -25,6 +25,7 @@ from agent_bridge.config import (
     resolve_backend_and_model_hint,
 )
 from agent_bridge.claude_runner import ClaudeRunner
+from agent_bridge.dashboard import build_dashboard, resolve_window
 from agent_bridge.models import JobRecord, RunRequest, RunResult
 from agent_bridge.nesting import NOT_NESTED, NestedBridgeError, Nesting
 from agent_bridge.process_control import (
@@ -1953,6 +1954,35 @@ class JobManager:
             summary["quota_advisory"] = self._build_quota_advisory(quota)
 
         return summary
+
+    async def usage_dashboard(
+        self,
+        *,
+        period: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict[str, Any]:
+        """Everything the bridge has run in a period, from its records only; see `dashboard.py`."""
+        now_ts = time.time()
+        window = resolve_window(period, since, until, now_ts=now_ts)
+        try:
+            # As get_usage does: a job whose window has closed is marked failed first, not shown as running.
+            await self._db(
+                self.store.recover_dead_owner_jobs,
+                self.owner_id,
+                is_pid_alive_fn=self._is_pid_alive,
+                stale_seconds=self.settings.owner_stale_seconds,
+            )
+        except Exception:
+            pass
+        records = await self._db(
+            self.store.dashboard_records,
+            since_ts=window.since_ts,
+            until_ts=window.until_ts,
+            session_owner_id=self.owner_id,
+            only_session=window.only_session,
+        )
+        return build_dashboard(records, window=window, owner_id=self.owner_id, now_ts=now_ts)
 
     def _build_quota_advisory(self, quota: dict[str, Any]) -> dict[str, Any]:
         local_defaults = read_codex_local_defaults()

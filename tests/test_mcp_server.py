@@ -1,4 +1,4 @@
-"""End-to-end stdio MCP protocol test (verifies JSON-RPC stdio framing, 8 tools, and default env timeout)."""
+"""End-to-end stdio MCP protocol test (verifies JSON-RPC stdio framing, 9 tools, and default env timeout)."""
 
 from __future__ import annotations
 
@@ -46,8 +46,22 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(tmp_path: Path) -> 
                 "cancel_job",
                 "review_code",
                 "get_usage",
+                "usage_dashboard",
                 "list_backends",
             }
+            # `codex exec` refuses a tool that is not marked read-only unless approvals are switched off.
+            dashboard_tool = next(t for t in tools_result.tools if t.name == "usage_dashboard")
+            assert dashboard_tool.annotations is not None
+            assert dashboard_tool.annotations.read_only_hint is True
+
+            dash_res = await session.call_tool("usage_dashboard", {"period": "session"})
+            assert not dash_res.is_error
+            # The whole view, figures included, reaches a host that reads only the text content as JSON,
+            # and a host that reads only the structured part as the same object.
+            dash_payload = json.loads(dash_res.content[0].text)
+            assert dash_res.structured_content == dash_payload
+            assert dash_payload["text"].startswith("agent-bridge usage, session")
+            assert dash_payload["totals"]["runs"] == 0
 
             usage_res = await session.call_tool(
                 "get_usage",

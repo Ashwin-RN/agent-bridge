@@ -2366,6 +2366,80 @@ class BridgeStore:
         summary["recent"] = recent
         return summary
 
+    def dashboard_records(
+        self,
+        *,
+        since_ts: float | None,
+        until_ts: float | None,
+        session_owner_id: str,
+        only_session: bool,
+    ) -> dict[str, Any]:
+        """Every record the usage dashboard reads, from one snapshot so that its figures agree.
+
+        Each usage row comes with what its job row says, when the job row is still kept: whether the job
+        is still running, whether its CLI was started, and why it failed. Pruned job rows read as NULL.
+        """
+        clauses: list[str] = []
+        vals: list[Any] = []
+        if since_ts is not None:
+            clauses.append("u.ts >= ?")
+            vals.append(since_ts)
+        if until_ts is not None:
+            clauses.append("u.ts < ?")
+            vals.append(until_ts)
+        if only_session:
+            clauses.append("u.owner_id = ?")
+            vals.append(session_owner_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        running_where = "WHERE status IN ('queued', 'running')" + (" AND owner_id = ?" if only_session else "")
+        running_vals: list[Any] = [session_owner_id] if only_session else []
+
+        with self._tx(write=False) as cur:
+            # One read transaction: in WAL mode every SELECT below sees the same committed state.
+            cur.execute("BEGIN")
+            usage_rows = cur.execute(
+                f"""
+                SELECT u.job_id, u.attempt_number, u.is_final_attempt, u.owner_id, u.ts, u.backend,
+                       COALESCE(u.quota_pool, CASE WHEN u.backend = 'codex' THEN 'codex'
+                                                   WHEN u.backend = 'claude' THEN 'claude'
+                                                   ELSE 'agy_gemini' END) AS quota_pool,
+                       COALESCE(NULLIF(u.model, ''), u.backend || '-default') AS model,
+                       u.status, u.duration_seconds, u.usage_status,
+                       u.input_tokens, u.output_tokens, u.cached_tokens, u.cache_write_tokens,
+                       u.reasoning_tokens, u.total_tokens, u.provider_metrics_json,
+                       j.job_id AS job_row_id, j.status AS job_status,
+                       j.provider_invoked AS job_provider_invoked, j.failure_reason AS job_failure_reason
+                FROM usage_events u
+                LEFT JOIN jobs j ON j.job_id = u.job_id
+                {where}
+                ORDER BY u.ts ASC, u.id ASC
+                """,
+                vals,
+            ).fetchall()
+            running_rows = cur.execute(
+                f"""
+                SELECT job_id, owner_id, backend, quota_pool, model, requested_model, status,
+                       created_at, started_at, last_activity
+                FROM jobs
+                {running_where}
+                ORDER BY created_at ASC
+                """,
+                running_vals,
+            ).fetchall()
+            first = cur.execute("SELECT MIN(ts) AS first_ts FROM usage_events").fetchone()
+            owner = cur.execute(
+                "SELECT started_at FROM owners WHERE owner_id = ?",
+                (session_owner_id,),
+            ).fetchone()
+            cur.execute("COMMIT")
+
+        return {
+            "usage_rows": [dict(r) for r in usage_rows],
+            "running_jobs": [dict(r) for r in running_rows],
+            "first_record_ts": float(first["first_ts"]) if first is not None and first["first_ts"] is not None else None,
+            "session_started_at": float(owner["started_at"]) if owner is not None else None,
+        }
+
     # --- Shared quota cache ---
 
     def get_cached_quota(self, backend: str, ttl_seconds: float) -> dict[str, Any] | None:

@@ -19,6 +19,7 @@ What you can do with it:
 - Let Codex or Claude edit code in its own Git worktree, away from your checkout.
 - Carry on a conversation with an agent you started earlier.
 - See how much of each subscription's quota is left before you spend it.
+- See everything the bridge has run, by backend, pool and model, for a period you choose, from its own records.
 
 ## Contents
 
@@ -28,13 +29,14 @@ What you can do with it:
 - [Your first tasks](#your-first-tasks)
 - [Key ideas](#key-ideas)
 - [Backends, models and effort](#backends-models-and-effort)
-- [The eight tools](#the-eight-tools)
+- [The nine tools](#the-nine-tools)
 - [Reading a result](#reading-a-result)
 - [What a subagent can touch](#what-a-subagent-can-touch)
 - [Edits in a worktree](#edits-in-a-worktree)
 - [Resuming a session](#resuming-a-session)
 - [Timeouts and waiting](#timeouts-and-waiting)
 - [Quota and usage](#quota-and-usage)
+- [The usage dashboard skill](#the-usage-dashboard-skill)
 - [A bridge inside a bridge](#a-bridge-inside-a-bridge)
 - [Optional instructions snippet](#optional-instructions-snippet)
 - [Optional: see each job as an agent](#optional-see-each-job-as-an-agent)
@@ -160,6 +162,7 @@ You talk to your host in plain words. It picks the tool and the arguments. Namin
 | "Have Codex make this refactor in an isolated worktree." | `run_agent` with `mode="edit"`, `worktree=True` |
 | From Codex or Antigravity: "Ask Claude through agent-bridge to review this plan." | `run_agent` with `backend="claude"` |
 | "How much quota is left on each pool?" | `get_usage` with `include_quota=True` |
+| `/bridge-usage 7d` (Claude Code, Antigravity) or `$bridge-usage 7d` (Codex), once the skill is installed | `usage_dashboard` with `period="7d"` |
 
 ## Key ideas
 
@@ -245,7 +248,7 @@ For `agy` the effort is part of the model name (`neon-medium`, `claude-opus-high
 - **What it loads.** Your `CLAUDE.md` files and settings, so repository rules apply. No MCP servers at all (`--strict-mcp-config`): a Claude subagent cannot reach your connectors, or the bridge.
 - **No model fallback.** If the CLI rejects the model, the job fails with the CLI's message. Only a network or server error on a new `read_only` job is retried, once.
 
-## The eight tools
+## The nine tools
 
 Your host fills these in for you. The tables are here so you know what you can ask for.
 
@@ -404,6 +407,42 @@ What the bridge has run, and optionally how much quota is left.
 | `include_quota` | `False` | Also read the live quota of each pool. See [Quota and usage](#quota-and-usage) |
 | `refresh_quota` | `False` | Skip the cache and read the quota again |
 | `recent_limit` | 10 | How many recent runs to list |
+
+### usage_dashboard
+
+A readable account of everything the bridge has run in a period, across every backend, quota pool and model, read from the bridge's own records and nothing else. It is read-only, and it also answers in a bridge that runs inside a bridge job. The [usage dashboard skill](#the-usage-dashboard-skill) is the easy way to call it.
+
+| Argument | Default | What it does |
+|---|---|---|
+| `period` | `today` | `today` (since local midnight), `7d`, `30d`, `all`, or `session` (this window only) |
+| `since`, `until` | none | Instead of `period`: a local date such as `2026-11-25`, or an ISO time such as `2026-11-25T14:30`. A date alone as `until` takes in that whole day. Giving both `period` and one of these is refused |
+
+What the reply holds:
+
+- `text`: the whole view as fixed-width text, ready to show as it is. It is rendered from the same figures as the rest of the reply.
+- `totals`: runs, their outcomes, time and tokens.
+- `this_session` and `other_sessions`: the same figures split between the calling window and every other window. The two add up to `totals`.
+- `by_backend`, `by_quota_pool`, `by_model`: each adds up to `totals`. Every backend and pool is listed, with zeros where nothing ran.
+- `not_in_totals`: what the records cannot vouch for, by job id. None of it is added in.
+- `counted_as_nothing_spent`: runs whose CLI was never started.
+
+Rules the figures follow:
+
+- A run counts in the period its record was written, which is when it finished. A retried run counts once, under the model its last attempt ran on. Each attempt's tokens go to the model that attempt ran on.
+- Totals hold tokens only from finished runs with an `exact` or `delta` count.
+- Listed apart under `not_in_totals`, and never added in:
+
+  | Entry | What it is |
+  |---|---|
+  | `running_or_queued` | Jobs not finished yet, from every window, with any tokens already recorded for an earlier attempt |
+  | `partial_counts` | A count for a turn that did not finish cleanly. It is shown, but it may be short |
+  | `cli_started_no_count` | The CLI was started but left no count: cancelled, timed out, failed, window closed, or a CLI that reports none, such as Codex's built-in review |
+  | `cannot_tell_if_cli_started` | No count, and the job's row has been pruned (the newest 500 are kept unless `AGENT_BRIDGE_MAX_STORED_JOBS` says otherwise), so it is not known whether the CLI ran |
+  | `claude_subagents` | Claude runs that started subagents of their own. Claude Code reports the main agent's tokens only |
+  | `claude_subagents_not_on_record` | Claude runs that did not record whether they started subagents: written before the bridge kept that count, or Claude Code did not report it |
+  | `before_records_begin` | Set when the period reaches back before the bridge's first record. That stretch is not covered, which is not the same as zero |
+
+- Left out on purpose: live quota readings, which come from each CLI (`get_usage` with `include_quota` shows them), and Claude Code's cost estimate, which is not a bill and repeats earlier turns on a resume.
 
 ### list_backends
 
@@ -613,6 +652,52 @@ Without `include_quota`, `get_usage` reports only what the bridge itself ran: ru
 - For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.session_cost_usd_estimate` is Claude Code's own estimate at list prices, not a bill; on a resume it covers the earlier turns of the session too. If the job started native subagents of its own, their tokens are not in the counts. `provider_metrics.native_subagents` says how many there were, 0 included, whenever Claude Code reports it; a run without it did not say.
 - Codex's built-in review (`review_code` with no `focus`) reports no token counts, so it shows as 0 tokens.
 
+## The usage dashboard skill
+
+`skills/bridge-usage/SKILL.md` is a skill that calls [`usage_dashboard`](#usage_dashboard) and shows its `text` unchanged. The same file works in Claude Code, Codex and Antigravity. The bridge works out every figure; the skill only picks the period and shows the answer, so the host's model has nothing to add up or round.
+
+### Install it
+
+Copy the `bridge-usage` folder into the skills folder of each host you use. Install it after updating the bridge: until the bridge in that host has `usage_dashboard`, the skill says the bridge is out of date and stops.
+
+| Host | Folder for every project | Folder for one project |
+|---|---|---|
+| Claude Code | `~/.claude/skills/bridge-usage/` | `<project>/.claude/skills/bridge-usage/` |
+| Codex | `~/.agents/skills/bridge-usage/` (OpenAI's docs). Codex's own skill installer uses `~/.codex/skills/` | `<project>/.agents/skills/bridge-usage/` |
+| Antigravity | `~/.gemini/config/skills/bridge-usage/` (the app and the CLI) | `<project>/.agents/skills/bridge-usage/` |
+
+On Windows, from the cloned folder in PowerShell:
+
+```
+Copy-Item -Recurse skills\bridge-usage $HOME\.claude\skills\
+Copy-Item -Recurse skills\bridge-usage $HOME\.agents\skills\
+Copy-Item -Recurse skills\bridge-usage $HOME\.gemini\config\skills\
+```
+
+On macOS and Linux:
+
+```
+cp -r skills/bridge-usage ~/.claude/skills/
+cp -r skills/bridge-usage ~/.agents/skills/
+cp -r skills/bridge-usage ~/.gemini/config/skills/
+```
+
+Make the parent folder first if it does not exist. A host that was running picks up a new skill in a new chat; in Antigravity, `/skills reload` also works.
+
+### Use it
+
+| Host | Type |
+|---|---|
+| Claude Code | `/bridge-usage`, `/bridge-usage 7d`, `/bridge-usage since 2026-11-20` |
+| Codex | `$bridge-usage 7d`, or pick it from `/skills` |
+| Antigravity | `/bridge-usage 7d` |
+
+With no period it shows today. `session` shows only the window you are typing in.
+
+### What was checked
+
+On 2026-11-26 the skill was run headless in each host, against a bridge started from a test folder: Claude Code 2.1.332 (`claude -p "/bridge-usage 7d"`), Codex 0.172.0 (`codex exec '$bridge-usage 7d'`) and `agy` 1.5.18 (`agy -p "/bridge-usage 7d"`). Each loaded the skill from the project folder in the table, called the tool, and printed the view. The same tests found that the hosts hand a tool result to their model differently: Claude Code passes only the structured part, and Codex and Antigravity pass the text. That is why `usage_dashboard` returns one object, which the bridge sends as both.
+
 ## A bridge inside a bridge
 
 Once the bridge is registered in more than one CLI, a subagent can see the bridge's tools too. Codex started by the bridge would find the bridge among its own MCP servers, and could start a Claude job, which could start another, and so on.
@@ -624,7 +709,7 @@ nested_bridge: this agent-bridge was started inside job codex-1a2b3c4d (detected
 not start further bridge jobs, so `run_agent` is refused. ...
 ```
 
-`check_jobs`, `get_usage` and `list_backends` still work there, and `list_backends` shows `nesting`. There is no setting to allow a second level.
+`check_jobs`, `get_usage`, `usage_dashboard` and `list_backends` still work there, and `list_backends` shows `nesting`. There is no setting to allow a second level.
 
 How a bridge knows:
 
@@ -759,7 +844,9 @@ These steps are written so that you can hand them to an agent on the machine: "p
 
    A current install answers with the commit line and ends with a sentence saying no file was changed. An old install comes back with no reply.
 
-6. Optional, per project: add the lines from [Optional instructions snippet](#optional-instructions-snippet) to the project's `AGENTS.md` or `CLAUDE.md`. For Claude Code, [Optional: see each job as an agent](#optional-see-each-job-as-an-agent) too; a `CLAUDE.local.md` beside `CLAUDE.md` keeps them out of Git.
+6. Optional: install or refresh the usage dashboard skill, as in [The usage dashboard skill](#the-usage-dashboard-skill).
+
+7. Optional, per project: add the lines from [Optional instructions snippet](#optional-instructions-snippet) to the project's `AGENTS.md` or `CLAUDE.md`. For Claude Code, [Optional: see each job as an agent](#optional-see-each-job-as-an-agent) too; a `CLAUDE.local.md` beside `CLAUDE.md` keeps them out of Git.
 
 Nothing in `~/.agent-bridge` needs changing on an update. The database is brought up to date by the bridge itself.
 
@@ -801,6 +888,8 @@ Run the line for each host you registered it in. Then remove any worktrees you n
 | `owner_exited` | The host window that ran the job closed. For an edit job, check what it left, then run it again |
 | `interactive_fallback` | `agy` wanted an approval. Use Codex with `mode="edit"` and `worktree=True` |
 | `agy` jobs fail with `permission_error` on ordinary shell commands | `agy` is older than 1.5.7, or its `settings.json` pins a mode with `agentMode`. Update `agy`, or remove `agentMode`, so a headless run uses its default mode |
+| `/bridge-usage` or `$bridge-usage` says the bridge is out of date | The bridge that host runs has no `usage_dashboard` yet. Update it as in [Update an existing install](#update-an-existing-install), then reconnect it in that host |
+| The skill does not show up in a host | It is not in a folder that host reads, or the host started before it was copied. See [Install it](#install-it), then open a new chat |
 | A Codex worktree job says it could not commit (`index.lock`, access denied) | Codex's sandbox refused the write to Git's own folder. The edits are in the worktree: commit them yourself |
 
 ## How it works inside
@@ -825,7 +914,8 @@ The tests use stand-ins for the CLIs, a throwaway state folder, and spend no quo
 
 | File | What it holds |
 |---|---|
-| `server.py` | The eight MCP tools |
+| `server.py` | The nine MCP tools |
+| `dashboard.py` | The usage dashboard: its figures and its text view |
 | `jobs.py` | Requests, queueing, sessions, waiting and cancelling |
 | `runners.py` | The `agy` and `codex` command lines, worktrees, retries |
 | `claude_runner.py` | The `claude -p` command line and its output |
