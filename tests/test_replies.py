@@ -206,7 +206,8 @@ async def test_response_file_leaves_running_and_empty_replies_alone(tmp_path: Pa
             "job_ids": [running["job_id"], empty_job.job_id], "response_file": True,
         })
         live, empty = out["jobs"]
-        assert live["status"] == "running" and "response" not in live
+        # Under load the job may not have left the queue yet: either way it has not ended.
+        assert live["status"] in {"queued", "running"} and "response" not in live
         assert empty["response"] == "" and "empty reply" in empty["warning"]
         assert not any("response_file" in job for job in out["jobs"])
         assert not (manager.settings.state_dir / "replies").exists()
