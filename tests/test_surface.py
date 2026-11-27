@@ -174,7 +174,7 @@ async def test_host_wait_caps_jobs_and_leaves_the_job_running(tmp_path: Path, ho
             backends = _data(await client.call_tool("backends", {}))
             assert (backends["host"], backends["wait_cap"]) == ("test-host", 1)
             assert host_limit == {
-                "identify": ["test-client"], "lookup": ["test-host"], "cap": [(30, "test-host")],
+                "identify": ["test-client"], "lookup": ["test-host"], "cap": [(2, "test-host")],
             }
 
 
@@ -191,7 +191,7 @@ async def test_host_wait_caps_run_and_recommends_safe_next(tmp_path: Path, host_
         assert receipt["status"] == "running" and receipt["timeout_seconds"] == 44
         assert receipt["next"] == f"jobs(job_ids=['{receipt['job_id']}'], wait_seconds=1)"
         assert (await manager.get_async(receipt["job_id"])).status == "running"
-        assert host_limit["cap"] == [(30, "test-host")]
+        assert host_limit["cap"] == [(2, "test-host")]
     finally:
         await manager.shutdown()
 
@@ -206,6 +206,84 @@ async def test_a_capped_wait_that_saw_the_job_end_carries_no_wait_note(tmp_path:
         assert collected["all_done"] is True and "wait_note" not in collected
     finally:
         await manager.shutdown()
+
+
+async def test_wait_cap_and_notice_stay_fixed_across_config_changes_and_respect_max_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_bridge.hosts import Roots, get_host
+
+    roots = Roots.for_home(tmp_path / "home")
+    codex = get_host("codex")
+    event_loop_thread = threading.get_ident()
+    identify_calls: list[str | None] = []
+
+    def fake_identify(client_name: str | None):
+        assert threading.get_ident() != event_loop_thread
+        identify_calls.append(client_name)
+        return codex
+
+    monkeypatch.setattr(host_limits, "identify_host", fake_identify)
+    monkeypatch.setattr(host_limits.Roots, "from_env", classmethod(lambda cls, _env: roots))
+    host_limits.clear_limit_cache()
+
+    mcp, manager = _bridge(tmp_path)
+    running = JobRecord(
+        job_id="codex-00000001", owner_id=manager.owner_id, backend="codex", cwd=str(tmp_path),
+        mode="read_only", requested_model=None, model=None, prompt_preview="hold", status="running",
+        created_at=time.time() - 5, started_at=time.time() - 4,
+    )
+    seen: list[int] = []
+
+    async def observe_wait(_job_ids, *, wait_seconds, **_kwargs):
+        seen.append(wait_seconds)
+        return [running]
+
+    monkeypatch.setattr(manager, "wait_for", observe_wait)
+    try:
+        # Codex default 60 s -> cap 50. Call 1 under cap caches host details.
+        first = await _call(mcp, "jobs", {"job_ids": [running.job_id], "wait_seconds": 30})
+        assert "wait_note" not in first
+
+        # Config changes mid-process and host_limits' 60 s cache expires: server must keep its startup cap.
+        cfg_path = roots.codex_home / "config.toml"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text('[mcp_servers.agent-bridge]\ncommand = "fixture"\ntool_timeout_sec = 600\n', encoding="utf-8")
+        host_limits.clear_limit_cache()
+
+        second = await _call(mcp, "jobs", {"job_ids": [running.job_id], "wait_seconds": 400})
+        third = await _call(mcp, "jobs", {"job_ids": [running.job_id], "wait_seconds": 60})
+        fourth = await _call(mcp, "jobs", {"job_ids": [running.job_id], "wait_seconds": 50})
+
+        assert seen == [30, 50, 50, 50]
+        assert "50 s" in second.get("wait_note", "")
+        assert third.get("wait_note") == second["wait_note"]
+        assert "wait_note" not in fourth
+        assert len(identify_calls) == 1
+    finally:
+        await manager.shutdown()
+        host_limits.clear_limit_cache()
+
+    # A new server starting with tool_timeout_sec = 600 (cap 590) still clamps waits at MAX_WAIT_SECONDS (300).
+    server2_dir = tmp_path / "server2"
+    server2_dir.mkdir()
+    mcp2, manager2 = _bridge(server2_dir)
+    seen2: list[int] = []
+
+    async def observe_wait2(_job_ids, *, wait_seconds, **_kwargs):
+        seen2.append(wait_seconds)
+        return [running]
+
+    monkeypatch.setattr(manager2, "wait_for", observe_wait2)
+    try:
+        over = await _call(mcp2, "jobs", {"job_ids": [running.job_id], "wait_seconds": 400})
+        under = await _call(mcp2, "jobs", {"job_ids": [running.job_id], "wait_seconds": 200})
+        assert seen2 == [300, 200]
+        assert over.get("wait_note") == f"Wait capped at {server_mod.MAX_WAIT_SECONDS} s."
+        assert "wait_note" not in under
+    finally:
+        await manager2.shutdown()
+        host_limits.clear_limit_cache()
 
 
 async def test_run_returns_a_small_receipt_at_once_and_jobs_collects_the_reply(

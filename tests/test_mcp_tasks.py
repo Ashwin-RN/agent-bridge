@@ -159,6 +159,36 @@ async def test_task_receipt():
     assert bridge.extractions == [False]
 
 
+@pytest.mark.parametrize("status,wire_status,is_error", [
+    ("completed", "completed", False),
+    ("failed", "completed", True),
+    ("timed_out", "completed", True),
+    ("cancelled", "cancelled", True),
+])
+async def test_terminal_job_at_run_returns_complete_result_and_task_methods_still_work(status, wire_status, is_error):
+    bridge = ToyBridge(async_view=True)
+    line = f"{LINE_HEAD} · {status}"
+    bridge.jobs[JOB_ID] = replace(RUNNING, status=status, line=line, detail=DETAIL)
+    async with bridge.connect() as client:
+        result = await client.call_tool("run_job", allow_claimed=True)
+        assert isinstance(result, CallToolResult)
+        assert result.result_type == "complete"
+        assert result.is_error is is_error
+        assert result.structured_content == DETAIL
+        assert result.content[0].text == DETAIL_TEXT
+
+        got = await task_request(client, "tasks/get")
+        assert got["resultType"] == "complete"
+        assert got["status"] == wire_status
+        if wire_status == "completed":
+            assert got["result"]["structuredContent"] == DETAIL
+            assert got["result"]["isError"] is is_error
+
+        cancel_ack = await task_request(client, "tasks/cancel")
+        assert cancel_ack["resultType"] == "complete"
+    bridge.cancel.assert_not_awaited()
+
+
 @pytest.mark.parametrize("case", ["undeclared", "unselected", "legacy", "request", "session", "version"])
 async def test_plain_receipt(case):
     bridge = ToyBridge(selected=case != "unselected", skew=case)

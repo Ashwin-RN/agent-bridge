@@ -483,6 +483,40 @@ def test_reused_owner_pid_is_shown_as_window_closed(
     assert rc == 0 and err == "" and len(out.splitlines()) == 1
 
 
+def test_unreadable_owner_process_identity_keeps_live_job_running(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_bridge.storage import _is_owner_row_alive
+
+    pid = os.getpid()
+    store = _store(tmp_path)
+    store.register_owner("elevated", pid, process_identity="win:123456789")
+    _add(store, job_id="live", owner="elevated")
+
+    monkeypatch.setattr(nesting, "process_identity", lambda _pid: None)
+    assert _is_owner_row_alive(
+        pid, None, "win:123456789", is_pid_alive_fn=status_cmd._pid_alive, process_identity_fn=nesting.process_identity,
+    ) is True
+
+    rc, out, err = _run(capsys, tmp_path, "--json")
+    assert rc == 0 and err == ""
+    (job,) = json.loads(out)["active"]
+    assert job["display_status"] == "running"
+    assert job["window_closed"] is False
+
+    rc, out, err = _run(capsys, tmp_path, "--line")
+    assert rc == 0 and err == ""
+    assert out.startswith("bridge: codex · ")
+
+    # A readable identity that differs still marks the window closed.
+    monkeypatch.setattr(nesting, "process_identity", lambda _pid: "win:999999999")
+    rc, out, err = _run(capsys, tmp_path, "--json")
+    assert rc == 0 and err == ""
+    (job,) = json.loads(out)["active"]
+    assert job["display_status"] == "window closed"
+    assert job["window_closed"] is True
+
+
 @pytest.mark.parametrize("mode", ["--line", "--lines"])
 @pytest.mark.parametrize("all_jobs", [False, True], ids=["default", "all"])
 def test_line_modes_query_only_active_rows(

@@ -106,9 +106,13 @@ class Review(BaseModel):
     focus: str | None = None
 
 
-def _read_host_limits(client_name: str | None) -> tuple[Host | None, int | None]:
+def _read_host_limits(client_name: str | None) -> tuple[Host | None, int | None, str | None]:
     host = host_limits.identify_host(client_name)
-    return host, host_limits.wait_cap_seconds(host)
+    cap = host_limits.wait_cap_seconds(host)
+    if cap is None:
+        return host, None, None
+    capped, notice = host_limits.cap_wait(cap + 1, host)
+    return host, min(cap, capped), notice
 
 
 def _next_call(job_id: str, wait_cap: int | None, *, response_file: bool) -> str:
@@ -313,10 +317,9 @@ def create_server(
     job_manager = manager or JobManager(cfg)
     nest = nesting if nesting is not None else _detect_nesting(job_manager)
     job_manager.nesting = nest
-    host_lookup: asyncio.Task[tuple[Host | None, int | None]] | None = None
-    capped_wait: asyncio.Task[tuple[int, str | None]] | None = None
+    host_lookup: asyncio.Task[tuple[Host | None, int | None, str | None]] | None = None
 
-    async def _host_details(ctx: Context) -> tuple[Host | None, int | None]:
+    async def _host_details(ctx: Context) -> tuple[Host | None, int | None, str | None]:
         nonlocal host_lookup
         if host_lookup is None:
             try:
@@ -329,18 +332,15 @@ def create_server(
 
     async def _effective_wait(ctx: Context, wait_seconds: int) -> tuple[int, str | None]:
         """Apply the same wait bounds to run and jobs."""
-        nonlocal capped_wait
         if wait_seconds <= 0:
             return 0, None
-        host, cap = await _host_details(ctx)
-        if cap is not None and cap <= MAX_WAIT_SECONDS and wait_seconds > cap:
-            # A host's cap and its notice apply to any wait shortened by that cap.
-            if capped_wait is None:
-                capped_wait = asyncio.create_task(asyncio.to_thread(host_limits.cap_wait, wait_seconds, host))
-            return await asyncio.shield(capped_wait)
-        if wait_seconds > MAX_WAIT_SECONDS:
-            return MAX_WAIT_SECONDS, f"Wait capped at {MAX_WAIT_SECONDS} s."
-        return wait_seconds, None
+        _, cap, host_notice = await _host_details(ctx)
+        limit = MAX_WAIT_SECONDS if cap is None else min(cap, MAX_WAIT_SECONDS)
+        if wait_seconds <= limit:
+            return wait_seconds, None
+        if cap is not None and cap <= MAX_WAIT_SECONDS and host_notice:
+            return limit, host_notice
+        return limit, f"Wait capped at {limit} s."
 
     def _refuse_if_nested(tool: str) -> None:
         nest = job_manager.nesting
@@ -508,7 +508,7 @@ def create_server(
         # A host that shows the call as a task row collects the job through the task, never by waiting.
         as_task = TASK_CALL.get()
         wait, wait_note = (0, None) if as_task else await _effective_wait(ctx, wait_seconds)
-        _, cap = (None, None) if as_task else await _host_details(ctx)
+        _, cap, _ = (None, None, None) if as_task else await _host_details(ctx)
         stop = asyncio.Event()
         progress: list[asyncio.Task[None]] = []
 
@@ -746,7 +746,7 @@ def create_server(
                 **claude_health,
             }
 
-        neon_info, codex_info, claude_info, (host, cap) = await asyncio.gather(
+        neon_info, codex_info, claude_info, (host, cap, _) = await asyncio.gather(
             _probe_neon(), _probe_codex(), _probe_claude(), _host_details(ctx),
         )
         return {

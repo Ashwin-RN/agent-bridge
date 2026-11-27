@@ -46,6 +46,14 @@ def _utc_timestamp(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).isoformat().replace("+00:00", "Z")
 
 
+def _tool_result(view: JobView) -> dict[str, Any]:
+    return {
+        "content": [{"type": "text", "text": json.dumps(view.detail, ensure_ascii=False, separators=(",", ":"))}],
+        "structuredContent": view.detail,
+        "isError": view.status != "completed",
+    }
+
+
 def _task_fields(job_id: str, view: JobView) -> dict[str, Any]:
     if view.status in _ACTIVE:
         status = "working"
@@ -127,6 +135,10 @@ class JobTasks(Extension):
         view = await self._get_view(job_id)
         if view is None:
             return result
+        if view.status not in _ACTIVE:
+            if view.detail is not None:
+                return {"resultType": "complete", **_tool_result(view)}
+            return {"resultType": "task", **_task_fields(job_id, view), "status": "working"}
         return {"resultType": "task", **_task_fields(job_id, view)}
 
     async def _get_view(self, job_id: str) -> JobView | None:
@@ -142,11 +154,7 @@ class JobTasks(Extension):
         if response["status"] == "completed" or (
             view.status == "cancelled" and view.detail and view.detail.get("provider_state") == "possibly_running"
         ):
-            response["result"] = {
-                "content": [{"type": "text", "text": json.dumps(view.detail, ensure_ascii=False, separators=(",", ":"))}],
-                "structuredContent": view.detail,
-                "isError": view.status != "completed",
-            }
+            response["result"] = _tool_result(view)
         return response
 
     async def _tasks_cancel(self, ctx: ServerRequestContext, params: _TaskIdParams) -> dict[str, Any]:
