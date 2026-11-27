@@ -61,7 +61,7 @@ class BackendRegistry:
     def quota_pools(self) -> tuple[QuotaPoolSpec, ...]:
         specs: list[QuotaPoolSpec] = []
         for adapter in self._adapters.values():
-            specs.extend(adapter.quota_pools)
+            specs.extend(adapter.effective_quota_pools())
         specs.sort(key=lambda spec: spec.quota_display_order)
         return tuple(specs)
 

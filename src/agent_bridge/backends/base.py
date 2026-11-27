@@ -7,7 +7,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -150,6 +150,37 @@ class BackendAdapter(ABC):
 
     def quota_pool_for_alias(self, alias: str) -> str:
         return self.classify_quota_pool(self.alias_model_hints.get(alias.strip().lower()))
+
+    @property
+    def has_quota_readout(self) -> bool:
+        """Whether this adapter overrides `read_quota` to report live or cached quota readings."""
+        return type(self).read_quota is not BackendAdapter.read_quota
+
+    def effective_quota_pools(self) -> tuple[QuotaPoolSpec, ...]:
+        """Quota pools this backend draws on: declared specs, or a default pool named after the backend."""
+        no_readout = f"{self.name} has no quota read-out."
+        if not self.quota_pools:
+            return (
+                QuotaPoolSpec(
+                    pool=self.name,
+                    backend=self.name,
+                    label=self.name,
+                    dashboard_label=self.name,
+                    no_reading_reason=no_readout,
+                    quota_view_no_reading=no_readout,
+                    quota_display_order=100,
+                ),
+            )
+        if self.has_quota_readout:
+            return self.quota_pools
+        return tuple(
+            replace(
+                spec,
+                no_reading_reason=spec.no_reading_reason or no_readout,
+                quota_view_no_reading=spec.quota_view_no_reading or no_readout,
+            )
+            for spec in self.quota_pools
+        )
 
     # --- Defaults and request validation ---
 

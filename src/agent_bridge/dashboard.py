@@ -45,8 +45,6 @@ from agent_bridge.backends.claude import CLAUDE_NO_READING, CLAUDE_SHARED_NOTE
 from agent_bridge.backends.registry import get_adapter_optional, get_default_registry
 from agent_bridge.quota import build_quota_advisory
 
-BACKENDS: tuple[str, ...] = tuple(a.name for a in get_default_registry().dashboard_backends())
-QUOTA_POOLS: tuple[str, ...] = tuple(spec.pool for spec in get_default_registry().quota_pools())
 NAMED_PERIODS: tuple[str, ...] = ("today", "7d", "30d", "all", "session")
 TOKEN_FIELDS: tuple[str, ...] = (
     "input_tokens",
@@ -89,9 +87,28 @@ TOKEN_NOTE = (
     "cached_tokens can exceed total_tokens."
 )
 
-POOL_LABELS: dict[str, str] = {
-    spec.pool: spec.dashboard_label for spec in get_default_registry().quota_pools()
-}
+def _backends() -> tuple[str, ...]:
+    return tuple(a.name for a in get_default_registry().dashboard_backends())
+
+
+def _quota_pools() -> tuple[str, ...]:
+    return tuple(spec.pool for spec in get_default_registry().quota_pools())
+
+
+def _pool_labels() -> dict[str, str]:
+    return {spec.pool: spec.dashboard_label for spec in get_default_registry().quota_pools()}
+
+
+def __getattr__(name: str) -> Any:
+    if name == "BACKENDS":
+        return _backends()
+    if name == "QUOTA_POOLS":
+        return _quota_pools()
+    if name == "POOL_LABELS":
+        return _pool_labels()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 QUOTA_SOURCE = (
     "Read from each CLI, not from the bridge's records. Each pool carries the time it was read. The "
     "Claude plan has no live read-out: its reading is what the Claude jobs run through the bridge "
@@ -678,9 +695,10 @@ def _used_lines(d: dict[str, Any]) -> list[str]:
             return [name, _num(b["runs"]), _num(b["tokens"]["total_tokens"]), _duration(b["duration_seconds"])]
 
         models = d["by_model"]
+        pool_labels = _pool_labels()
         rows: list[list[str]] = []
         for pool, bucket in d["by_quota_pool"].items():
-            rows.append(cells(POOL_LABELS.get(pool, pool), bucket))
+            rows.append(cells(pool_labels.get(pool, pool), bucket))
             rows += [
                 cells("  " + key.split(":", 1)[-1], b) for key, b in models.items() if b.get("quota_pool") == pool
             ]

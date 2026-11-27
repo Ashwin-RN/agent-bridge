@@ -9,12 +9,14 @@ from typing import Any
 
 import pytest
 
+from agent_bridge import dashboard as dashboard_module
 from agent_bridge.backends import (
     BackendAdapter,
     BackendDefaults,
     Capabilities,
     CommandSpec,
     ParsedStream,
+    QuotaPoolSpec,
     register_adapter,
     unregister_adapter,
 )
@@ -206,6 +208,83 @@ async def test_fourth_backend_runs_end_to_end_via_registry(tmp_path: Path) -> No
             assert "echo has no fast tier." in fast_res["warning"]
             with pytest.raises(Exception, match="worktree=True is only supported"):
                 await mcp.call_tool("run", {"backend": "echo", "prompt": "wt", "mode": "edit", "worktree": True})
+        finally:
+            await manager.shutdown()
+    finally:
+        unregister_adapter(adapter.name)
+
+
+async def test_fourth_backend_without_declared_pool_in_quota_view(tmp_path: Path) -> None:
+    script = tmp_path / "fake_echo.py"
+    script.write_text(FAKE_ECHO_CLI.strip() + "\n", encoding="utf-8")
+    adapter = EchoAdapter(script)
+    register_adapter(adapter)
+    try:
+        mcp, manager = create_server(settings=_settings(tmp_path), nesting=NOT_NESTED)
+        try:
+            out = _data(await mcp.call_tool("usage", {"period": "all", "quota": True}))
+            quota = out["quota"]
+            pools = quota["pools"]
+            assert [p["pool"] for p in pools] == ["codex", "agy_gemini", "agy_claude_gpt", "claude", "echo"]
+            echo_pool = pools[-1]
+            assert echo_pool["backend"] == "echo"
+            assert echo_pool["priority"] == "unknown"
+            assert echo_pool["note"] == "echo has no quota read-out."
+            assert "echo" not in quota["summary"]
+        finally:
+            await manager.shutdown()
+    finally:
+        unregister_adapter(adapter.name)
+
+
+class LabeledEchoAdapter(EchoAdapter):
+    """Fourth backend that declares a named quota pool with a distinct dashboard label."""
+
+    name = "echo_labeled"
+    cli_name = "echo-labeled-cli"
+    aliases = ()
+    quota_pools = (
+        QuotaPoolSpec(
+            pool="echo_pool",
+            backend="echo_labeled",
+            label="Echo Labeled",
+            dashboard_label="Echo Plan",
+        ),
+    )
+
+
+async def test_fourth_backend_with_declared_pool_in_dashboard_text(tmp_path: Path) -> None:
+    script = tmp_path / "fake_echo.py"
+    script.write_text(FAKE_ECHO_CLI.strip() + "\n", encoding="utf-8")
+    adapter = LabeledEchoAdapter(script)
+    register_adapter(adapter)
+    try:
+        assert "echo_labeled" in dashboard_module.BACKENDS
+        assert "echo_pool" in dashboard_module.QUOTA_POOLS
+        assert dashboard_module.POOL_LABELS["echo_pool"] == "Echo Plan"
+
+        mcp, manager = create_server(settings=_settings(tmp_path), nesting=NOT_NESTED)
+        try:
+            done = _data(await mcp.call_tool("run", {"backend": "echo_labeled", "prompt": "hi", "wait_seconds": 30}))
+            assert done["status"] == "completed"
+            assert done["quota_pool"] == "echo_pool"
+
+            out = _data(await mcp.call_tool("usage", {"period": "all", "view": "dashboard", "verbose": True}))
+            text = out["text"]
+            lines = text.splitlines()
+            quota_start = next(i for i, line in enumerate(lines) if line.startswith("QUOTA LEFT"))
+            used_start = next(i for i, line in enumerate(lines) if line.startswith("USED THROUGH THE BRIDGE"))
+            caveats_start = next(i for i, line in enumerate(lines) if line.startswith("NOT IN THE TOTALS"))
+            quota_lines = lines[quota_start:used_start]
+            used_lines = lines[used_start:caveats_start]
+
+            quota_row = next(line for line in quota_lines if line.startswith("  Echo Plan"))
+            assert "no reading: echo_labeled has no quota read-out." in quota_row
+
+            used_row = next((line for line in used_lines if line.startswith("  Echo Plan")), None)
+            assert used_row is not None, f"Expected 'Echo Plan' row in used section, got:\n" + "\n".join(used_lines)
+            assert "1" in used_row and "18" in used_row
+            assert not any(line.startswith("  echo_pool") for line in used_lines)
         finally:
             await manager.shutdown()
     finally:
