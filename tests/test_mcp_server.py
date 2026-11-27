@@ -1,4 +1,4 @@
-"""End-to-end stdio MCP protocol test (verifies JSON-RPC stdio framing, 9 tools, and default env timeout)."""
+"""End-to-end stdio MCP protocol test (verifies JSON-RPC stdio framing, the five tools, and default env timeout)."""
 
 from __future__ import annotations
 
@@ -50,57 +50,40 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(
 
             tools_result = await session.list_tools()
             tool_names = {t.name for t in tools_result.tools}
-            assert tool_names == {
-                "run_agent",
-                "start_agent",
-                "run_parallel",
-                "check_jobs",
-                "cancel_job",
-                "review_code",
-                "get_usage",
-                "usage_dashboard",
-                "list_backends",
-            }
+            assert tool_names == {"run", "jobs", "cancel", "usage", "backends"}
             # `codex exec` refuses a tool that is not marked read-only unless approvals are switched off.
-            dashboard_tool = next(t for t in tools_result.tools if t.name == "usage_dashboard")
-            assert dashboard_tool.annotations is not None
-            assert dashboard_tool.annotations.read_only_hint is True
-            # It asks each CLI for its quota, as get_usage does, and is marked the same way.
-            usage_tool = next(t for t in tools_result.tools if t.name == "get_usage")
-            assert dashboard_tool.annotations.open_world_hint is True
-            assert usage_tool.annotations is not None
-            assert (usage_tool.annotations.read_only_hint, usage_tool.annotations.open_world_hint) == (True, True)
+            # `usage` asks each CLI for its quota, so it is open-world as well.
+            tools = {t.name: t.annotations for t in tools_result.tools}
+            assert (tools["usage"].read_only_hint, tools["usage"].open_world_hint) == (True, True)
+            assert (tools["jobs"].read_only_hint, tools["backends"].read_only_hint) == (True, True)
+            assert (tools["run"].read_only_hint, tools["cancel"].read_only_hint) == (False, False)
 
-            dash_res = await session.call_tool("usage_dashboard", {"period": "session"})
+            dash_res = await session.call_tool("usage", {"period": "session", "view": "dashboard", "quota": True})
             assert not dash_res.is_error
-            # The whole view, figures included, reaches a host that reads only the text content as JSON,
-            # and a host that reads only the structured part as the same object.
+            # The view reaches a host that reads only the text content as JSON, and a host that reads only
+            # the structured part as the same object.
             dash_payload = json.loads(dash_res.content[0].text)
             assert dash_res.structured_content == dash_payload
             assert dash_payload["text"].startswith("agent-bridge usage, session")
-            assert dash_payload["totals"]["runs"] == 0
             # The quota bars are not ASCII, and reach the host whole.
-            claude_pool = dash_payload["quota"]["pools"][-1]
-            assert (claude_pool["pool"], claude_pool["five_hour"]["remaining_percent"]) == ("claude", 75.0)
             assert "  Claude plan             " + "\u2588" * 8 + "\u2591" * 2 + "  75%" in dash_payload["text"]
+            claude_pool = dash_payload["quota"]["pools"][-1]
+            assert (claude_pool["pool"], claude_pool["five_hour"]["left_percent"]) == ("claude", 75)
 
-            usage_res = await session.call_tool(
-                "get_usage",
-                {"period": "session", "compact": True},
-            )
+            usage_res = await session.call_tool("usage", {"period": "session"})
             assert not usage_res.is_error
             payload = json.loads(usage_res.content[0].text)
             assert payload["scope"]["period"] == "session"
-            assert payload["overview"]["runs"] == 0
-            assert payload["overview"]["in_flight"] == 0
+            assert payload["totals"] == {"runs": 0, "duration_seconds": 0.0, "total_tokens": 0}
+            assert "quota" not in payload
 
-            jobs_res = await session.call_tool("check_jobs", {})
+            jobs_res = await session.call_tool("jobs", {})
             assert not jobs_res.is_error
             jobs_payload = json.loads(jobs_res.content[0].text)
             assert jobs_payload["count"] == 0
 
-            # Verify list_backends honors AGENT_BRIDGE_DEFAULT_TIMEOUT & reports invalid bins honestly!
-            lb_res = await session.call_tool("list_backends", {})
+            # `backends` honours AGENT_BRIDGE_DEFAULT_TIMEOUT and reports invalid bins honestly.
+            lb_res = await session.call_tool("backends", {})
             assert not lb_res.is_error
             lb_payload = json.loads(lb_res.content[0].text)
             assert lb_payload["default_timeout_seconds"] == 185
@@ -119,17 +102,17 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(
             assert lb_payload["nesting"] == {"nested": False}
 
             # The host is not assumed to be any one CLI, and every backend is offered to it.
-            assert "whichever CLI you are yourself" in init.instructions
+            assert "whichever CLI you are" in init.instructions
             assert "your Claude Code subscription" not in init.instructions
             for backend_name in ("`codex`", "`neon`", "`claude`"):
                 assert backend_name in init.instructions
 
             # A refusal reaches the host with its reason, not as a bare "Error executing tool".
-            bad = await session.call_tool("run_agent", {"backend": "bogus", "prompt": "x"})
+            bad = await session.call_tool("run", {"backend": "bogus", "prompt": "x"})
             assert bad.is_error
             assert "Unknown backend 'bogus'" in bad.content[0].text
             wt = await session.call_tool(
-                "run_agent",
+                "run",
                 {"backend": "neon", "prompt": "x", "mode": "edit", "worktree": True},
             )
             assert wt.is_error

@@ -24,7 +24,6 @@ from agent_bridge.config import (
     Settings,
     classify_quota_pool,
     normalize_backend,
-    normalize_quota_pool,
     split_claude_model_and_effort,
 )
 from agent_bridge.jobs import JobManager
@@ -211,7 +210,6 @@ def test_claude_backend_names_and_pool_do_not_collide_with_agy_claude_models() -
     assert normalize_backend("claude") == "claude"
     assert normalize_backend("claude-code") == "claude"
     assert normalize_backend("agy-claude") == "neon"
-    assert normalize_quota_pool("claude") == "claude"
 
     for model in ("sonnet", "opus", "haiku", "fable", "claude-opus-5-5", None):
         assert classify_quota_pool("claude", model) == "claude"
@@ -542,15 +540,14 @@ async def test_claude_cli_too_old_for_the_flags_the_bridge_passes_is_reported_un
 async def test_claude_quota_is_what_the_last_job_reported(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
 
-    before = await manager.get_usage_summary(period="session", quota_pool="claude", include_quota=True)
-    assert set(before["quota"]) == {"claude"}
-    assert before["quota"]["claude"]["status"] == "unknown"
-    assert "no command that prints the plan limits" in before["quota"]["claude"]["note"]
+    before = await manager.get_quota(["claude"])
+    assert set(before) == {"claude"}
+    assert before["claude"]["status"] == "unknown"
+    assert "no command that prints the plan limits" in before["claude"]["note"]
 
     await manager.run(manager.prepare_request(backend="claude", prompt="quota"))
 
-    after = await manager.get_usage_summary(period="session", quota_pool="claude", include_quota=True)
-    reading = after["quota"]["claude"]
+    reading = (await manager.get_quota(["claude"]))["claude"]
     assert reading["status"] == "ok"
     assert reading["source"] == "last_claude_job"
     weekly = next(w for w in reading["windows"] if w["window_kind"] == "weekly")
@@ -558,9 +555,12 @@ async def test_claude_quota_is_what_the_last_job_reported(tmp_path: Path) -> Non
     assert weekly["remaining_percent"] == 14.0
     assert weekly["resets_in_seconds"] > 0
 
-    pool = next(p for p in after["quota_advisory"]["pools"] if p["pool"] == "claude")
+    # The host reads it through `usage(quota=True)`, in the one quota shape.
+    mcp, _ = create_server(settings=manager.settings, manager=manager)
+    view = _tool_data(await mcp.call_tool("usage", {"period": "session", "quota": True}))["quota"]
+    pool = next(p for p in view["pools"] if p["pool"] == "claude")
     assert pool["backend"] == "claude"
-    assert pool["weekly"]["remaining_percent"] == 14.0
+    assert pool["weekly"]["left_percent"] == 14
     assert pool["priority"] == "conserve"
     await manager.shutdown()
 
@@ -847,11 +847,11 @@ async def test_claude_subagent_token_scope(tmp_path: Path, resumed: bool) -> Non
         await manager.shutdown()
 
 
-async def test_list_backends_and_review_code_know_the_claude_backend(tmp_path: Path) -> None:
+async def test_backends_and_a_review_run_know_the_claude_backend(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     mcp, _ = create_server(settings=manager.settings, manager=manager)
 
-    backends = _tool_data(await mcp.call_tool("list_backends", {}))
+    backends = _tool_data(await mcp.call_tool("backends", {}))
     claude = backends["backends"]["claude"]
     assert claude["healthy"] is True and "9.9.9" in claude["version"]
     assert claude["quota_pool"] == "claude"
@@ -861,14 +861,14 @@ async def test_list_backends_and_review_code_know_the_claude_backend(tmp_path: P
     assert backends["backends"]["codex"]["command_found"] is False
     assert backends["backends"]["neon"]["command_found"] is False
 
-    review = _tool_data(
+    result = _tool_data(
         await mcp.call_tool(
-            "review_code",
-            {"backends": ["claude"], "cwd": str(tmp_path), "claude_model": "haiku", "focus": "bugs only"},
+            "run",
+            {"backend": "claude", "cwd": str(tmp_path), "model": "haiku", "review": {"focus": "bugs only"},
+             "wait_seconds": 60},
         )
     )
-    assert [r["backend"] for r in review["reviews"]] == ["claude"]
-    result = review["reviews"][0]
+    assert result["backend"] == "claude"
     assert result["status"] == "completed"
     seen = json.loads(result["response"])
     assert _value_after(seen["argv"], "--model") == "haiku"

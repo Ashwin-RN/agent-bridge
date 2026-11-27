@@ -11,6 +11,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -22,8 +23,6 @@ from agent_bridge.config import (
     normalize_backend,
     normalize_effort,
     normalize_mode,
-    normalize_quota_pool,
-    read_codex_local_defaults,
     resolve_backend_and_model_hint,
 )
 from agent_bridge.claude_runner import ClaudeRunner
@@ -38,7 +37,6 @@ from agent_bridge.process_control import (
 )
 from agent_bridge.quota import (
     CLAUDE_QUOTA_NOTE,
-    build_quota_advisory,
     claude_quota_from_rate_limit,
     enrich_quota_reading,
     fetch_codex_quota,
@@ -55,7 +53,6 @@ WORKTREE_BACKENDS: frozenset[str] = frozenset({"codex", "claude"})
 from agent_bridge.storage import (
     BridgeStore,
     SessionHeldError,
-    UsagePeriod,
     is_sqlite_lock_error,
     session_held_error_text,
     session_held_guidance,
@@ -82,17 +79,8 @@ class SessionResumeBlockedError(RuntimeError):
         super().__init__(
             f"Automatic resume blocked on session {session_id!r}: prior turn {prior_job_id!r} "
             f"ended with provider_state={prior_provider_state!r}. Confirm that exact turn has ended "
-            f"(and inspect git diff/worktree for edits), then retry with confirm_prior_job_id={prior_job_id!r} "
-            "(or confirm_prior_stopped=True)."
+            f"(and inspect git diff/worktree for edits), then retry with confirm_prior_job_id={prior_job_id!r}."
         )
-
-
-class BatchStartError(RuntimeError):
-    """Raised when a batch could not start all of its jobs. The jobs it had started are cancelled."""
-
-    def __init__(self, message: str, *, job_ids: list[str]) -> None:
-        self.job_ids = job_ids
-        super().__init__(message)
 
 
 class WorktreeMissingError(RuntimeError):
@@ -358,7 +346,6 @@ class JobManager:
         review_scope: Literal["uncommitted", "base", "commit"] | None = None,
         review_base: str | None = None,
         review_commit: str | None = None,
-        confirm_prior_stopped: bool = False,
         confirm_prior_job_id: str | None = None,
         allow_cross_pool_fallback: bool = False,
     ) -> RunRequest:
@@ -544,16 +531,10 @@ class JobManager:
                     f"({requested_model})."
                 )
 
-        # Bind confirmation to a specific prior turn so a pre-confirmed or stale boolean cannot bypass a newer uncertain turn!
-        bound_confirm_job_id: str | None = None
-        if confirm_prior_job_id and confirm_prior_job_id.strip():
-            bound_confirm_job_id = confirm_prior_job_id.strip()
-        elif confirm_prior_stopped and resolved_session_id:
-            active_block = self.store.get_session_safety_block(resolved_backend, resolved_session_id)
-            if active_block is not None:
-                bound_confirm_job_id = active_block["blocking_job_id"]
-            elif resume_from_job_id is not None:
-                bound_confirm_job_id = resume_from_job_id
+        # A confirmation names the one prior turn it vouches for, so it cannot pass a newer uncertain turn.
+        bound_confirm_job_id = (
+            confirm_prior_job_id.strip() if confirm_prior_job_id and confirm_prior_job_id.strip() else None
+        )
 
         return RunRequest(
             backend=resolved_backend,
@@ -577,7 +558,6 @@ class JobManager:
             review_scope=review_scope,
             review_base=review_base,
             review_commit=review_commit,
-            confirm_prior_stopped=bool(confirm_prior_stopped or bound_confirm_job_id),
             confirm_prior_job_id=bound_confirm_job_id,
             allow_cross_pool_fallback=bool(allow_cross_pool_fallback),
             prior_quota_pool=prior_quota_pool,
@@ -1504,7 +1484,7 @@ class JobManager:
             record.retry_guidance = (
                 f"Prior turn {exc.prior_job_id!r} ended with provider_state={exc.prior_provider_state!r}. "
                 "Confirm that exact prior turn has stopped (and inspect git status/diff for edits), "
-                f"then retry with confirm_prior_job_id={exc.prior_job_id!r} (or confirm_prior_stopped=True)."
+                f"then retry with confirm_prior_job_id={exc.prior_job_id!r}."
             )
             record.finished_at = time.time()
             record.duration_seconds = 0.0
@@ -1612,7 +1592,7 @@ class JobManager:
             record.provider_state = "stopped" if stopped else "possibly_running"
             record.error = f"{type(exc).__name__}: {exc}"
             record.retry_guidance = (
-                "Check CLI installation with list_backends and inspect error."
+                "Check CLI installation with backends and inspect error."
                 if stopped
                 else "Subprocess cleanup could not be verified after an internal error; inspect running "
                 "processes and repository state before retrying."
@@ -1789,19 +1769,23 @@ class JobManager:
         request: RunRequest,
         *,
         wait_seconds: int | None = None,
+        on_started: Callable[[JobRecord], None] | None = None,
     ) -> JobRecord:
         """Run a job and wait for completion (or up to `wait_seconds`).
 
         If the MCP caller cancels this synchronous wait, the underlying job is cancelled, and the cancel
         runs to its end in a task the manager owns (see `_cancel_jobs_owned`).
         If `wait_seconds` expires before the job's own deadline, the job stays active and the live
-        `JobRecord` (with `job_id`) is returned so the caller can poll via `check_jobs`.
+        `JobRecord` (with `job_id`) is returned so the caller can collect it with `jobs`.
+        `on_started` is called with the job's record once it has started, before any wait.
         """
         record = await self.start_async(request)
         ev = self._events.get(record.job_id)
         # Until the caller holds the job's record, the job has no receipt: a cancel anywhere up to then,
         # the last lookup included, cancels the job.
         try:
+            if on_started is not None:
+                on_started(record)
             if ev is not None:
                 if wait_seconds is None:
                     await ev.wait()
@@ -1822,71 +1806,18 @@ class JobManager:
                 await self._cancel_jobs_owned([record.job_id])
             raise
 
-    async def cancel_without_receipt(self, job_ids: list[str]) -> None:
-        """Cancel jobs whose caller was cancelled before it got their ids; the cancel runs to its end."""
-        await self._cancel_jobs_owned(job_ids)
-
-    async def run_parallel(
-        self,
-        requests: list[RunRequest],
-        *,
-        wait: bool = True,
-        wait_seconds: int | None = None,
-    ) -> list[JobRecord]:
-        # The whole submission is under one handler: if starting job k fails, or the caller is cancelled
-        # meanwhile, the jobs already started are cancelled, so no job is left running without a receipt.
-        records: list[JobRecord] = []
-        try:
-            for req in requests:
-                records.append(await self.start_async(req))
-        except asyncio.CancelledError:
-            if records:
-                started = [r.job_id for r in records]
-                # A cancelled MCP request is never answered, so the log is the only place these ids can go.
-                logger.warning(
-                    "A batch was cancelled while its jobs were being started; cancelling the %d already "
-                    "started: %s",
-                    len(started),
-                    ", ".join(started),
-                )
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._cancel_jobs_owned(started)
-            raise
-        except Exception as exc:
-            if not records:
-                raise
-            started = [r.job_id for r in records]
-            outcomes = await self._cancel_jobs_owned(started)
-            described = ", ".join(
-                f"{jid} ({out.status})" if isinstance(out, JobRecord) else f"{jid} (cancel failed: {out!r})"
-                for jid, out in zip(started, outcomes)
-            )
-            message = (
-                f"Starting task {len(records) + 1} of {len(requests)} failed ({type(exc).__name__}: {exc}). "
-                f"The {len(started)} job(s) this batch had already started were cancelled: {described}."
-            )
-            logger.warning("%s", message)
-            raise BatchStartError(message, job_ids=started) from exc
-        if not wait:
-            return records
-        job_ids = [r.job_id for r in records]
-        effective_wait = (
-            wait_seconds
-            if wait_seconds is not None
-            else max((r.timeout_seconds for r in requests), default=self.settings.default_timeout_seconds)
-        )
-        try:
-            return await self.wait_for(job_ids, wait_seconds=effective_wait, wait_mode="all")
-        except asyncio.CancelledError:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._cancel_jobs_owned(job_ids)
-            raise
-
-    def peek(self, job_id: str) -> JobRecord | None:
-        """Read a local live record or the stored row without running recovery."""
+    def peek_local(self, job_id: str) -> JobRecord | None:
+        """This window's own copy of a job it runs or has not yet stored, from memory; never the database."""
         local = self._terminal_uncommitted.get(job_id) or self._local_jobs.get(job_id)
         if local is not None and local.owner_id == self.owner_id:
             return self._visible_record(local)
+        return None
+
+    def peek(self, job_id: str) -> JobRecord | None:
+        """Read a local live record or the stored row without running recovery."""
+        local = self.peek_local(job_id)
+        if local is not None:
+            return local
         return self.store.peek_job(job_id)
 
     def get(self, job_id: str) -> JobRecord:
@@ -2246,22 +2177,23 @@ class JobManager:
         ]
         return [r.to_summary() for r in merged]
 
-    async def session_compact_summary_async(self) -> dict[str, Any]:
-        return await self._db(self.store.session_compact_summary, self.owner_id)
-
     async def get_usage_summary(
         self,
         *,
-        period: UsagePeriod = "today",
+        period: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
         backend: str | None = None,
-        quota_pool: str | None = None,
         cwd: str | None = None,
         parent_run: str | None = None,
-        include_quota: bool = False,
-        refresh_quota: bool = False,
-        compact: bool = False,
-        recent_limit: int = 10,
     ) -> dict[str, Any]:
+        """What the bridge ran in a period, from its usage records, as `usage` summarises it.
+
+        `period`, or `since` / `until`, mean what they mean for the dashboard. Jobs left running by a
+        window that has closed are marked first, so that they are not counted as in flight.
+        """
+        now_ts = time.time()
+        window = resolve_window(period, since, until, now_ts=now_ts)
         try:
             await self._db(
                 self.store.recover_dead_owner_jobs,
@@ -2272,37 +2204,27 @@ class JobManager:
         except Exception:
             pass
         norm_backend = normalize_backend(backend) if backend and backend.strip() else None
-        norm_pool = normalize_quota_pool(quota_pool)
         norm_cwd = str(Path(cwd).expanduser().resolve()) if cwd and cwd.strip() else None
         norm_parent = parent_run.strip() if parent_run and parent_run.strip() else None
 
         summary = await self._db(
             self.store.summarize_usage,
-            period=period,
+            period="session" if window.only_session else "all",
+            since_ts=window.since_ts,
+            until_ts=window.until_ts,
             owner_id=self.owner_id,
             backend=norm_backend,
-            quota_pool=norm_pool,
             cwd=norm_cwd,
             parent_run=norm_parent,
-            recent_limit=recent_limit,
-            compact=compact,
         )
-
-        if include_quota:
-            if norm_backend:
-                targets = [norm_backend]
-            elif norm_pool == "codex":
-                targets = ["codex"]
-            elif norm_pool == "claude":
-                targets = ["claude"]
-            elif norm_pool in {"agy_gemini", "agy_claude_gpt"}:
-                targets = ["neon"]
-            else:
-                targets = list(ALL_BACKENDS)
-            quota = await self.get_quota(targets, refresh=refresh_quota)
-            summary["quota"] = quota
-            summary["quota_advisory"] = self._build_quota_advisory(quota)
-
+        scope: dict[str, Any] = {"period": window.name}
+        for key, ts in (("from", window.since_ts), ("until", window.until_ts)):
+            if ts is not None:
+                scope[key] = datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+        for key, value in (("backend", norm_backend), ("cwd", norm_cwd), ("parent_run", norm_parent)):
+            if value:
+                scope[key] = value
+        summary["scope"] = scope
         return summary
 
     async def usage_dashboard(
@@ -2311,12 +2233,14 @@ class JobManager:
         period: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        readings_out: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """What is left of each subscription, then what the bridge has run in a period; see `dashboard.py`.
 
         It writes nothing. A job left running by a window that has closed is not recovered here, as
-        `get_usage` would: the dashboard lists it under "cannot tell" instead. The quota readings are a
-        recent cached one where there is one, and otherwise read from each CLI and not stored.
+        the summary view of `usage` does: the dashboard lists it under "cannot tell" instead. The quota
+        readings are a recent cached one where there is one, and otherwise read from each CLI and not
+        stored. `readings_out`, when given, receives those readings.
         """
         now_ts = time.time()
         window = resolve_window(period, since, until, now_ts=now_ts)
@@ -2349,27 +2273,9 @@ class JobManager:
                 raise result
             else:
                 readings.update(result)
+        if readings_out is not None:
+            readings_out.update(readings)
         return build_dashboard(records, window=window, owner_id=self.owner_id, now_ts=now_ts, quota=readings)
-
-    def _build_quota_advisory(self, quota: dict[str, Any]) -> dict[str, Any]:
-        local_defaults = read_codex_local_defaults()
-        eff_codex_model = (
-            self.codex_runner._effective_model(None, local_defaults=local_defaults)
-            or local_defaults.get("model")
-            or "codex-default"
-        )
-        eff_codex_effort = (
-            self.codex_runner._effective_effort(None)
-            or local_defaults.get("model_reasoning_effort")
-            or "default"
-        )
-        claude_model, claude_effort = self.claude_runner.effective_model_and_effort(None, None)
-        return build_quota_advisory(
-            quota,
-            neon_pool_models=self.neon_runner.catalog.group_models_by_quota_pool(),
-            codex_default_label=f"{eff_codex_model} (effort={eff_codex_effort})",
-            claude_default_label=f"{claude_model or 'claude-default'} (effort={claude_effort or 'default'})",
-        )
 
     async def _remember_claude_rate_limit(self, provider_metrics: dict[str, Any] | None) -> None:
         """Keep the plan limits a Claude job reported, as the only quota reading there is for that pool."""
@@ -2387,7 +2293,6 @@ class JobManager:
         self,
         backends: list[str],
         *,
-        refresh: bool = False,
         store: bool = True,
     ) -> dict[str, Any]:
         """Each backend's quota reading. `store=False` keeps a fresh reading out of the cache."""
@@ -2409,14 +2314,13 @@ class JobManager:
                     }
                 return bname, enrich_quota_reading(last)
 
-            if not refresh:
-                cached = await self._db(
-                    self.store.get_cached_quota,
-                    bname,
-                    self.settings.quota_cache_ttl_seconds,
-                )
-                if cached is not None and not has_passed_reset(cached):
-                    return bname, enrich_quota_reading(cached)
+            cached = await self._db(
+                self.store.get_cached_quota,
+                bname,
+                self.settings.quota_cache_ttl_seconds,
+            )
+            if cached is not None and not has_passed_reset(cached):
+                return bname, enrich_quota_reading(cached)
 
             if bname == "codex":
                 try:
