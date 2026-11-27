@@ -927,3 +927,7 @@ The tests use stand-ins for the CLIs, a throwaway state folder, and spend no quo
 | `quota.py`, `usage.py` | Quota readings, advice and token counts |
 | `storage.py` | The SQLite database |
 | `config.py` | Environment variables and name aliases |
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -3,6 +3,8 @@ name = "agent-bridge"
 version = "0.1.0"
 description = "Lightweight local stdio MCP server that lets any AI coding CLI (Claude Code, Codex, Antigravity) run the others as subagents over existing CLI subscriptions."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=2.0.0",
