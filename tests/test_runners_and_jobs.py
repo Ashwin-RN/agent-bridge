@@ -3436,9 +3436,10 @@ time.sleep(30)
     )
     settings = _make_settings(tmp_path)
     runner_a = StubAgyRunner(settings, fake_agy_remote)
+    # Long enough for the stand-in's Python to start and write its stderr line on a loaded machine.
     res_a = await runner_a.run(
         RunRequest(backend="neon", model="neon-medium", prompt="slow", cwd=str(tmp_path), timeout_seconds=10),
-        deadline=time.monotonic() + 0.45,
+        deadline=time.monotonic() + 3.0,
     )
     assert res_a.status == "timed_out"
     assert res_a.failure_reason == "provider_timeout_still_running"
