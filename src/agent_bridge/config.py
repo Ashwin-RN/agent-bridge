@@ -201,6 +201,19 @@ def split_claude_model_and_effort(model: str | None) -> tuple[str | None, Effort
     return raw, None
 
 
+STATE_DB_FILENAME = "bridge.db"
+
+
+def state_dir_from_env() -> Path:
+    """The bridge's state folder: `AGENT_BRIDGE_STATE_DIR` if set, else `~/.agent-bridge`.
+
+    The one rule for every reader of the state folder (the server and `agent-bridge status`).
+    It reads no other variable and never raises on a value it does not recognise.
+    """
+    raw = os.environ.get("AGENT_BRIDGE_STATE_DIR", "").strip()
+    return Path(raw).expanduser() if raw else Path.home() / ".agent-bridge"
+
+
 def clamp_timeout(timeout_seconds: int | None, default: int) -> int:
     value = default if timeout_seconds is None else int(timeout_seconds)
     return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, value))
@@ -301,12 +314,7 @@ class Settings:
         models_ttl = float(os.environ.get("AGENT_BRIDGE_MODELS_TTL_SECONDS", "900"))
         quota_ttl = float(os.environ.get("AGENT_BRIDGE_QUOTA_TTL_SECONDS", "120"))
         owner_stale = float(os.environ.get("AGENT_BRIDGE_OWNER_STALE_SECONDS", "30"))
-        state_dir_raw = os.environ.get("AGENT_BRIDGE_STATE_DIR", "").strip()
-        state_dir = (
-            Path(state_dir_raw).expanduser()
-            if state_dir_raw
-            else Path.home() / ".agent-bridge"
-        )
+        state_dir = state_dir_from_env()
         agy_bin = os.environ.get("AGENT_BRIDGE_AGY_BIN", "").strip() or None
         codex_bin = os.environ.get("AGENT_BRIDGE_CODEX_BIN", "").strip() or None
         claude_bin = os.environ.get("AGENT_BRIDGE_CLAUDE_BIN", "").strip() or None
