@@ -137,6 +137,7 @@ async def test_batch_cancelled_while_starting_its_jobs_cancels_the_ones_already_
     manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _holding_codex(tmp_path)))
     real_insert = manager.store.insert_job
     second_insert_entered = threading.Event()
+    second_insert_done = threading.Event()
     release = threading.Event()
     inserts = 0
 
@@ -146,6 +147,9 @@ async def test_batch_cancelled_while_starting_its_jobs_cancels_the_ones_already_
         if inserts == 2:
             second_insert_entered.set()
             release.wait(20)
+            real_insert(record)
+            second_insert_done.set()
+            return
         real_insert(record)
 
     monkeypatch.setattr(manager.store, "insert_job", insert_job)
@@ -162,6 +166,17 @@ async def test_batch_cancelled_while_starting_its_jobs_cancels_the_ones_already_
         first = _row_for_prompt(manager, "one")
         assert first.status == "cancelled"
         assert not is_pid_alive(int((tmp_path / "pid-one").read_text()))
+        # The second job's row lands only now, after the cancel: it must not stay behind as a queued
+        # orphan, and its CLI must never start.
+        release.set()
+        async with asyncio.timeout(15):
+            while not second_insert_done.is_set():
+                await asyncio.sleep(0.02)
+            while any(r.prompt_preview == "two" for r in manager.store.list_jobs(limit=50)):
+                await asyncio.sleep(0.05)
+        await asyncio.sleep(0.5)
+        assert not (tmp_path / "pid-two").exists()
+        assert [r.prompt_preview for r in manager.store.list_jobs(limit=50)] == ["one"]
     finally:
         release.set()
         await manager.shutdown()
@@ -536,40 +551,58 @@ async def test_a_second_cancel_from_shutdown_does_not_cut_the_first_cancel_short
     }
 
 
-class _AgyRunnerEndingAsTheCancelComes(NeonRunner):
-    """Plays a runner whose CLI had ended with agy's remote in-progress signal as the cancel came."""
+class _AgyRunnerEndingAsTheCancelComes(StubAgyRunner):
+    """The real agy runner, its stream read and its process gone, held at the moment it returns, so that
+    the cancel lands just as its result comes back."""
 
-    def __init__(self, settings: Settings, started: asyncio.Event) -> None:
-        super().__init__(settings)
-        self._started = started
+    def __init__(self, settings: Settings, script_path: Path, returned: asyncio.Event) -> None:
+        super().__init__(settings, script_path)
+        self._returned = returned
+        self.result: RunResult | None = None
 
-    async def run(self, request, *, deadline=None, prior_watermark=None, on_session=None,  # type: ignore[override]
-                  on_activity=None, on_model=None, on_provider_start=None, on_attempt=None) -> RunResult:
-        await on_provider_start()
-        on_session("conv-late")
-        self._started.set()
+    async def run(self, request, **kwargs) -> RunResult:  # type: ignore[override]
+        self.result = await super().run(request, **kwargs)
+        self._returned.set()
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
-            pass  # its own cleanup is done, and it reports what agy had said
-        return RunResult(
-            status="timed_out", session_id="conv-late", failure_reason="provider_timeout_still_running",
-            provider_state="possibly_running", provider_invoked=True, error="turn is still in progress",
-        )
+            pass  # the result is in hand; the cancel only reaches the caller
+        return self.result
 
 
 async def test_cancel_keeps_possibly_running_from_an_agy_result_that_ended_as_the_cancel_came(
     tmp_path: Path,
 ) -> None:
+    # agy says the turn goes on at the server, and its CLI exits 3, as it does after its print timeout.
+    script = tmp_path / "agy_exit3.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "if 'models' in sys.argv:\n"
+        "    print('gemini-4-neon-high\\tGemini 4 Neon (High)')\n"
+        "    sys.exit(0)\n"
+        f"open({str(tmp_path / 'pid-agy')!r}, 'w').write(str(os.getpid()))\n"
+        "print(json.dumps({'event': 'init', 'conversation_id': 'conv-late', "
+        "'init': {'model': 'gemini-4-neon-high'}}), flush=True)\n"
+        "sys.stderr.write('print timeout elapsed while turn is still in progress\\n')\n"
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
     settings = _settings(tmp_path)
-    started = asyncio.Event()
-    manager = JobManager(settings, neon_runner=_AgyRunnerEndingAsTheCancelComes(settings, started))
+    returned = asyncio.Event()
+    runner = _AgyRunnerEndingAsTheCancelComes(settings, script, returned)
+    manager = JobManager(settings, neon_runner=runner)
     try:
         job = await manager.start_async(manager.prepare_request(backend="neon", prompt="go"))
-        async with asyncio.timeout(10):
-            await started.wait()
+        async with asyncio.timeout(15):
+            await returned.wait()
             while manager.store.get_job(job.job_id).session_id != "conv-late":
                 await asyncio.sleep(0.02)
+        # The runner's own reading of the stream, unaided.
+        assert runner.result is not None
+        assert (runner.result.failure_reason, runner.result.provider_state) == (
+            "provider_timeout_still_running", "possibly_running",
+        )
+        assert not is_pid_alive(int((tmp_path / "pid-agy").read_text()))
         await manager.cancel(job.job_id)
         stored = manager.store.get_job(job.job_id)
         assert stored is not None and stored.status == "cancelled"
@@ -584,12 +617,24 @@ async def test_cancel_keeps_possibly_running_from_an_agy_result_that_ended_as_th
 # --- 5. Fenced final writes ---
 
 
-def _quick_codex(tmp_path: Path, *, thread_id: str = "thr-quick", sleep_for: dict[str, float] | None = None) -> Path:
-    """A Codex stand-in that starts `thread_id`, works for `sleep_for[prompt]` seconds, then answers."""
+def _quick_codex(
+    tmp_path: Path, *, thread_id: str = "thr-quick", sleep_for: dict[str, float] | None = None,
+    record_pids: bool = False,
+) -> Path:
+    """A Codex stand-in that starts `thread_id`, works for `sleep_for[prompt]` seconds, then answers.
+
+    With `record_pids`, each run first writes its pid to `pid-<prompt>` in `tmp_path`.
+    """
     script = tmp_path / "codex_quick.py"
+    pid_line = (
+        f"import os; from pathlib import Path; Path({str(tmp_path)!r}, 'pid-' + prompt).write_text(str(os.getpid()))\n"
+        if record_pids
+        else ""
+    )
     script.write_text(
         "import json, sys, time\n"
         "prompt = sys.stdin.read().strip()\n"
+        + pid_line +
         f"print(json.dumps({{'type': 'thread.started', 'thread_id': {thread_id!r}}}), flush=True)\n"
         f"time.sleep({sleep_for or {}!r}.get(prompt, 0))\n"
         "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'OK:' + prompt}}), flush=True)\n"
@@ -695,10 +740,11 @@ async def test_a_final_write_that_fails_is_kept_and_retried_until_it_lands(
     manager._finalize_error_backoff = (0.05, 0.2)
     real_finalize = manager.store.finalize_job
     failures = 0
+    broken = True
 
     def finalize_job(record: JobRecord, **kwargs: object) -> str:
         nonlocal failures
-        if failures < 3:
+        if broken:
             failures += 1
             raise sqlite3.DatabaseError("database disk image is malformed")
         return real_finalize(record, **kwargs)
@@ -709,10 +755,18 @@ async def test_a_final_write_that_fails_is_kept_and_retried_until_it_lands(
             rec = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
             # Readable at once from this window, whether or not the row has landed yet.
             assert (rec.status, rec.response) == ("completed", "OK:go")
+            # While the write keeps failing, and after more than one retry: the row still reads running,
+            # and the session stays claimed, so no other turn can take it meanwhile.
+            async with asyncio.timeout(10):
+                while failures < 3:
+                    await asyncio.sleep(0.02)
+            assert manager.store.get_job(rec.job_id).status == "running"
+            assert _claims_of(manager, rec.job_id) == [("codex", "thr-quick")]
+            assert (await manager.get_async(rec.job_id)).status == "completed"
+            broken = False
             async with asyncio.timeout(10):
                 while manager.store.get_job(rec.job_id).status != "completed":
                     await asyncio.sleep(0.05)
-        assert failures == 3
         assert manager.store.get_job(rec.job_id).response == "OK:go"
         assert _claims_of(manager, rec.job_id) == []  # its session claim went with the write
         assert "Could not store the result of job" in caplog.text and "tried again" in caplog.text
@@ -808,20 +862,25 @@ async def test_a_turn_revealing_a_session_another_live_job_holds_is_stopped_and_
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
-    script = _quick_codex(tmp_path, thread_id="thr-shared", sleep_for={"A": 5.0, "B": 5.0})
+    script = _quick_codex(tmp_path, thread_id="thr-shared", sleep_for={"A": 5.0, "B": 5.0}, record_pids=True)
     manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
     try:
         first = await manager.start_async(manager.prepare_request(backend="codex", prompt="A"))
         async with asyncio.timeout(15):
             while manager.store.get_job(first.job_id).session_id != "thr-shared":
                 await asyncio.sleep(0.05)
+        started = time.monotonic()
         second = await manager.run(manager.prepare_request(backend="codex", prompt="B"))
+        took = time.monotonic() - started  # wall clock to the answer, cleanup included
         assert second.status == "failed"
         assert second.failure_reason == "cli_error"
         assert second.error is not None and first.job_id in second.error and "thr-shared" in second.error
         assert second.session_id is None
         assert manager.store.get_job(second.job_id).session_id is None
-        assert (second.duration_seconds or 0) < 4.0  # stopped, not left to run its five seconds
+        assert took < 4.0  # stopped, not left to run its five seconds
+        # By the time the answer is back, its CLI is gone, and the row says it was seen to stop.
+        assert not is_pid_alive(int((tmp_path / "pid-B").read_text()))
+        assert manager.store.get_job(second.job_id).provider_state == "stopped"
         # The holder is untouched: it keeps its claim while it runs, and ends normally.
         assert _claims_of(manager, first.job_id) == [("codex", "thr-shared")]
         [done] = await manager.wait_for([first.job_id], wait_seconds=20)
@@ -1117,17 +1176,23 @@ async def test_check_jobs_gives_an_unknown_id_a_not_found_entry_and_still_answer
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
-    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _quick_codex(tmp_path)))
+    script = _quick_codex(tmp_path, sleep_for={"any": 2.0, "all": 2.0})
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
     mcp, _ = create_server(settings=settings, manager=manager, nesting=NOT_NESTED)
     try:
-        done = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
-        out = _tool_data(await mcp.call_tool(
-            "check_jobs", {"job_ids": ["codex-00000000", done.job_id], "wait_seconds": 30, "wait_mode": "all"},
-        ))
-        assert [j["job_id"] for j in out["jobs"]] == ["codex-00000000", done.job_id]
-        assert out["jobs"][0]["status"] == "not_found" and "No job 'codex-00000000'" in out["jobs"][0]["error"]
-        assert out["jobs"][1]["status"] == "completed"
-        assert (out["all_done"], out["any_done"]) == (True, True)
+        for mode in ("any", "all"):
+            # A peer still running: the unknown id must neither end an "any" wait nor hold up an "all" one.
+            peer = await manager.start_async(manager.prepare_request(backend="codex", prompt=mode))
+            started = time.monotonic()
+            out = _tool_data(await mcp.call_tool(
+                "check_jobs", {"job_ids": ["codex-00000000", peer.job_id], "wait_seconds": 30, "wait_mode": mode},
+            ))
+            took = time.monotonic() - started
+            assert 1.0 < took < 15, (mode, took)  # waited for the peer, and only for it
+            assert [j["job_id"] for j in out["jobs"]] == ["codex-00000000", peer.job_id]
+            assert out["jobs"][0]["status"] == "not_found" and "No job 'codex-00000000'" in out["jobs"][0]["error"]
+            assert out["jobs"][1]["status"] == "completed"
+            assert (out["all_done"], out["any_done"]) == (True, True)
         # Ids that are all unknown do not hold an "any" wait open.
         started = time.monotonic()
         out = _tool_data(await mcp.call_tool(
