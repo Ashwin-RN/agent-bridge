@@ -706,6 +706,99 @@ async def test_a_turn_revealing_a_session_another_live_job_holds_is_stopped_and_
         await manager.shutdown()
 
 
+def _give_claim(manager: JobManager, backend: str, session_id: str, job_id: str, owner_id: str) -> None:
+    conn = sqlite3.connect(manager.store.db_path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO session_claims (backend, session_id, job_id, owner_id, claimed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (backend, session_id, job_id, owner_id, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def test_a_revealed_session_whose_holder_window_has_died_is_taken_and_its_block_stays(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    dead_pid = 999_999_991
+    settings = _settings(tmp_path)
+    manager = JobManager(
+        settings,
+        codex_runner=StubCodexRunner(settings, _quick_codex(tmp_path, thread_id="thr-orphan")),
+        is_pid_alive_fn=lambda pid: pid != dead_pid,
+    )
+    try:
+        # A window that died while its turn held the session; added after this manager started, so its own
+        # start-up recovery has not seen it.
+        manager.store.register_owner("dead-win", dead_pid)
+        manager.store.insert_job(replace(_running_job("codex-0deadbee", "dead-win", tmp_path), session_id="thr-orphan"))
+        _give_claim(manager, "codex", "thr-orphan", "codex-0deadbee", "dead-win")
+
+        rec = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
+        assert (rec.status, rec.session_id) == ("completed", "thr-orphan"), rec.error  # not refused
+        assert manager.store.get_job("codex-0deadbee").failure_reason == "owner_exited"
+        # The dead turn may still be going at the provider: its block stays, for the user to confirm.
+        assert manager.store.get_session_safety_block("codex", "thr-orphan") == {
+            "blocking_job_id": "codex-0deadbee", "provider_state": "unknown",
+        }
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_collision_seen_only_at_the_final_write_is_stored_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    script = _quick_codex(tmp_path, thread_id="thr-shared", sleep_for={"A": 6.0})
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
+    try:
+        first = await manager.start_async(manager.prepare_request(backend="codex", prompt="A"))
+        async with asyncio.timeout(15):
+            while manager.store.get_job(first.job_id).session_id != "thr-shared":
+                await asyncio.sleep(0.05)
+        real_update = manager.store.update_job_progress
+
+        def update_job_progress(job_id: str, **kwargs: object) -> None:
+            if kwargs.get("session_id") == "thr-shared" and job_id != first.job_id:
+                time.sleep(1.0)  # the claim check is still waiting on SQLite when the run ends
+                raise sqlite3.OperationalError("database is locked")
+            real_update(job_id, **kwargs)
+
+        monkeypatch.setattr(manager.store, "update_job_progress", update_job_progress)
+        second = await manager.run(manager.prepare_request(backend="codex", prompt="B"))
+        assert (second.status, second.failure_reason) == ("failed", "cli_error")
+        assert second.error is not None and first.job_id in second.error and "thr-shared" in second.error
+        assert "had ended completed" in second.error
+        assert manager.store.get_job(second.job_id).session_id is None
+        assert _claims_of(manager, first.job_id) == [("codex", "thr-shared")]
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_queued_resume_cancelled_while_the_holder_runs_keeps_its_own_outcome(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    script = _quick_codex(tmp_path, thread_id="thr-q", sleep_for={"A": 6.0})
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
+    try:
+        first = await manager.start_async(manager.prepare_request(backend="codex", prompt="A"))
+        async with asyncio.timeout(15):
+            while manager.store.get_job(first.job_id).session_id != "thr-q":
+                await asyncio.sleep(0.05)
+        waiting = await manager.start_async(manager.prepare_request(backend="codex", prompt="B", resume_from="thr-q"))
+        async with asyncio.timeout(15):
+            while not (manager._local_jobs[waiting.job_id].last_activity or "").startswith("waiting for session"):
+                await asyncio.sleep(0.05)
+        await manager.cancel(waiting.job_id)
+        # It asked for that session and was waiting its turn: not a collision.
+        stored = manager.store.get_job(waiting.job_id)
+        assert (stored.status, stored.failure_reason) == ("cancelled", "cancelled")
+        assert _claims_of(manager, first.job_id) == [("codex", "thr-q")]
+    finally:
+        await manager.shutdown()
+
+
 # --- 6. Owner liveness that survives PID reuse ---
 
 

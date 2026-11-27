@@ -521,6 +521,83 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
     return changed
 
 
+def _live_session_holder_cur(
+    cur: sqlite3.Cursor,
+    backend: str,
+    session_id: str,
+    *,
+    job_id: str,
+    owner_id: str,
+    now: float,
+    is_pid_alive_fn: Callable[[int], bool] | None,
+    process_identity_fn: Callable[[int], str | None] | None = None,
+) -> str | None:
+    """The job, other than `job_id`, that holds `(backend, session_id)` and is live, or None.
+
+    The one claim decision, for a turn that asks for a session and for one whose CLI reveals it. A claim
+    whose job has ended is dropped. A claim whose job's window has died is released by recovering that
+    job (failed, owner_exited; which leaves the session blocked as `unknown` if the turn had started).
+    Without a pid check (`is_pid_alive_fn=None`) any holder that has not ended counts as live.
+    """
+    claim = cur.execute(
+        "SELECT job_id FROM session_claims WHERE backend = ? AND session_id = ?",
+        (backend, session_id),
+    ).fetchone()
+    if claim is None or str(claim["job_id"]) == job_id:
+        return None
+    holder_id = str(claim["job_id"])
+    holder_row = cur.execute(
+        """
+        SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+               o.process_identity AS owner_process_identity
+        FROM jobs j
+        LEFT JOIN owners o ON j.owner_id = o.owner_id
+        WHERE j.job_id = ?
+        """,
+        (holder_id,),
+    ).fetchone()
+    if holder_row is None or str(holder_row["status"]) in TERMINAL_STATUSES:
+        cur.execute(
+            "DELETE FROM session_claims WHERE backend = ? AND session_id = ?",
+            (backend, session_id),
+        )
+        return None
+    if is_pid_alive_fn is None:
+        return holder_id
+    holder_alive = str(holder_row["owner_id"]) == owner_id or _is_owner_row_alive(
+        holder_row["owner_pid"],
+        holder_row["owner_exited_at"],
+        holder_row["owner_process_identity"],
+        is_pid_alive_fn=is_pid_alive_fn,
+        process_identity_fn=process_identity_fn,
+    )
+    if holder_alive:
+        return holder_id
+    # Dead owner held the claim: recover its job atomically, which releases the claim.
+    _recover_job_row_cur(cur, holder_row, now)
+    if holder_row["owner_pid"] is not None and holder_row["owner_exited_at"] is None:
+        cur.execute(
+            "UPDATE owners SET exited_at = ? WHERE owner_id = ? AND exited_at IS NULL",
+            (now, str(holder_row["owner_id"])),
+        )
+    return None
+
+
+def session_held_error_text(session_id: str, holder_job_id: str) -> str:
+    return (
+        f"The CLI reported session {session_id!r}, which job {holder_job_id!r} holds and has not ended. Two "
+        "turns must not run on one session at once, so this job was stopped, and that session is not "
+        "recorded on it."
+    )
+
+
+def session_held_guidance(session_id: str, holder_job_id: str) -> str:
+    return (
+        f"Wait for job {holder_job_id!r} to end, then pass resume_from={session_id!r} if this turn was meant "
+        "to continue that session. For edit tasks inspect git status/diff first."
+    )
+
+
 def _reconcile_session_safety_cur(
     cur: sqlite3.Cursor,
     backend: str,
@@ -1306,54 +1383,23 @@ class BridgeStore:
         now = time.time()
         with self._tx(write=True) as cur:
             claim = cur.execute(
-                """
-                SELECT job_id, owner_id FROM session_claims
-                WHERE backend = ? AND session_id = ?
-                """,
+                "SELECT job_id FROM session_claims WHERE backend = ? AND session_id = ?",
                 (backend, session_id),
             ).fetchone()
-
-            if claim is not None:
-                holder_id = str(claim["job_id"])
-                if holder_id == job_id:
-                    return "claimed", None, None
-
-                holder_row = cur.execute(
-                    """
-                    SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at,
-                           o.process_identity AS owner_process_identity
-                    FROM jobs j
-                    LEFT JOIN owners o ON j.owner_id = o.owner_id
-                    WHERE j.job_id = ?
-                    """,
-                    (holder_id,),
-                ).fetchone()
-
-                if holder_row is None or str(holder_row["status"]) in TERMINAL_STATUSES:
-                    cur.execute(
-                        "DELETE FROM session_claims WHERE backend = ? AND session_id = ?",
-                        (backend, session_id),
-                    )
-                else:
-                    holder_alive = (
-                        str(holder_row["owner_id"]) == owner_id
-                        or _is_owner_row_alive(
-                            holder_row["owner_pid"],
-                            holder_row["owner_exited_at"],
-                            holder_row["owner_process_identity"],
-                            is_pid_alive_fn=is_pid_alive_fn,
-                            process_identity_fn=process_identity_fn,
-                        )
-                    )
-                    if holder_alive:
-                        return "busy", holder_id, None
-                    # Dead owner held the claim: recover its job atomically and continue.
-                    _recover_job_row_cur(cur, holder_row, now)
-                    if holder_row["owner_pid"] is not None and holder_row["owner_exited_at"] is None:
-                        cur.execute(
-                            "UPDATE owners SET exited_at = ? WHERE owner_id = ? AND exited_at IS NULL",
-                            (now, str(holder_row["owner_id"])),
-                        )
+            if claim is not None and str(claim["job_id"]) == job_id:
+                return "claimed", None, None
+            holder_id = _live_session_holder_cur(
+                cur,
+                backend,
+                session_id,
+                job_id=job_id,
+                owner_id=owner_id,
+                now=now,
+                is_pid_alive_fn=is_pid_alive_fn,
+                process_identity_fn=process_identity_fn,
+            )
+            if holder_id is not None:
+                return "busy", holder_id, None
 
             # Defensive check: ensure no active RUNNING job on `(backend, session_id)` lacks a claim row.
             running_rows = cur.execute(
@@ -1583,6 +1629,8 @@ class BridgeStore:
         last_activity: str | None = None,
         provider_invoked: bool | None = None,
         lock_timeout: float = 2.0,
+        is_pid_alive_fn: Callable[[int], bool] | None = None,
+        process_identity_fn: Callable[[int], str | None] | None = None,
     ) -> None:
         sets: list[str] = []
         vals: list[Any] = []
@@ -1632,23 +1680,20 @@ class BridgeStore:
                     brow = cur.execute("SELECT backend FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
                     claim_backend = str(brow["backend"]) if brow is not None else None
                 if claim_backend:
-                    held = cur.execute(
-                        """
-                        SELECT c.job_id, j.status FROM session_claims c
-                        LEFT JOIN jobs j ON j.job_id = c.job_id
-                        WHERE c.backend = ? AND c.session_id = ?
-                        """,
-                        (claim_backend, session_id),
-                    ).fetchone()
-                    if (
-                        held is not None
-                        and str(held["job_id"]) != job_id
-                        and held["status"] is not None
-                        and str(held["status"]) not in TERMINAL_STATUSES
-                    ):
-                        raise SessionHeldError(
-                            backend=claim_backend, session_id=session_id, holder_job_id=str(held["job_id"])
-                        )
+                    # The claim decision a resume gets: a holder whose window has died is recovered, not
+                    # obeyed. With no pid check given, any holder that has not ended counts as live.
+                    holder = _live_session_holder_cur(
+                        cur,
+                        claim_backend,
+                        session_id,
+                        job_id=job_id,
+                        owner_id=owner_id,
+                        now=now,
+                        is_pid_alive_fn=is_pid_alive_fn,
+                        process_identity_fn=process_identity_fn,
+                    )
+                    if holder is not None:
+                        raise SessionHeldError(backend=claim_backend, session_id=session_id, holder_job_id=holder)
             cur.execute(
                 f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ? "
                 "AND status NOT IN ('completed', 'failed', 'cancelled', 'timed_out')",
@@ -1707,6 +1752,8 @@ class BridgeStore:
         touched_provider: bool | None = None,
         attempts: list[dict[str, Any]] | None = None,
         lock_timeout: float = 5.0,
+        is_pid_alive_fn: Callable[[int], bool] | None = None,
+        process_identity_fn: Callable[[int], str | None] | None = None,
     ) -> FinalizeOutcome:
         """Atomically persist terminal status, per-attempt usage, claim release, and safety state.
 
@@ -1764,32 +1811,35 @@ class BridgeStore:
                 return "missing"
             outcome: FinalizeOutcome = "written"
 
-            # A session that another job holds and has not ended is not this job's to touch: the row keeps
-            # the session it had, and that session's watermark and safety state are left alone.
-            foreign_session = False
-            if record.session_id:
-                held = cur.execute(
-                    """
-                    SELECT c.job_id, j.status FROM session_claims c
-                    LEFT JOIN jobs j ON j.job_id = c.job_id
-                    WHERE c.backend = ? AND c.session_id = ?
-                    """,
-                    (record.backend, record.session_id),
-                ).fetchone()
-                foreign_session = (
-                    held is not None
-                    and str(held["job_id"]) != record.job_id
-                    and held["status"] is not None
-                    and str(held["status"]) not in TERMINAL_STATUSES
+            # A session the CLI revealed (not the one this turn asked for and was let into) that another live
+            # job holds: two turns ran on one session, which is a failure, whatever the run said. The row
+            # keeps the session it had, and that session's watermark and safety state are left alone. This
+            # is the same decision as while the job ran, for when that check had not finished in time.
+            revealed = bool(record.session_id) and record.session_id != record.requested_session_id
+            if revealed:
+                holder = _live_session_holder_cur(
+                    cur,
+                    record.backend,
+                    str(record.session_id),
+                    job_id=record.job_id,
+                    owner_id=record.owner_id,
+                    now=now,
+                    is_pid_alive_fn=is_pid_alive_fn,
+                    process_identity_fn=process_identity_fn,
                 )
-                if foreign_session:
+                if holder is not None:
                     logger.warning(
-                        "Job %s reported session %s, which job %s holds; it is not recorded on %s.",
+                        "Job %s reported session %s, which job %s holds; it is stored failed, without that session.",
                         record.job_id,
                         record.session_id,
-                        held["job_id"],
-                        record.job_id,
+                        holder,
                     )
+                    ended = f"{record.status}" + (f", {record.failure_reason}" if record.failure_reason else "")
+                    held_sid = str(record.session_id)
+                    record.status = "failed"
+                    record.failure_reason = "cli_error"
+                    record.error = f"{session_held_error_text(held_sid, holder)} The run itself had ended {ended}."
+                    record.retry_guidance = session_held_guidance(held_sid, holder)
                     row_sid = cur.execute(
                         "SELECT session_id FROM jobs WHERE job_id = ?", (record.job_id,)
                     ).fetchone()
@@ -1891,10 +1941,18 @@ class BridgeStore:
                             record.finished_at or now,
                         ),
                     )
-                else:
+                elif record.session_id == record.requested_session_id:
+                    # The turn was let into this session past its block (confirmed), and has stopped.
                     cur.execute(
                         "DELETE FROM session_safety_state WHERE backend = ? AND session_id = ?",
                         (record.backend, record.session_id),
+                    )
+                else:
+                    # A session the CLI revealed never passed its block, so another job's block stays (such as
+                    # the `unknown` one a recovered holder leaves); only this job's own is cleared.
+                    cur.execute(
+                        "DELETE FROM session_safety_state WHERE backend = ? AND session_id = ? AND blocking_job_id = ?",
+                        (record.backend, record.session_id, record.job_id),
                     )
 
             # Atomically release any session claim held by this job right as terminal state commits.

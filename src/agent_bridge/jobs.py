@@ -52,7 +52,14 @@ from agent_bridge.runners import CodexRunner, NeonRunner, prepare_job_worktree
 ALL_BACKENDS: tuple[str, ...] = ("neon", "codex", "claude")
 # Backends whose edit jobs can run in a Git worktree the bridge makes for them.
 WORKTREE_BACKENDS: frozenset[str] = frozenset({"codex", "claude"})
-from agent_bridge.storage import BridgeStore, SessionHeldError, UsagePeriod, is_sqlite_lock_error
+from agent_bridge.storage import (
+    BridgeStore,
+    SessionHeldError,
+    UsagePeriod,
+    is_sqlite_lock_error,
+    session_held_error_text,
+    session_held_guidance,
+)
 
 logger = logging.getLogger("agent_bridge.jobs")
 
@@ -951,6 +958,8 @@ class JobManager:
                     touched_provider=touched_provider,
                     attempts=attempts,
                     lock_timeout=lock_timeout,
+                    is_pid_alive_fn=self._is_pid_alive,
+                    process_identity_fn=self._process_identity,
                 )
                 return True, None
             except Exception as exc:
@@ -1152,6 +1161,8 @@ class JobManager:
                         description=f"claiming session {sid!r}",
                         backend=record.backend,
                         session_id=sid,
+                        is_pid_alive_fn=self._is_pid_alive,
+                        process_identity_fn=self._process_identity,
                     )
                 except asyncio.CancelledError:
                     return
@@ -1542,15 +1553,8 @@ class JobManager:
             record.status = "failed"
             record.failure_reason = "cli_error"
             record.provider_state = "stopped" if stopped else "possibly_running"
-            record.error = (
-                f"The CLI reported session {exc.session_id!r}, which job {exc.holder_job_id!r} holds and has "
-                "not ended. Two turns must not run on one session at once, so this job was stopped, and that "
-                "session is not recorded on it."
-            )
-            record.retry_guidance = (
-                f"Wait for job {exc.holder_job_id!r} to end, then pass resume_from={exc.session_id!r} if this "
-                "turn was meant to continue that session. For edit tasks inspect git status/diff first."
-            )
+            record.error = session_held_error_text(exc.session_id, exc.holder_job_id)
+            record.retry_guidance = session_held_guidance(exc.session_id, exc.holder_job_id)
             record.finished_at = time.time()
             record.duration_seconds = (
                 round(max(0.0, work_stop_wall - record.started_at), 2)
