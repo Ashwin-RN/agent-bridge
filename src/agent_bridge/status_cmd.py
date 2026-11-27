@@ -236,7 +236,9 @@ def read_snapshot(
                             from agent_bridge.nesting import process_identity
 
                             identity_cache[pid] = process_identity(pid)
-                        alive = identity_cache[pid] == owner_identity
+                        current_identity = identity_cache[pid]
+                        if current_identity is not None:
+                            alive = current_identity == owner_identity
                 if not alive:
                     job["display_status"] = WINDOW_CLOSED
                     job["window_closed"] = True

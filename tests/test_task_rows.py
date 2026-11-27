@@ -163,6 +163,42 @@ async def test_task_row_collects_its_reply_as_a_file(tmp_path: Path) -> None:
         assert (await _task(client, "tasks/get", job_id))["result"]["structuredContent"] == reply
 
 
+async def test_fast_failing_task_run_returns_error_detail_and_supports_task_methods(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp, manager = _bridge(tmp_path)
+
+    async def fail_fast(*_args: Any, **_kwargs: Any) -> Any:
+        raise FileNotFoundError("missing cli binary")
+
+    monkeypatch.setattr(manager.codex_runner, "run", fail_fast)
+    orig_get = manager.get_async
+
+    async def get_after_done(job_id: str) -> Any:
+        ev = manager._events.get(job_id)
+        if ev is not None:
+            await asyncio.wait_for(ev.wait(), timeout=5)
+        return await orig_get(job_id)
+
+    monkeypatch.setattr(manager, "get_async", get_after_done)
+    async with _client(mcp, declares=True) as client:
+        result = await client.call_tool("run", {"backend": "codex", "prompt": "hi"}, allow_claimed=True)
+        assert isinstance(result, CallToolResult)
+        assert result.is_error is True
+        detail = result.structured_content
+        assert detail["status"] == "failed"
+        assert "missing cli binary" in detail["error"]
+        job_id = detail["job_id"]
+
+        got = await _task(client, "tasks/get", job_id)
+        assert got["status"] == "completed"
+        assert got["result"]["isError"] is True
+        assert got["result"]["structuredContent"]["job_id"] == job_id
+
+        cancel_ack = await _task(client, "tasks/cancel", job_id)
+        assert cancel_ack["resultType"] == "complete"
+
+
 async def test_a_host_that_does_not_declare_tasks_gets_the_ordinary_receipt(tmp_path: Path) -> None:
     mcp, manager = _bridge(tmp_path)
     async with _client(mcp, declares=False) as client:

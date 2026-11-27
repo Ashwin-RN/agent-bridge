@@ -649,7 +649,7 @@ def _redact_values(
     value: Any, path: tuple[str, ...] = (), visible: frozenset[tuple[str, ...]] = frozenset()
 ) -> Any:
     if isinstance(value, dict):
-        private_values = any(key.casefold() in {"env", "headers"} for key in path)
+        private_values = any(key.casefold() in {"env", "headers", "http_headers"} for key in path)
         return {
             key: _REDACTED if private_values and (*path, key) not in visible
             else _redact_values(item, (*path, key), visible)
@@ -863,11 +863,26 @@ def plan_registration(host: Host, roots: Roots, opts: Options, planner: Planner)
 def plan_side_files(host: Host, roots: Roots, opts: Options, planner: Planner) -> None:
     timeout = host.timeout
     if timeout.key and timeout.file and timeout.needs_raising() and usable(timeout.source):
-        planner.add_json(roots.path(timeout.file), "tool-call limit", SetKey(tuple(timeout.key.split(".")), timeout.wanted_value(), "minimum"))
+        path = roots.path(timeout.file)
+        op = SetKey(tuple(timeout.key.split(".")), timeout.wanted_value(), "minimum")
+        if opts.scope == "user":
+            planner.add_json(path, "tool-call limit", op)
+        else:
+            planner.snippets.append(
+                Snippet(str(path), _json_snippet_for([("tool-call limit", op)]), f"user-level settings are not edited for --scope {opts.scope}")
+            )
     approval = host.approval
     if approval and approval.kind == "list" and (approval.by_default or opts.approve):
         if approval.writable and approval.file and usable(approval.source):
-            planner.add_json(roots.path(approval.file), "approval rule", AddToList(tuple(approval.key.split(".")), approval.value))
+            path = roots.path(approval.file)
+            op = AddToList(tuple(approval.key.split(".")), approval.value)
+            if opts.scope == "user":
+                planner.add_json(path, "approval rule", op)
+            else:
+                snippet = approval.snippet or _json_snippet_for([("approval rule", op)])
+                planner.snippets.append(
+                    Snippet(str(path), snippet, f"user-level settings are not edited for --scope {opts.scope}")
+                )
         else:
             planner.snippets.append(
                 Snippet(roots.path(approval.file).as_posix() if approval.file else host.label, approval.snippet, "the approval rule is not written by the installer")

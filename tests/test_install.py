@@ -295,6 +295,74 @@ def test_project_scope_edits_the_project_file_and_never_runs_the_hosts_command(
     assert entry["command"] == str(python)
 
 
+@pytest.mark.parametrize("host,extra_flags,project_rel,home_rel,expected_rule", [
+    ("antigravity", (), ".agents/mcp_config.json", ".gemini/antigravity-cli/settings.json", "mcp(agent-bridge/*)"),
+    ("claude-code", ("--approve",), ".mcp.json", ".claude/settings.json", "mcp__agent-bridge"),
+])
+def test_project_scope_prints_snippets_instead_of_writing_under_home(
+    run: Run, home: Path, python: Path, tmp_path: Path,
+    host: str, extra_flags: tuple[str, ...], project_rel: str, home_rel: str, expected_rule: str,
+) -> None:
+    project = tmp_path / "repo"
+    before_home = _snapshot(home)
+    assert run.install(
+        "--host", host, "--scope", "project", "--project", str(project), "--yes", "--no-skill", *extra_flags,
+    ) == 0
+    assert (project / project_rel).is_file()
+    assert _snapshot(home) == before_home
+    assert not (home / home_rel).exists()
+    assert "paste by hand" in run.text
+    assert expected_rule in run.text
+
+    # A timeout side-file under {home} that needs raising also prints a snippet under --scope project.
+    base_host = get_host("claude-code")
+    short_timeout = hosts.Timeout(
+        key="env.MCP_TOOL_TIMEOUT", file="{home}/.claude/settings.json",
+        default_seconds=60, scale=1000, as_string=True, source=hosts.RUN,
+    )
+    custom = hosts.Host(**{**base_host.__dict__, "timeout": short_timeout})
+    roots = Roots.for_home(home, project=project)
+    opts = install_cmd.Options(str(python), ["-m", "agent_bridge"], "project", False, False, False, False, True)
+    planner = install_cmd.Planner(roots, opts)
+    install_cmd.plan_side_files(custom, roots, opts, planner)
+    assert not planner.json_ops
+    assert any("MCP_TOOL_TIMEOUT" in s.text and "600000" in s.text for s in planner.snippets)
+
+
+def test_http_headers_are_redacted_in_json_and_toml_previews(run: Run, home: Path) -> None:
+    other = {
+        "http_headers": {"X-Json-Auth": "json-http-header-secret", "X-Other": "json-other-secret"},
+    }
+    original_json = json.dumps({"mcpServers": {"other": other}})
+    json_path = _write(home / ".claude.json", original_json)
+    assert run.install("--host", "claude-code", "--print", "--no-skill", "--no-status-line") == 0
+    assert "json-http-header-secret" not in run.text and "json-other-secret" not in run.text
+    assert run.install("--host", "claude-code", "--yes", "--no-skill", "--no-status-line") == 0
+    assert "json-http-header-secret" not in run.text and "json-other-secret" not in run.text
+    assert json.loads(json_path.read_bytes())["mcpServers"]["other"] == other
+
+    original_toml = (
+        'mcp_servers.other_top.http_headers."X-Top-Auth" = "toml-top-secret"\n'
+        '[mcp_servers.other_inline]\n'
+        'http_headers = { "X-Inline-Auth" = "toml-inline-secret" }\n'
+        '[mcp_servers.agent-bridge]\n'
+        'command = "old"\n'
+        'http_headers."X-Dotted-Auth" = "toml-dotted-secret"\n'
+        '[mcp_servers.other_table.http_headers]\n'
+        'X-Table-Auth = "toml-table-secret"\n'
+    )
+    toml_path = _write(home / ".codex" / "config.toml", original_toml)
+    toml_secrets = ("toml-inline-secret", "toml-dotted-secret", "toml-table-secret", "toml-top-secret")
+    preview = install_cmd._toml_preview(original_toml)
+    assert all(secret not in preview for secret in toml_secrets), preview
+    assert run.install("--host", "codex", "--print", "--no-skill") == 0
+    assert all(secret not in run.text for secret in toml_secrets), run.text
+    assert run.install("--host", "codex", "--yes", "--no-skill") == 0
+    assert all(secret not in run.text for secret in toml_secrets), run.text
+    written = toml_path.read_text(encoding="utf-8")
+    assert all(secret in written for secret in toml_secrets)
+
+
 # ------------------------------------------------------------------ TOML
 
 
