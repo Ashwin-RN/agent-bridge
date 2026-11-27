@@ -1020,6 +1020,11 @@ def _timeout_seconds(host: Host, entry: Any, roots: Roots) -> float | None:
         return None
 
 
+def configured_timeout_seconds(host: Host, entry: Any, roots: Roots) -> float | None:
+    """Read a timeout override using the same parser as doctor."""
+    return _timeout_seconds(host, entry, roots)
+
+
 def _approval_present(host: Host, entry: Any, roots: Roots) -> bool | None:
     approval = host.approval
     if approval is None:

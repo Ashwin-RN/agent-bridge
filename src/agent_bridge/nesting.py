@@ -319,6 +319,11 @@ def _process_command_line(pid: int) -> list[str] | None:
         return None
 
 
+def process_command_line(pid: int) -> list[str] | None:
+    """Return a process's argument vector, or None when it cannot be read."""
+    return _process_command_line(pid)
+
+
 def _is_bridge_command(argv: list[str]) -> bool:
     if not argv:
         return False

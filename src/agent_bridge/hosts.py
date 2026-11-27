@@ -231,6 +231,7 @@ HOSTS: tuple[Host, ...] = (
         skills_project="{project}/.claude/skills",
         skills_source=RUN,
         process_names=("claude",),
+        client_names=("claude-code",),
         detect_source=RUN,
     ),
     Host(
