@@ -735,6 +735,10 @@ def is_shim(path: str) -> bool:
     return "shim" in Path(path).parent.name.lower()
 
 
+def is_batch_launcher(path: str) -> bool:
+    return Path(path).suffix.lower() in {".cmd", ".bat"}
+
+
 def detect_installed(
     env: Mapping[str, str],
     path_lookup: Callable[[str], str | None],
