@@ -296,6 +296,56 @@ async def test_jobs_list_is_short(tmp_path: Path) -> None:
         await manager.shutdown()
 
 
+@pytest.mark.parametrize("form", ["new", "resume", "review"])
+async def test_codex_fast_cli_override(tmp_path: Path, form: str) -> None:
+    mcp, manager = _bridge(tmp_path)
+    args: dict[str, Any] = {"backend": "codex", "prompt": "ARGV", "wait_seconds": 30}
+    try:
+        if form == "resume":
+            first = await _call(mcp, "run", args)
+            args["resume_from"] = first["job_id"]
+        elif form == "review":
+            args.update(prompt="", review={"scope": "uncommitted"})
+        reply = await _call(mcp, "run", {**args, "fast": True})
+        assert reply["status"] == "completed"
+        argv = json.loads(reply["response"])["argv"]
+        assert argv[:2] == ["exec", "--json" if form == "new" else form]
+        tier = argv.index('service_tier="fast"')
+        assert argv[tier - 1] == "-c"
+    finally:
+        await manager.shutdown()
+
+
+async def test_codex_fast_is_opt_in_on_each_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("agent_bridge.runners.read_codex_local_defaults", lambda: {})
+    mcp, manager = _bridge(tmp_path)
+    args = {"backend": "codex", "prompt": "ARGV", "wait_seconds": 30}
+    try:
+        fast = await _call(mcp, "run", {**args, "fast": True})
+        assert 'service_tier="fast"' in json.loads(fast["response"])["argv"]
+        for resume in ({"resume_from": fast["job_id"]}, {}):
+            reply = await _call(mcp, "run", {**args, **resume})
+            assert reply["status"] == "completed"
+            argv = json.loads(reply["response"])["argv"]
+            assert all(not arg.startswith("service_tier=") for arg in argv)
+            assert argv.count("-c") == bool(resume)  # resume still overrides sandbox_mode
+    finally:
+        await manager.shutdown()
+
+
+async def test_codex_fast_line_follows_effort(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        receipt = await _call(mcp, "run", {"backend": "codex", "prompt": "hi", "effort": "medium", "fast": True})
+        [done] = (await _call(mcp, "jobs", {"job_ids": [receipt["job_id"]], "wait_seconds": 30}))["jobs"]
+        [summary] = (await _call(mcp, "jobs", {}))["jobs"]
+        assert done["status"] == "completed"
+        for reply in (receipt, done, summary):
+            assert " · medium · fast · " in reply["line"]
+    finally:
+        await manager.shutdown()
+
+
 # --- review ---
 
 
@@ -342,6 +392,44 @@ async def test_a_review_that_would_not_be_one_is_refused(tmp_path: Path, args: d
 
 
 # --- usage and backends ---
+
+
+@pytest.mark.parametrize("empty", [False, True])
+async def test_agy_fast_warns_and_keeps_other_warnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty: bool,
+) -> None:
+    mcp, manager = _bridge(tmp_path)
+    script = tmp_path / "agy_stand_in.py"
+    script.write_text(
+        "import json, sys\n"
+        "if sys.argv[1:2] == ['models']:\n"
+        "    print('gemini-4-neon-high\\tGemini 4 Neon (High)')\n"
+        "    sys.exit(0)\n"
+        "argv = sys.argv[1:]\n"
+        "assert not any(arg.startswith('service_tier=') for arg in argv)\n"
+        f"response = '' if {empty!r} else json.dumps(argv)\n"
+        "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'response': response}}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(manager.neon_runner, "resolve_command", lambda: [sys.executable, str(script)])
+    if not empty:
+        def fail_export(*_args: Any) -> None:
+            raise OSError("test export failure")
+
+        monkeypatch.setattr(server_mod, "_write_reply_file", fail_export)
+    try:
+        reply = await _call(mcp, "run", {
+            "backend": "neon", "prompt": "hi", "fast": True, "wait_seconds": 30, "response_file": True,
+        })
+        assert reply["status"] == "completed"
+        if not empty:
+            assert "--model" in json.loads(reply["response"])
+        assert "fast" not in reply["line"].split(" · ")
+        assert "neon has no fast tier" in reply["warning"]
+        assert ("empty reply" if empty else "Could not write reply file") in reply["warning"]
+        assert len(reply["warning"].splitlines()) == 1
+    finally:
+        await manager.shutdown()
 
 
 def _finish(manager: JobManager, job_id: str, *, backend: str, pool: str, tokens: int, finished: float,

@@ -9,6 +9,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
@@ -218,6 +219,8 @@ class JobManager:
         self._trackers: dict[str, ProcessTracker] = {}
         self._cancelled_ids: set[str] = set()
         self._session_waiters: dict[tuple[str, str], set[asyncio.Event]] = {}
+        # Remember per-run tier requests for finished jobs within this window's history.
+        self._recent_fast_jobs: OrderedDict[str, None] = OrderedDict()
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
         self._finalize_retry_seconds: float = 15.0
         # A final write that fails with something other than a lock: first delay and the cap, in seconds.
@@ -267,12 +270,26 @@ class JobManager:
         """Release completed job records and handles from RAM once committed to SQLite."""
         if job_id in self._terminal_uncommitted or job_id in self._finalizing_records:
             return
+        record = self._local_jobs.get(job_id)
+        if record is not None and record.fast:
+            self._recent_fast_jobs[job_id] = None
+            if len(self._recent_fast_jobs) > self.store.max_stored_jobs:
+                self._recent_fast_jobs.popitem(last=False)
         self._local_jobs.pop(job_id, None)
         self._events.pop(job_id, None)
         self._tasks.pop(job_id, None)
         self._trackers.pop(job_id, None)
         self._cancelled_ids.discard(job_id)
         self._uncommitted_session_ids.discard(job_id)
+
+    def with_fast_request(self, record: JobRecord) -> JobRecord:
+        """Restore this window's per-run tier request when rendering a stored job."""
+        if record.fast:
+            return record
+        local = self._local_jobs.get(record.job_id)
+        if (local is not None and local.fast) or record.job_id in self._recent_fast_jobs:
+            return replace(record, fast=True)
+        return record
 
     def _notify_session_waiters(self, backend: str, session_id: str | None) -> None:
         if not session_id:
@@ -356,6 +373,7 @@ class JobManager:
         review_commit: str | None = None,
         confirm_prior_job_id: str | None = None,
         allow_cross_pool_fallback: bool = False,
+        fast: bool = False,
     ) -> RunRequest:
         if not prompt.strip() and review_scope is None:
             raise ValueError("Prompt must be non-empty.")
@@ -573,6 +591,7 @@ class JobManager:
             prior_quota_pool=prior_quota_pool,
             prior_model=prior_model_label,
             resume_notice=resume_notice,
+            fast=fast,
         )
 
     async def prepare_request_async(self, **kwargs: Any) -> RunRequest:
@@ -602,6 +621,7 @@ class JobManager:
             model=request.model,
             model_source="requested" if request.model else None,
             effort=request.effort,
+            fast=request.fast,
             prompt_preview=_preview(preview_source),
             label=request.label,
             parent_run=request.parent_run,
@@ -2147,7 +2167,7 @@ class JobManager:
             else r
             for r in recs
         ]
-        return [r.to_summary() for r in merged]
+        return [self.with_fast_request(r).to_summary() for r in merged]
 
     async def list_jobs_async(
         self,
@@ -2185,7 +2205,7 @@ class JobManager:
             else r
             for r in recs
         ]
-        return [r.to_summary() for r in merged]
+        return [self.with_fast_request(r).to_summary() for r in merged]
 
     async def get_usage_summary(
         self,
