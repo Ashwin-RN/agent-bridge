@@ -8,5 +8,5 @@
 - **TOML mixed line endings.** When `agent-bridge install` edits a TOML file, it normalises mixed line endings in that file.
 - **SQLite side files on read-only status.** `agent-bridge status` opens `bridge.db` read-only (`mode=ro`), but SQLite may still create `-shm` and `-wal` side files beside it.
 - **Codex model reporting.** The Codex CLI does not report which model ran, so its model always reads `requested` (or Codex's default model).
-- **Untested hosts and platforms.** Hosts other than Claude Code, Codex and Antigravity are written from their documentation and have not been run. Linux and macOS paths have not been run on real machines.
+- **Untested hosts and platforms.** The five tools have been driven live from Claude Code and from Codex. Antigravity as a host has not been run on the five-tool surface, and every other host in the table is written from its documentation and has not been run. A host the bridge cannot identify waits at most 20 seconds per call. Linux and macOS paths have not been run on real machines.
 - **Claude Code task rows.** Task rows have been proven in Claude Code only, through a headless session (`scripts/live-checks/task_rows_claude_code.py`). How the row is drawn in the interactive window was not checked.
