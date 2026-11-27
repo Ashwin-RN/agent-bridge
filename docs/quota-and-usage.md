@@ -13,60 +13,81 @@ Each pool has a 5 hour window and a weekly window. The Claude and GPT pool on `a
 
 ## Reading the quota
 
-`get_usage` with `include_quota=True` starts `codex` and `agy` to ask for their numbers. That can take 10 to 15 seconds. The reading is kept for 2 minutes and shared by every window; `refresh_quota=True` reads again. If a reading fails, that pool shows `status: "unknown"` with the error, and the rest of the reply is still good.
+`usage(quota=True)` starts `codex` and `agy` to read their numbers. That takes about 10 to 15 seconds. Readings are cached in `bridge.db` for 2 minutes (`AGENT_BRIDGE_QUOTA_TTL_SECONDS`) and shared across windows; a cached reading whose reset time has already passed is read again automatically. Every pool is returned in one fixed shape regardless of summary filters.
 
-The `claude` pool is different. Claude Code has no command that prints the plan limits, so the bridge keeps what the last Claude job's output carried:
+Top-level fields of `quota`:
 
-- Before any Claude job has run, or once every window of that reading has reset, the pool shows `status: "unknown"` with a note. A window whose reset has passed is dropped on its own; the others stay.
-- After a job, it shows the windows that job reported, with `source: "last_claude_job"`. A Claude job can report only a subset of windows (see [verification log](verification-log.md#claude-quota-window-reporting)). A window that is not listed was not reported; it is not known to be empty or full.
-- The reading does not see your own Claude use since that job. `refresh_quota` does not change it.
-- The advice never marks this pool `use_before_reset`. What is left of the plan before its reset is also what your own Claude sessions run on.
-
-Each window comes back with `used_percent`, `remaining_percent`, `reset_time`, `resets_in` and a `signal`:
-
-| `signal` | Meaning |
+| Field | Meaning |
 |---|---|
-| `idle_full` | Untouched. The timer starts on first use |
-| `on_track` | Nothing to note |
-| `ahead_of_pace` | More quota left than time left in the window |
-| `burning_fast` | Being used faster than the window allows |
+| `read_at` | Oldest ISO timestamp among the readings used, or `null` if none succeeded |
+| `pools` | Always all four pools in fixed order: `codex`, `agy_gemini`, `agy_claude_gpt`, `claude` |
+| `order` | Usable routable pools, best first. Excludes `claude` and any pool with priority `avoid`, `stale` or `unknown` |
+| `unread` | List of `{"pool", "reason"}` for pools with no usable reading (and any unrecognised Antigravity group) |
+| `summary` | One-sentence routing summary; names any pool whose read failed |
+
+Each entry in `pools` has:
+
+| Field | Meaning |
+|---|---|
+| `pool`, `backend`, `label` | Pool name, backend name and display label |
+| `five_hour`, `weekly` | Window object, or `null` if the reading did not include that window |
+| `priority` | Routing priority (table below) |
+| `note` | Short explanation of the pool's state or why it was not read |
+
+Each window object has `left_percent`, `resets_in` (human countdown or `null`), `reset_time` (ISO timestamp or `null`), and `state`:
+
+| `state` | Meaning |
+|---|---|
+| `ok` | Active window with room left |
+| `not_started` | Untouched (`100%` left; timer starts on first use) |
 | `low` | 15% or less left |
 | `exhausted` | 2% or less left |
-| `expiring_soon_use_it` | A good share is unused and the window resets soon |
-| `stale_reset` | The reset time has passed. Read again with `refresh_quota=True` |
+| `expiring` | Unused capacity with the window resetting soon |
+| `stale` | The reset timestamp has passed |
 
-`quota_advisory` turns that into advice for each pool:
+Pool `priority` values:
 
 | `priority` | Meaning |
 |---|---|
-| `use_before_reset` | The weekly window resets soon with quota unused. Send work here first. Also listed in `expiring_weekly_alerts` |
-| `high` | Plenty of room |
-| `normal` | Some room |
+| `use_before_reset` | Weekly window resets soon with at least 20% unused (and 5h > 5%). Ranked first in `order` |
+| `high` | Untouched, healthy headroom (>= 70% or ahead of pace), or expiring 5h window |
+| `normal` | Moderate headroom |
 | `conserve` | Running low or burning fast |
-| `avoid` | Exhausted or rate limited |
-| `stale` | The reading is out of date |
+| `avoid` | Exhausted or rate limited. Left out of `order` |
+| `stale` | A window's reset time has passed. Left out of `order` |
+| `unknown` | Could not be read, or no reading yet. Left out of `order` |
 
-`recommended_order` lists the usable pools best first. Pools marked `avoid` or `stale` are left out of it. So is the `claude` pool, always: it is the allowance your own Claude sessions run on, so a job uses it only when it names the `claude` backend. `upcoming_resets` lists every reset to come, soonest first.
+The `claude` pool is different. Claude Code has no command that prints the plan limits, so the bridge keeps what the Claude jobs it ran reported:
+
+- Before any Claude job has run, or once every window of that reading has reset, `five_hour` and `weekly` are `null`, `priority` is `"unknown"`, and `note` reads `"no reading: no Claude job has reported one"`. It appears in `unread` without marking the `summary` as a read failure.
+- Each window is kept until its own reset passes; an expired 5h window is dropped while a current weekly window stays. A Claude job can report only a subset of windows (see [verification log](verification-log.md#claude-quota-window-reporting)). An unlisted window was not reported and is not known to be empty or full.
+- The reading does not see your own Claude use since that job.
+- `claude` is never listed in `order` and never marked `use_before_reset`: that allowance is shared with your own Claude Code and claude.ai sessions, so a job uses it only when it names `backend="claude"`.
 
 A quota reading is a snapshot. A few large jobs can use up a 5 hour window that looked nearly full a moment ago.
 
 ## Usage
 
-Without `include_quota`, `get_usage` reports only what the bridge itself ran: runs, outcomes, time and tokens, by backend and by pool.
+Without `quota=True`, `usage()` reports only what the bridge itself ran: `scope`, `totals`, `by_quota_pool` and `note`. Pass `verbose=True` for the per-pool token breakdown, `usage_coverage`, `attempts` (when retries occurred) and `partial_total_tokens`.
 
-- `exact` and `delta` counts go into the token totals. `partial` counts are shown apart, and `missing` means the CLI gave no figure.
+- `exact` and `delta` counts go into the token totals. Runs without a full count are counted in `runs_without_full_count` (and detailed in `view="dashboard"` under `not_in_totals`).
 - A job that was retried counts as one run with two attempts.
 - Work you do in `codex`, `agy` or `claude` outside the bridge is not in these counts. For `codex` and `agy` it does show in the quota reading.
-- For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.session_cost_usd_estimate` is Claude Code's own list-price estimate. On a resume the estimate includes earlier turns. For new sessions with native subagents, the bridge sums Claude Code's per-model token counts when available and sets `provider_metrics.usage_scope` to `whole_job`. Resumed sessions use the main agent's per-turn counts. Provider metrics retain the main agent's token figures and report the number of native subagents in `native_subagents` when Claude Code supplies it, including zero.
-- Codex's built-in review (`review_code` with no `focus`) reports no token counts, so it shows as 0 tokens.
+- For `claude`, `input_tokens` includes cache reads and cache writes, and `cached_tokens` is the cache-read part. `provider_metrics.session_cost_usd_estimate` is Claude Code's own list-price estimate (on a resume it includes earlier turns). For new sessions with native subagents, the bridge sums Claude Code's per-model token counts when available and sets `provider_metrics.usage_scope` to `whole_job`. Resumed sessions use the main agent's per-turn counts. Provider metrics retain the main agent's token figures and report `native_subagents` when Claude Code supplies it, including zero.
+- Codex's built-in review (`run` with `review` and no `focus` or `prompt`) reports no token counts, so it shows as 0 tokens.
 
-## The usage dashboard skill
+## Skills
 
-`skills/bridge-usage/SKILL.md` is a skill that calls [`usage_dashboard`](tools.md#usage_dashboard) and shows its `text` unchanged. The same file works in Claude Code, Codex and Antigravity. The bridge works out every figure; the skill only picks the period and shows the answer, so the host's model has nothing to add up or round.
+Two skills ship in `skills/`:
 
-`agent-bridge install` offers to install the skill automatically. For manual installation, see [Install the usage dashboard skill](install.md#install-the-usage-dashboard-skill).
+- `bridge-usage`: calls `usage(view="dashboard")` and shows its `text` unchanged.
+- `bridge-routing`: which backend and model to pick, and how to brief and collect a job.
 
-### Use it
+### The usage dashboard skill
+
+`skills/bridge-usage/SKILL.md` works in Claude Code, Codex and Antigravity. The bridge works out every figure; the skill only picks the period and shows `text` unchanged, so the host's model has nothing to add up or round.
+
+`agent-bridge install` offers to install `bridge-usage` automatically. For manual installation, see [Install the skills](install.md#install-the-skills).
 
 | Host | Type |
 |---|---|
@@ -78,6 +99,6 @@ With no period it shows today. `session` shows only the window you are typing in
 
 Notes on host behaviour (see the [verification log](verification-log.md#usage-dashboard-skill-headless-checks-2026-11-26-and-2026-11-27)):
 
-- `codex exec` runs `usage_dashboard` without an approval override because the tool is marked read-only.
+- `codex exec` runs `usage` without an approval override because the tool is marked read-only.
 - In Antigravity, a project-level entry named `agent-bridge` in `<project>/.agents/mcp_config.json` does not replace one with the same name in `~/.gemini/config/mcp_config.json`.
-- Because Claude Code passes only the structured part of a tool result to its model while Codex and Antigravity pass the text part, `usage_dashboard` returns one object sent as both.
+- Because Claude Code passes only the structured part of a tool result to its model while Codex and Antigravity pass the text part, `usage(view="dashboard")` returns one object sent as both.

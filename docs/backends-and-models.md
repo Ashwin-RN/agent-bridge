@@ -28,7 +28,7 @@ Shortcuts carry no version number. The bridge reads the live list from `agy mode
 | `claude`, `claude-sonnet`, `claude-sonnet-medium`, `claude-sonnet-high` | Claude Sonnet |
 | `claude-opus`, `claude-opus-medium`, `claude-opus-high` | Claude Opus |
 | `gpt-oss` | GPT-OSS, at `medium` |
-| A full id from `list_backends` | That exact model |
+| A full id from `backends` | That exact model |
 
 Rules worth knowing:
 
@@ -47,6 +47,7 @@ Rules worth knowing:
 - `model="latest"`, `"default"` or `"auto"` lets Codex choose its own model.
 - If Codex rejects the model, the job runs once more with Codex's own default, and `model_notice` says so.
 - `effort` on a call overrides the default for that call.
+- Codex does not report which model ran, so job replies and status lines show `model_source: "requested"` (or `"default"`).
 
 ## Effort on agy
 

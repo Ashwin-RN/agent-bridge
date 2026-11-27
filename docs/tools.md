@@ -1,275 +1,324 @@
-<!-- TOOLS: this page describes the tool surface before the five-tool change; it is rewritten in the final pass -->
-
-# The nine tools
+# The five tools
 
 Your host fills these in for you. The tables are here so you know what you can ask for.
 
-## run_agent
+## Updating from the nine-tool surface
 
-Runs one job and waits for the reply.
+The server now exposes five tools with no aliases.
 
-| Argument | Default | What it does |
-|---|---|---|
-| `backend` | required | See [Backend names](backends-and-models.md#backend-names). On a resume pass plain `neon`, `codex` or `claude`, or leave it out |
-| `prompt` | required | The task |
-| `cwd` | where the host started the bridge | The folder the subagent works in. Pass it: not every host starts the bridge in your project folder |
-| `mode` | `read_only` | `read_only` or `edit` |
-| `model` | the backend's default | A shortcut or a full id |
-| `effort` | the backend's default | `low`, `medium`, `high`, `xhigh` |
-| `timeout_seconds` | 300 | The job's deadline, 10 to 3600 |
-| `wait_seconds` | until the job ends | How long this call waits. The job carries on if the wait ends first |
-| `resume_from` | none | A `job_id` or `session_id` to continue |
-| `relocate_cwd` | `False` | Move a resumed session to another folder on purpose |
-| `worktree` | `False` | Codex or Claude in `edit` mode only: work in a new Git worktree |
-| `extra_dirs` | none | More folders the subagent may use. Not accepted on a Codex resume |
-| `label` | none | A short name shown in job lists |
-| `parent_run` | none | A group label |
-| `confirm_prior_stopped`, `confirm_prior_job_id` | off | See [Resuming a session](troubleshooting.md#resuming-a-session) |
-| `allow_cross_pool_fallback` | `False` | Let an `agy` job fall back to a model in the other `agy` pool |
+| Old call | New |
+|---|---|
+| `run_agent(...)` | `run(..., wait_seconds=N)` |
+| `start_agent(...)` | `run(...)` |
+| `run_parallel` with 3 tasks | 3 `run` calls made in parallel |
+| `review_code(backends=[a, b], focus=f)` | one `run` per backend, each with `review={"focus": f}` |
+| `check_jobs(...)` | `jobs(...)` |
+| `cancel_job(id)` | `cancel(id)` |
+| `get_usage(compact=True, include_quota=True)` | `usage(quota=True)` |
+| `usage_dashboard(period)` | `usage(view="dashboard", period=...)` |
+| `list_backends(include_quota=True)` | `backends()` plus `usage(quota=True)` |
 
-Example call:
+## run
 
-```json
-{
-  "backend": "agy-claude",
-  "cwd": "/path/to/repo",
-  "prompt": "In one sentence, what does pyproject.toml say this package is?"
-}
-```
+Starts one subagent job and answers at once with a small receipt whose `next` field is the `jobs` call that collects it. To fan out, call `run` once per job in parallel.
 
-Example result, shortened:
+With `wait_seconds` (max 300), `run` waits up to that long first: a job that finishes in time returns its full job detail, and one still active returns a receipt. Waits are capped under the host's tool-call limit; a shortened wait whose job has not ended carries `wait_note`.
 
-```json
-{
-  "job_id": "neon-1a2b3c4d",
-  "backend": "neon",
-  "quota_pool": "agy_claude_gpt",
-  "status": "completed",
-  "mode": "read_only",
-  "model": "claude-sonnet-5-5-high",
-  "requested_model": "claude-sonnet-high",
-  "cwd": "/path/to/repo",
-  "effective_cwd": "/path/to/repo",
-  "elapsed_seconds": 14.47,
-  "session_id": "0f1e2d3c-4b5a-6978-8695-a4b3c2d1e0f9",
-  "response": "It is a lightweight local stdio MCP server that ...",
-  "usage": {"input_tokens": 17900, "output_tokens": 907, "cached_tokens": 9100, "reasoning_tokens": 0, "total_tokens": 18807},
-  "usage_status": "exact"
-}
-```
-
-## start_agent
-
-The same as `run_agent`, but it returns at once with a `job_id` and the job runs in the background. It takes every `run_agent` argument except `wait_seconds`. Collect the reply with `check_jobs`.
-
-```json
-{"job_id": "neon-5e6f7a8b", "backend": "neon", "status": "queued", "mode": "read_only", "timeout_seconds": 300,
- "hint": "Call check_jobs(job_ids=['neon-5e6f7a8b'], wait_seconds=60) to wait for results."}
-```
-
-## run_parallel
-
-Starts 1 to 10 jobs in one call.
+A host that supports the MCP tasks extension (`io.modelcontextprotocol/tasks`, such as Claude Code) receives each `run` as a background task row instead of waiting, shows the job's `line` as its status message, and delivers the finished job reply when the job ends with no polling by the model.
 
 | Argument | Default | What it does |
 |---|---|---|
-| `tasks` | required | A list. Each task needs `backend` and `prompt`, and may set `cwd`, `mode`, `model`, `effort`, `resume_from`, `relocate_cwd`, `worktree`, `extra_dirs`, `label`, the two confirm flags and `allow_cross_pool_fallback` |
-| `cwd`, `mode` | as `run_agent` | Used by any task that does not set its own |
-| `wait` | `True` | `True` waits for all tasks. `False` returns the `job_ids` at once |
-| `timeout_seconds` | 300 | One deadline applied to every task |
-| `wait_seconds` | the timeout | How long the call waits |
-| `parent_run` | none | One group label for every task |
+| `backend` | `None` | `codex`, `neon` (`agy`), `agy-claude`, `agy-opus`, `agy-gpt` or `claude`. Required on new jobs; may be left out with `resume_from`. See [Backend names](backends-and-models.md#backend-names) |
+| `prompt` | `""` | The task. Required unless `review` is set; with `review`, optional and appended to `review.focus` |
+| `cwd` | `None` | Working folder (defaults to `AGENT_BRIDGE_DEFAULT_CWD` or where the bridge started). Pass on new jobs; leave out on `resume_from` unless `relocate_cwd=True` |
+| `mode` | `"read_only"` | `"read_only"` or `"edit"` |
+| `model` | `None` | Model id or shortcut (for `neon`: e.g. `neon-high`, `hydrogen-medium`, `flash`; for `claude`: `sonnet`, `opus`, `haiku`, `fable`). Defaults to the backend's |
+| `effort` | `None` | `"low"`, `"medium"`, `"high"` or `"xhigh"`. Defaults to the backend's |
+| `timeout_seconds` | `None` | The job's own deadline in seconds, clamped to 10–3600 (defaults to `AGENT_BRIDGE_DEFAULT_TIMEOUT`, 300) |
+| `wait_seconds` | `0` | Wait up to this many seconds before answering (max 300, also capped by the host's limit). Ignored on MCP task calls |
+| `response_file` | `False` | Save a finished non-empty reply to `<state_dir>/replies/<job_id>.md` and return a preview instead of `response`. Forwarded into `next` on a receipt |
+| `resume_from` | `None` | A prior `job_id` or `session_id` to continue. Inherits `cwd`, worktree, `model`, `effort` and `parent_run` |
+| `worktree` | `False` | For `codex` and `claude` in `edit` mode: give the job its own Git worktree |
+| `extra_dirs` | `None` | Additional folders the subagent may use. Refused on a Codex resume |
+| `label` | `None` | Short name shown in `line` and status tables |
+| `parent_run` | `None` | Group label for filtering in `jobs` and `usage` |
+| `review` | `None` | Read-only code review object: `scope` (`"uncommitted"`, `"base"` or `"commit"`, default `"uncommitted"`), `base` (branch for `"base"`, default `"main"`), `commit` (SHA, required for `"commit"`), `focus` (optional focus text). Must keep `mode="read_only"`, `worktree=False` and `resume_from=None`. Codex with no `focus` and empty `prompt` runs `codex exec review`; any focus or prompt runs a review prompt, as `neon` and `claude` always do |
+| `relocate_cwd` | `False` | Move a resumed session to `cwd` on purpose |
+| `confirm_prior_job_id` | `None` | The prior turn's `job_id`, once you have confirmed it stopped, to resume an uncertain session |
+| `allow_cross_pool_fallback` | `False` | Allow an `agy` job to fall back to its other quota pool |
 
-Every task is checked before any starts, so one bad task stops the whole call. Once running, a failed task does not stop the others. The reply has `count`, `all_done` and `results`, one entry per task in order.
+Returns a receipt when the job is still queued or running (or the full job detail when `wait_seconds > 0` and the job finishes in time):
 
 ```json
 {
-  "cwd": "/path/to/repo",
-  "wait": false,
-  "timeout_seconds": 1800,
-  "parent_run": "auth-scope",
-  "tasks": [
-    {"backend": "agy-opus", "model": "claude-opus-medium", "label": "read-server", "prompt": "..."},
-    {"backend": "codex", "effort": "low", "label": "read-tests", "prompt": "..."}
-  ]
+  "line": "codex · requested gpt-6.2-sol · high · queued 0s · queued · review auth · codex",
+  "job_id": "codex-1a2b3c4d",
+  "status": "queued",
+  "backend": "codex",
+  "model": "gpt-6.2-sol",
+  "timeout_seconds": 300,
+  "next": "jobs(job_ids=['codex-1a2b3c4d'], wait_seconds=50)"
 }
 ```
 
-## check_jobs
+`model` is omitted on a receipt when the bridge only knows the CLI's default.
 
-Lists recent jobs, or waits for named ones.
+Refused as a tool error before any job is created when:
+
+- The bridge is running inside one of its own jobs (`nested_bridge`).
+- Required inputs are missing or invalid (empty `prompt` without `review`, missing `backend` on a new job, unknown `backend`/`mode`/`effort`, non-existent `cwd` or `extra_dirs`, unknown `job_id` in `resume_from`, or a prior job with no `session_id` yet).
+- Options conflict (`worktree=True` on `neon` or without `mode="edit"`, `extra_dirs` on a Codex resume, `review` combined with `mode="edit"`, `worktree=True`, `resume_from`, or `scope="commit"` without `commit`, or a resumed session's recorded worktree is missing without `relocate_cwd=True` or `worktree=True`).
+
+## jobs
+
+With `job_ids`: waits up to `wait_seconds` for all or any of those jobs to end and returns each in full. A job still `queued` or `running` carries on. Without `job_ids`: lists recent jobs from every window of every host.
 
 | Argument | Default | What it does |
 |---|---|---|
-| `job_ids` | none | With ids: wait for these jobs and return each in full. Without: return a short list of recent jobs |
-| `wait_seconds` | 0 | How long to wait, at most 300 |
-| `wait_mode` | `all` | `all` waits for every job, `any` returns when the first one ends |
-| `status`, `backend`, `cwd`, `parent_run`, `limit` | none, `limit` 20 | Filters for the list. Ignored when `job_ids` is given |
+| `job_ids` | `None` | Job ids to wait for and return in full. Omit to list recent jobs |
+| `wait_seconds` | `0` | Wait up to this long (max 300, also capped under the host's tool-call limit). Used only with `job_ids` |
+| `wait_mode` | `"all"` | `"all"` waits until every found job ends; `"any"` returns when the first ends |
+| `response_offset` | `0` | Character offset into the stored `response` (must be `>= 0`) |
+| `response_chars` | `20000` | Characters to return per page (clamped to 1–100000) |
+| `response_file` | `False` | Write each finished non-empty reply to `<state_dir>/replies/<job_id>.md` and return `response_file`, `response_head` and `response_total_chars` |
+| `verbose` | `False` | Add full token breakdown, `provider_metrics` and multi-attempt `attempts` |
+| `status` | `None` | List-mode filter: `queued`, `running`, `completed`, `failed`, `cancelled` or `timed_out` |
+| `backend` | `None` | List-mode filter by backend |
+| `cwd` | `None` | List-mode filter by working folder |
+| `parent_run` | `None` | List-mode filter by `parent_run` |
+| `limit` | `20` | Maximum rows returned in list mode |
 
-The list covers jobs from every window of every host. A wait that ends with a job still `queued` or `running` leaves it running: call again.
+With `job_ids`, returns `jobs`, `all_done`, `any_done`, and `wait_note` (only when the wait was shortened and the wait condition was not met). An unknown id appears in `jobs` with `status: "not_found"` and an `error`.
 
-## cancel_job
+```json
+{
+  "jobs": [
+    {
+      "line": "codex · requested gpt-6.2-sol · high · completed 1m12s · review auth · codex",
+      "job_id": "codex-1a2b3c4d",
+      "status": "completed",
+      "backend": "codex",
+      "model": "gpt-6.2-sol",
+      "model_source": "requested",
+      "effort": "high",
+      "quota_pool": "codex",
+      "mode": "read_only",
+      "session_id": "019a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8",
+      "response": "No race found in ...",
+      "usage": {"total_tokens": 3692345}
+    }
+  ],
+  "all_done": true,
+  "any_done": true
+}
+```
 
-Stops one job by `job_id` and kills its subprocesses.
+Without `job_ids`, returns `{"count": N, "jobs": [...]}` where each entry has `line`, `job_id`, `status`, `prompt_preview`, and (on non-completed terminal jobs) `failure_reason`.
 
-- It cancels jobs started from this window.
-- A job owned by another live window must be cancelled from that window.
-- A job whose window has closed is marked `failed` with `owner_exited` instead.
+Refused as a tool error when `response_offset < 0` or a list-mode `status` or `backend` filter is unknown.
+
+## cancel
+
+Stops a queued or running job that this window started, terminates its subprocess tree, and returns its job detail.
+
+| Argument | Default | What it does |
+|---|---|---|
+| `job_id` | required | The job to stop |
+
+- A job owned by this window is stopped and returned as `cancelled`. If `agy` had already reported that its server-side turn may still be running, `provider_state` stays `"possibly_running"` and resuming that session requires `confirm_prior_job_id`.
+- A job whose owning window has closed is marked `failed` with `owner_exited` and returned.
 - A job that already ended is returned unchanged.
 
 ```json
-{"job_id": "neon-5e6f7a8b", "status": "cancelled", "failure_reason": "cancelled", "provider_state": "stopped",
- "error": "Job cancelled.",
- "retry_guidance": "Subprocess tree was verified stopped. For edit tasks inspect git status/diff before retrying."}
+{
+  "line": "codex · requested gpt-6.2-sol · high · cancelled 4s · codex",
+  "job_id": "codex-1a2b3c4d",
+  "status": "cancelled",
+  "backend": "codex",
+  "model": "gpt-6.2-sol",
+  "model_source": "requested",
+  "effort": "high",
+  "quota_pool": "codex",
+  "mode": "read_only",
+  "response": "",
+  "usage_status": "missing",
+  "failure_reason": "cancelled",
+  "provider_state": "stopped",
+  "retry_guidance": "Subprocess tree was verified stopped. For edit tasks inspect git status/diff before retrying.",
+  "error": "Job cancelled."
+}
 ```
 
-## review_code
+Refused as a tool error when `job_id` does not exist or belongs to another live bridge window ("must be cancelled from that window").
 
-A read-only code review by one backend or by several at once.
+## usage
 
-| Argument | Default | What it does |
-|---|---|---|
-| `cwd` | where the host started the bridge | The repository |
-| `backends` | `["neon", "codex"]` | Who reviews. Add `"claude"` to include it |
-| `scope` | `uncommitted` | `uncommitted`, `base` (the diff against a branch) or `commit` (one commit) |
-| `base` | `main` | The branch for `scope="base"` |
-| `commit` | none | The commit for `scope="commit"`. Required there |
-| `focus` | none | What to look for, in your words |
-| `neon_model`, `codex_model`, `claude_model` | the defaults | The model for each side |
-| `effort` | the default | Applied to the backends chosen |
-| `wait`, `timeout_seconds`, `wait_seconds`, `parent_run` | as `run_parallel` | |
-
-Notes:
-
-- With no `focus`, Codex runs its own built-in review (`codex exec review`). With a `focus`, Codex gets a written review prompt instead, as `agy` always does.
-- To review with Claude or GPT through `agy`, pass `backends=["neon"]` and set `neon_model`, for example `"claude-opus"`. A name such as `agy-opus` in `backends` only selects `agy`; it does not choose the model here.
-- To review with Claude Code itself, pass `backends=["claude"]`. It gets the written review prompt and runs `read_only`.
-
-The reply has `scope`, `base`, `commit`, `all_done` and `reviews`, one result per backend.
-
-## get_usage
-
-What the bridge has run, and optionally how much quota is left.
+Reports what the bridge ran in a period, and optionally what subscription quota is left across every pool.
 
 | Argument | Default | What it does |
 |---|---|---|
-| `period` | `today` | `session` (this window only), `today`, `7d`, `30d`, `all`. All but `session` count every window |
-| `backend`, `quota_pool`, `cwd`, `parent_run` | none | Filters |
-| `compact` | `False` | A short planning view: no per-model table and no recent list |
-| `include_quota` | `False` | Also read the live quota of each pool. See [Quota and usage](quota-and-usage.md) |
-| `refresh_quota` | `False` | Skip the cache and read the quota again |
-| `recent_limit` | 10 | How many recent runs to list |
+| `period` | `None` | `"today"` (default when `since`/`until` are omitted), `"7d"`, `"30d"`, `"all"` or `"session"` (this window only) |
+| `since` | `None` | Local date (`YYYY-MM-DD`) or ISO time (`YYYY-MM-DDTHH:MM`). Cannot be combined with `period` |
+| `until` | `None` | End bound. A date alone includes that whole day. Cannot be combined with `period` |
+| `backend` | `None` | Filter `view="summary"` by backend |
+| `cwd` | `None` | Filter `view="summary"` by working folder |
+| `parent_run` | `None` | Filter `view="summary"` by `parent_run` |
+| `quota` | `False` | Add `quota` with all four pools in one shape and their routing `order` (about 10 s when read live; call before a fan-out) |
+| `view` | `"summary"` | `"summary"` returns compact period totals and `by_quota_pool`; `"dashboard"` returns `text` ready to show unchanged (reads without writing to the database or quota cache) |
+| `verbose` | `False` | On `"summary"`, adds per-pool `tokens`, `usage_coverage`, `attempts` (when different from `runs`) and `partial_total_tokens`. On `"dashboard"`, adds the dashboard's structured figures (without duplicating `quota`) |
 
-## usage_dashboard
+Example reply for `usage(period="today", quota=True)`:
 
-What is left of each subscription, then what the bridge has run in a period.
+```json
+{
+  "scope": {"period": "today", "from": "2026-11-27T00:00:00+05:30"},
+  "totals": {"runs": 2, "completed": 2, "duration_seconds": 48.5, "total_tokens": 140200},
+  "by_quota_pool": {
+    "codex": {"runs": 2, "completed": 2, "duration_seconds": 48.5, "total_tokens": 140200}
+  },
+  "note": "Tokens are counted for finished runs whose CLI reported an exact or per-turn count; runs_without_full_count says how many are left out.",
+  "quota": {
+    "read_at": "2026-11-27T21:40:00+00:00",
+    "pools": [
+      {
+        "pool": "codex",
+        "backend": "codex",
+        "label": "Codex CLI",
+        "five_hour": {"left_percent": 71, "resets_in": "2h 16m", "reset_time": "2026-11-28T00:00:00+00:00", "state": "ok"},
+        "weekly": {"left_percent": 30, "resets_in": "1d 3h", "reset_time": "2026-11-29T00:44:00+00:00", "state": "expiring"},
+        "priority": "use_before_reset",
+        "note": "30% of the week unused, resets in 1d 3h"
+      }
+    ],
+    "order": ["codex", "agy_claude_gpt", "agy_gemini"],
+    "unread": [],
+    "summary": "Use codex first (30% weekly unused, resets in 1d 3h)."
+  }
+}
+```
 
-The view opens with the quota left in every pool: Codex, Antigravity's two pools and the Claude plan, each with the 5h and weekly windows its reading holds, as a bar with the percent left, its reset and the time it was read. A window the reading does not hold says `no reading`; a Claude job can report one window only. Those readings come from each CLI, as [`get_usage`](#get_usage) with `include_quota` reads them, and take about 10 seconds. Below it is everything the bridge has run in the period, by quota pool and model, read from the bridge's own records and nothing else.
+With `view="dashboard"`, the reply is `{"text": "..."}` (plus the dashboard figures when `verbose=True`, and `quota` when `quota=True`). The dashboard opens with all four pools' 5h and weekly windows, followed by runs, outcomes, time and tokens by backend, pool and model from the bridge's own records. Totals include only finished runs with an `exact` or `delta` count; everything else is listed apart under `not_in_totals`:
 
-It only reads: it writes nothing to the database, and a quota reading it takes is not put in the cache. It also answers in a bridge that runs inside a bridge job. The [usage dashboard skill](quota-and-usage.md#the-usage-dashboard-skill) is the easy way to call it.
+| Entry in `not_in_totals` | What it is |
+|---|---|
+| `running_or_queued` | Jobs still active in open windows, with any tokens already recorded for earlier attempts |
+| `partial_counts` | A count for a turn that did not finish cleanly; may be short |
+| `cli_started_no_count` | The CLI started but left no count (cancelled, timed out, failed, or Codex's built-in review) |
+| `cannot_tell` | Runs the records cannot speak for: `window_closed`, `job_row_pruned`, or `end_not_confirmed` |
+| `claude_subagents` | Claude runs whose reported count covers only the main agent while native subagents ran |
+| `claude_subagents_not_on_record` | Claude runs that did not record whether native subagents ran |
+| `before_records_begin` | Set when the period reaches before the bridge's first record |
+
+See [Quota and usage](quota-and-usage.md) for the full `quota` shape and pool rules.
+
+Refused as a tool error when:
+
+- Both `period` and `since`/`until` are passed.
+- `period` is unknown, `since` or `until` is not a valid date/ISO time, or `since >= until`.
+- `backend`, `cwd` or `parent_run` is passed with `view="dashboard"`.
+- `backend` is unknown.
+
+## backends
+
+Checks each CLI's health and version, reports backend defaults, `agy`'s live models and shortcuts, the detected `host` and its `wait_cap` in seconds, and whether the bridge is nested.
 
 | Argument | Default | What it does |
 |---|---|---|
-| `period` | `today` | `today` (since local midnight), `7d`, `30d`, `all`, or `session` (this window only) |
-| `since`, `until` | none | Instead of `period`: a local date such as `2026-11-25`, or an ISO time such as `2026-11-25T14:30`. A date alone as `until` takes in that whole day. Giving both `period` and one of these is refused |
+| `refresh_models` | `False` | Read `agy models` again instead of using the 15-minute cache |
 
-What the reply holds:
+```json
+{
+  "host": "claude-code",
+  "wait_cap": null,
+  "default_cwd": "C:\\work\\repo",
+  "default_timeout_seconds": 300,
+  "max_concurrent_jobs_per_process": 8,
+  "db_path": "C:\\Users\\me\\.agent-bridge\\bridge.db",
+  "nesting": {"nested": false},
+  "backends": {
+    "neon": {"backend": "neon", "cli": "agy", "default_intent": "neon-high", "command_found": true, "healthy": true, "available": true, "version": "1.5.18"},
+    "codex": {"backend": "codex", "cli": "codex", "default_model": "gpt-6.2-sol", "default_effort": "high", "command_found": true, "healthy": true, "available": true, "version": "codex-cli 0.172.0"},
+    "claude": {"backend": "claude", "cli": "claude", "quota_pool": "claude", "default_model": "sonnet", "default_effort": "high", "command_found": true, "healthy": true, "available": true, "version": "2.1.332 (Claude Code)"}
+  }
+}
+```
 
-- `text`: the whole view as fixed-width text, ready to show as it is. It is rendered from the same figures as the rest of the reply. A caveat is shown only when there is something under it; the rest of the reply always holds every entry.
-- `quota`: what is left in every pool, in a fixed order: `codex`, `agy_gemini`, `agy_claude_gpt`, `claude`. A pool that was read has `five_hour` and `weekly` (each with `remaining_percent`, `resets_in`, `reset_time`, `read_at` and a `state` of `ok`, `not_started`, `exhausted` or `reset_passed`; `None` when the CLI reported no such window), `as_of` and `read_at` (when it was read: the time of its oldest window), `source` (`live`, `cached`, or `last_claude_job`) and `priority`. A pool that could not be read, or whose reading holds neither window, has status `unknown` and a `reason`; one backend failing does not hide the others. `notes` holds the lines worth acting on, such as a week about to reset with quota unused. The period does not change this section.
-- `covers` and `not_covered`: it covers jobs run through the bridge only. Not in it: the host session's own tokens, a host's own subagents, and CLI runs made outside the bridge. The view says so in its footer.
-- `totals`: runs, their outcomes, time and tokens.
-- `this_session` and `other_sessions`: the same figures split between the calling window and every other window. The two add up to `totals`.
-- `by_backend`, `by_quota_pool`, `by_model`: each adds up to `totals`. Every backend and pool is listed, with zeros where nothing ran. Each model carries its `quota_pool`.
-- `not_in_totals`: what the records cannot vouch for, by job id. None of it is added in.
-- `counted_as_nothing_spent`: runs whose CLI was never started.
+A missing or broken CLI does not fail the tool call; its entry sets `command_found`, `healthy` or `available` to `false` with an `error`.
 
-Rules the figures follow:
-
-- A run counts in the period its record was written, which is when it finished. A retried run counts once, under the model its last attempt ran on. Each attempt's tokens go to the model that attempt ran on.
-- Totals hold tokens only from finished runs with an `exact` or `delta` count.
-- Listed apart under `not_in_totals`, and never added in:
-
-  | Entry | What it is |
-  |---|---|
-  | `running_or_queued` | Jobs not finished yet, in windows that are still open, with any tokens already recorded for an earlier attempt |
-  | `partial_counts` | A count for a turn that did not finish cleanly. It is shown, but it may be short |
-  | `cli_started_no_count` | The CLI was started but left no count: cancelled, timed out, failed, or a CLI that reports none, such as Codex's built-in review |
-  | `cannot_tell` | Runs the records cannot speak for, each with a `reason`: `window_closed` (the window that ran the job closed before it finished, whether or not a later window has marked it `owner_exited` yet), `job_row_pruned` (no count, and the job's row has been pruned; the newest 500 are kept unless `AGENT_BRIDGE_MAX_STORED_JOBS` says otherwise), or `end_not_confirmed` (no count, and the bridge could not confirm whether the CLI ran or stopped) |
-  | `claude_subagents` | Claude runs that started subagents whose tokens are outside the reported count, including resumed sessions |
-  | `claude_subagents_not_on_record` | Claude runs that did not record whether they started subagents: written before the bridge kept that count, or Claude Code did not report it |
-  | `before_records_begin` | Set when the period reaches back before the bridge's first record. That stretch is not covered, which is not the same as zero |
-
-- A job whose row still says queued or running, but whose window has closed, is found by reading the owners table. Unlike `get_usage`, the dashboard does not mark it failed; it lists it under `cannot_tell` as `window_closed`.
-- The quota readings are not bridge records, and no figure from them is added to a total. The Claude plan has no live read-out: its reading is what the Claude jobs run through the bridge reported. Each window is kept until its own reset passes and carries the time it was read, so the week stays on show after the 5h window has reset. The pool says `no reading` when no window is left.
-- Left out on purpose: Claude Code's cost estimate, which is not a bill and repeats earlier turns on a resume.
-
-## list_backends
-
-Shows what the bridge found on this machine: each CLI's path, version and health, the live `agy` model list with what every shortcut resolves to, the Codex and Claude defaults, the database path, the default timeout, the concurrency cap, and `nesting` (whether this bridge is itself running inside a bridge job).
-
-| Argument | Default | What it does |
-|---|---|---|
-| `refresh_models` | `False` | Read `agy models` again instead of using the cache |
-| `include_quota` | `False` | Add the quota reading and advice |
-
-# Reading a result
+# Reading a job reply
 
 ## Status
 
 | `status` | Meaning |
 |---|---|
-| `queued` | Waiting for a free slot, or for an earlier turn on the same session |
+| `queued` | Waiting for a concurrency slot or for an earlier turn on the same session |
 | `running` | The CLI is working |
-| `completed` | The CLI exited cleanly |
+| `completed` | The CLI exited cleanly and emitted its final event |
 | `failed` | It did not. Read `failure_reason` and `error` |
-| `timed_out` | The deadline passed |
-| `cancelled` | You cancelled it |
+| `timed_out` | The job's deadline passed |
+| `cancelled` | The job was cancelled |
 
-`completed` means the process ended well, not that the job did what you asked. A job can complete with a short or empty `response`. Always read the reply.
+`completed` only means the process ended cleanly, not that the job did what you asked. A job that completes with an empty reply carries a `warning`. Always read `response`.
 
-## Fields
+## Job detail fields
+
+Null fields are omitted.
 
 | Field | Meaning |
 |---|---|
-| `response` | The subagent's final message |
-| `session_id` | Keep it, or the `job_id`, to resume |
-| `model`, `requested_model`, `model_notice` | What ran, what you asked for, and why they differ if they do |
-| `cwd`, `effective_cwd` | The folder asked for and the folder used. They differ for a worktree job |
-| `worktree_path`, `worktree_branch`, `worktree_commit` | Where a worktree job's edits are |
-| `usage`, `usage_status` | Tokens for this turn, and how sure the count is (`exact`, `delta`, `partial`, `missing`) |
-| `failure_reason`, `provider_state`, `retry_guidance`, `error`, `stderr_tail` | Present when the job did not complete |
-| `last_activity` | What a running job is doing |
+| `line` | One-line summary: backend, model, effort, status and duration, current activity (while running), label, pool |
+| `job_id`, `status`, `backend`, `mode`, `quota_pool` | Job identity and mode |
+| `model`, `model_source`, `requested_model`, `model_notice` | Model name (omitted when only the CLI's default is known), how it is known (`observed`, `requested` or `default`), the requested name when it differs, and any fallback or billing notice |
+| `effort`, `session_id`, `parent_run` | Effort level, resumable session id, and group label |
+| `effective_cwd` | Included only when different from the requested `cwd` (such as inside a worktree) |
+| `worktree_path`, `worktree_branch` | Present on worktree jobs |
+| `response` | Paged reply text (default up to 20,000 chars, max 100,000). Omitted when `response_file=True` writes a file |
+| `response_offset`, `response_truncated`, `response_total_chars`, `next_offset`, `response_note` | Present when a reply is paged or was cut at the 200,000-character storage cap |
+| `response_file`, `response_head`, `response_total_chars` | Returned instead of `response` when `response_file=True` wrote the full stored reply to `<state_dir>/replies/<job_id>.md`; `response_head` is the first 400 characters |
+| `warning` | Present on an empty completed reply, or when `response_file=True` fell back to a paged reply |
+| `usage`, `usage_status` | `{"total_tokens": N}` by default (full token breakdown with `verbose=True`). `usage_status` is omitted when `"exact"` and shown for `"delta"`, `"partial"` or `"missing"` |
+| `failure_reason`, `provider_state`, `retry_guidance`, `error`, `exit_code`, `cleanup_seconds`, `stderr_tail` | Present on non-completed terminal jobs |
+| `provider_metrics`, `attempts` | Included only with `verbose=True` (`attempts` when more than one attempt ran) |
 
-A bad argument (an unknown backend, a folder that does not exist, `worktree=True` without `edit`) is refused as a tool error before any job is made. The error carries the reason in words, for example `Unknown backend 'bogus'. Expected one of: ...`. A bridge that runs inside a bridge job refuses the job-starting tools the same way, with `nested_bridge`: see [A bridge inside a bridge](safety.md#a-bridge-inside-a-bridge).
+## Paging and reply files
 
-## When a job fails
+Replies are stored up to 200,000 characters in `bridge.db` and returned in pages of `response_chars` (default 20,000, max 100,000) starting at `response_offset`. When more text remains, the reply sets `response_truncated: true`, `response_total_chars`, `next_offset`, and a `response_note` with the next `jobs` call. If the CLI produced more than 200,000 characters, the final page notes that only the first 200,000 were kept.
+
+Pass `response_file=True` on `run` or `jobs` to keep a long reply out of the conversation. On a finished job with a non-empty reply, the bridge writes the full stored reply atomically to `<state_dir>/replies/<job_id>.md` and returns `response_file`, `response_head` (first 400 characters) and `response_total_chars`. If the file cannot be written, it falls back to the normal paged reply with a single-line `warning`. Running jobs and empty replies write no file.
+
+## Failure reasons
 
 | `failure_reason` | Meaning | What to do |
 |---|---|---|
-| `timeout` | The bridge's deadline passed, queue time included | Raise `timeout_seconds`, or run it in the background |
-| `provider_timeout_still_running` | `agy` reports that its turn may still be running on the server | Read `error` for the real cause, wait, then resume with a confirm flag |
-| `quota_exceeded` | The pool is out of quota | Check `get_usage`, use another pool |
-| `auth_error` | The CLI is not signed in | Sign in to that CLI again |
-| `model_unavailable` | The model was rejected, or the pool has no model to offer | `list_backends` with `refresh_models=True`, or name another model |
-| `transient_service` | A network or server error | Try again. For an edit job, look at `git diff` first |
-| `interactive_fallback` | `agy` wanted an approval that nobody can give | Use Codex in `edit` mode with a worktree |
-| `permission_error` | The sandbox refused something, or `agy` or `claude` was denied an action it could not ask about and ended the turn with no reply | Use `edit` or `extra_dirs` if you meant to allow it. For `agy`, resume and tell it to use its file tools, or add an allow rule in `agy`'s `settings.json` |
-| `cli_error` | Anything else, a missing CLI included | Read `error` and `stderr_tail`; run `list_backends` |
+| `timeout` | The job's deadline passed, queue and session wait included | Raise `timeout_seconds` |
+| `provider_timeout_still_running` | `agy` reported its server-side turn may still be running | Read `error` (sometimes quota), wait until it stops, then resume with `confirm_prior_job_id` |
+| `quota_exceeded` | The pool is out of quota or rate limited | Call `usage(quota=True)` and use another pool |
+| `auth_error` | The CLI is not signed in | Sign in to that CLI again (or add an API key variable to `AGENT_BRIDGE_CHILD_ENV_KEEP` if using key auth) |
+| `model_unavailable` | The model was rejected, or the pool has no model to offer | Call `backends(refresh_models=True)` or pick another model |
+| `transient_service` | A network or server error | Retry a read-only task; inspect `git status`/`git diff` first on an edit task |
+| `interactive_fallback` | `agy` fell back to interactive approval prompts | Use `codex` with `mode="edit"` and `worktree=True` |
+| `permission_error` | The sandbox denied an action, or `agy`/`claude` was denied an action and ended with no reply | Use `mode="edit"` or `extra_dirs` if writes were intended, or tell the agent to use file tools |
+| `cli_error` | Any other CLI failure, missing CLI, a session held by another job, or a stream that ended without its final event | Read `error` and `stderr_tail`, check `backends`, and inspect `git diff` on edit tasks |
 | `launch_error` | The subprocess could not be started safely | Read `error` |
-| `cancelled` | Cancelled | For an edit job, look at `git diff` |
-| `prior_turn_uncertain` | An earlier turn on this session may not have stopped | See [Resuming a session](troubleshooting.md#resuming-a-session) |
-| `worktree_missing` | The session's worktree was deleted | Resume with `relocate_cwd=True` and a `cwd`, or with `worktree=True` |
-| `owner_exited` | The host window that owned the job closed | Check what it did, then run it again |
+| `cancelled` | The job was cancelled | Inspect `git status`/`git diff` on edit tasks |
+| `prior_turn_uncertain` | An earlier turn on this session ended with `possibly_running` or `unknown` | Confirm that turn ended and pass `confirm_prior_job_id` |
+| `worktree_missing` | The resumed session's recorded worktree no longer exists | Resume with `relocate_cwd=True` and `cwd`, or with `worktree=True` and `mode="edit"` |
+| `owner_exited` | The host window that started the job closed before it finished | Inspect what it left, then run again |
+
+A stream that exits 0 without its final event fails with `failure_reason: "cli_error"`, keeps any partial `response`, and is never auto-retried. The exact `error` text is:
+
+- Codex (outside built-in plain-text review): `the CLI's output ended without its final event (turn.completed), so the run may have been cut short; any partial reply is kept`
+- `agy`: `the CLI's output ended without its final event (a result event with a status), so the run may have been cut short; any partial reply is kept`
+- Claude: `claude ended without a result event; its output was cut short`
 
 | `provider_state` | Meaning |
 |---|---|
-| `stopped` | The subprocesses were checked and are gone |
-| `possibly_running` | The bridge could not confirm that, or `agy`'s turn may go on at the server |
-| `unknown` | The owning window died mid-run |
+| `stopped` | Subprocess tree was verified gone |
+| `possibly_running` | Termination could not be verified, or `agy` reported the server-side turn may still be running |
+| `unknown` | The owning window exited mid-run |
 
 ## What the bridge retries by itself
 
 - A rejected model: once, with another model in the same pool (`agy`) or Codex's default. Not on `claude`.
-- A network or server error: once, only for a new `read_only` job that had made no progress.
-- Nothing else. No retry on a timeout, on quota, on sign-in, or on any `edit` job.
+- A `transient_service` error: once, only for a new `read_only` job that made no progress.
+- Nothing else: no auto-retry on timeouts, quota, auth, cut-short streams, resumed sessions, or any `edit` job.
