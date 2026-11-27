@@ -127,7 +127,7 @@ def read_snapshot(
     parent_run: str | None = None,
     finished_limit: int = DEFAULT_FINISHED_LIMIT,
     pid_alive: Callable[[int], bool] = _pid_alive,
-) -> dict[str, list[dict[str, Any]]] | None:
+) -> dict[str, Any] | None:
     """`{"active": [...], "finished": [...]}`, or None when there is no database.
 
     Raises SnapshotError when the file exists but cannot be read read-only. Never writes.
@@ -231,7 +231,8 @@ def read_snapshot(
         else:
             finished.append(job)
     finished.sort(key=lambda j: float(j.get("finished_at") or j.get("created_at") or 0), reverse=True)
-    return {"active": active, "finished": finished[: max(0, finished_limit)]}
+    # The cap is never silent: the total travels with the rows.
+    return {"active": active, "finished": finished[: max(0, finished_limit)], "finished_total": len(finished)}
 
 
 # --- Rendering ----------------------------------------------------------------------------------
@@ -273,7 +274,7 @@ def _render_rows(jobs: Sequence[Mapping[str, Any]], *, now: float, width: int | 
 
 
 def render_table(
-    snapshot: Mapping[str, list[dict[str, Any]]],
+    snapshot: Mapping[str, Any],
     *,
     now: float,
     width: int | None,
@@ -292,7 +293,9 @@ def render_table(
         title = "Finished" if include_all else f"Finished in the last {_minutes(recent_minutes)}"
         lines.append("")
         if finished:
-            lines.append(f"{title} ({len(finished)})")
+            total = int(snapshot.get("finished_total", len(finished)))
+            count = f"{len(finished)} of {total}, --limit to show more" if total > len(finished) else str(total)
+            lines.append(f"{title} ({count})")
             lines += _render_rows(finished, now=now, width=width)
         else:
             lines.append(f"{title}: none.")
@@ -316,7 +319,7 @@ def _job_json(job: Mapping[str, Any], *, now: float) -> dict[str, Any]:
 
 
 def render_json(
-    snapshot: Mapping[str, list[dict[str, Any]]] | None, *, db_path: Path, now: float
+    snapshot: Mapping[str, Any] | None, *, db_path: Path, now: float
 ) -> str:
     import json
 
@@ -326,13 +329,14 @@ def render_json(
         "now": round(now, 3),
         "active": [_job_json(j, now=now) for j in (snapshot or {}).get("active", [])],
         "finished": [_job_json(j, now=now) for j in (snapshot or {}).get("finished", [])],
+        "finished_total": int((snapshot or {}).get("finished_total", 0)),
     }
     if snapshot is None:
         payload["message"] = _missing_sentence(db_path)
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def _running(snapshot: Mapping[str, list[dict[str, Any]]] | None) -> list[dict[str, Any]]:
+def _running(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     """Jobs that are really running: a closed window's job is not, so it never pins a status line."""
     return [j for j in (snapshot or {}).get("active", []) if not j.get("window_closed")]
 
@@ -417,7 +421,7 @@ def _enable_vt() -> None:
         pass
 
 
-def _snapshot(args: argparse.Namespace, db_path: Path, now: float) -> dict[str, list[dict[str, Any]]] | None:
+def _snapshot(args: argparse.Namespace, db_path: Path, now: float) -> dict[str, Any] | None:
     return read_snapshot(
         db_path,
         now=now,

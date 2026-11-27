@@ -281,6 +281,23 @@ def test_table_lists_running_then_recent_and_recent_zero_hides_them(
     assert "neon-ancient" in out and "neon-done" in out
 
 
+def test_finished_rows_are_capped_and_the_cap_is_shown(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    state = tmp_path / "state"
+    store = _store(state)
+    _live_owner(store)
+    now = time.time()
+    for i in range(25):
+        _add(store, job_id=f"done-{i:02d}", status="completed", finished_at=now - 100 + i, duration_seconds=1.0)
+    rc, out, _ = _run(capsys, state)
+    assert "Finished in the last 10 minutes (20 of 25, --limit to show more)" in out
+    assert "done-24" in out and "done-04" not in out  # the newest first
+    rc, out, _ = _run(capsys, state, "--limit", "30")
+    assert "Finished in the last 10 minutes (25)" in out
+    rc, out, _ = _run(capsys, state, "--json")
+    data = json.loads(out)
+    assert len(data["finished"]) == 20 and data["finished_total"] == 25
+
+
 def test_json_mode_is_one_snapshot(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     state = tmp_path / "state"
     store = _store(state)
