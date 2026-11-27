@@ -1,7 +1,7 @@
 """`agent-bridge install` and `agent-bridge doctor`.
 
 `install` writes this bridge into a host's MCP configuration, with the tool-call limit and the
-approval rule the bridge needs, offers the status line and the usage skill, and says what is left
+approval rule the bridge needs, offers the status line and the skills, and says what is left
 to do by hand. For each file it shows a unified diff and asks before writing; it keeps a backup;
 it merges and never overwrites; a second run changes nothing. A file it cannot edit safely is left
 alone and the snippet to paste is printed instead.
@@ -42,7 +42,8 @@ from agent_bridge import hosts as hosts_mod
 from agent_bridge.hosts import HOSTS, SERVER_NAME, WANTED_TIMEOUT_SECONDS, Host, Roots, Source
 
 ENV_PARENT_JOB = "AGENT_BRIDGE_PARENT_JOB"  # the same name as nesting.ENV_PARENT_JOB
-SKILL_NAME = "bridge-usage"
+# The skills under skills/ that the wheel ships (pyproject.toml force-include) and install offers.
+SKILL_NAMES = ("bridge-usage", "bridge-routing")
 LAST_STEP = "restart the host, or reconnect agent-bridge in it"
 DOCS_WARNING = "written from documentation, not tested on this machine"
 
@@ -607,17 +608,22 @@ def status_command(command: str, args: Sequence[str], *, script: str = "") -> st
     return _windows_status_command(argv)
 
 
-def packaged_skill() -> bytes:
-    """The SKILL.md shipped in the wheel, or the checkout's copy in a source install."""
+def skill_label(name: str) -> str:
+    """The label of a skill's file edit: "usage skill" for bridge-usage."""
+    return name.removeprefix("bridge-") + " skill"
+
+
+def packaged_skill(name: str) -> bytes:
+    """The skill's SKILL.md shipped in the wheel, or the checkout's copy in a source install."""
     from importlib import resources
 
     try:
-        resource = resources.files("agent_bridge") / "skills" / SKILL_NAME / "SKILL.md"
+        resource = resources.files("agent_bridge") / "skills" / name / "SKILL.md"
         if resource.is_file():
             return resource.read_bytes()
     except (FileNotFoundError, ModuleNotFoundError):
         pass
-    checkout = Path(__file__).resolve().parents[2] / "skills" / SKILL_NAME / "SKILL.md"
+    checkout = Path(__file__).resolve().parents[2] / "skills" / name / "SKILL.md"
     return checkout.read_bytes()
 
 
@@ -865,11 +871,12 @@ def plan_skill(host: Host, roots: Roots, opts: Options, planner: Planner, seen: 
     template = host.skills_user if opts.scope == "user" else host.skills_project
     if template is None or not usable(host.skills_source):
         return
-    path = roots.path(template) / SKILL_NAME / "SKILL.md"
-    if path in seen:
-        return
-    seen.add(path)
-    planner.raw_files[path] = ("usage skill", packaged_skill())
+    for name in SKILL_NAMES:
+        path = roots.path(template) / name / "SKILL.md"
+        if path in seen:
+            continue
+        seen.add(path)
+        planner.raw_files[path] = (skill_label(name), packaged_skill(name))
 
 
 def expand_register(argv: Sequence[str], opts: Options) -> list[str]:
@@ -941,8 +948,8 @@ class Session:
         label = ", ".join(edit.labels)
         state = "new file" if edit.raw_old is None else "changes"
         self.out(f">> {edit.path} ({label}; {state})")
-        if edit.raw_old is None and edit.labels == ["usage skill"]:
-            self.out(f"(the packaged {SKILL_NAME}/SKILL.md, {len(edit.new_text.splitlines())} lines)")
+        if edit.raw_old is None and edit.labels in ([skill_label(name)] for name in SKILL_NAMES):
+            self.out(f"(the packaged {edit.path.parent.name}/SKILL.md, {len(edit.new_text.splitlines())} lines)")
             return
         diff = difflib.unified_diff(
             edit.old_text.splitlines(keepends=True),
@@ -1099,7 +1106,7 @@ def _install_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", "-y", action="store_true", help="accept every change without asking")
     parser.add_argument("--approve", action="store_true", help="also pre-approve the bridge's tools where the host does not need it for headless runs")
     parser.add_argument("--no-status-line", dest="status_line", action="store_false", help="do not offer the status line")
-    parser.add_argument("--no-skill", dest="skill", action="store_false", help="do not offer the usage skill")
+    parser.add_argument("--no-skill", dest="skill", action="store_false", help="do not offer the skills")
     parser.add_argument("--home", type=Path, help="(for tests) treat DIR as the home folder; the real one is never read or written, and no host command is run")
     return parser
 
@@ -1300,7 +1307,7 @@ def _entry_command(host: Host, entry: Any) -> str | None:
     return command if isinstance(command, str) else None
 
 
-def check_host(host: Host, roots: Roots, path_lookup: PathLookup, skill: bytes) -> list[Check]:
+def check_host(host: Host, roots: Roots, path_lookup: PathLookup, skills: Mapping[str, bytes]) -> list[Check]:
     fix = f"agent-bridge install --host {host.name}"
     checks: list[Check] = []
     label = host.label
@@ -1355,14 +1362,15 @@ def check_host(host: Host, roots: Roots, path_lookup: PathLookup, skill: bytes) 
         else:
             checks.append(Check(f"{label}: approval", "warn", f"{approval.key} lacks {approval.value!r}: headless runs fail on bridge tools", fix))
     if host.skills_user and usable(host.skills_source):
-        skill_path = roots.path(host.skills_user) / SKILL_NAME / "SKILL.md"
-        current = _read_bytes(skill_path)
-        if current is None:
-            checks.append(Check(f"{label}: skill", "warn", f"missing at {skill_path}", fix))
-        elif current.replace(b"\r\n", b"\n") != skill.replace(b"\r\n", b"\n"):
-            checks.append(Check(f"{label}: skill", "warn", f"out of date at {skill_path}", fix))
-        else:
-            checks.append(Check(f"{label}: skill", "ok", str(skill_path)))
+        for name, skill in skills.items():
+            skill_path = roots.path(host.skills_user) / name / "SKILL.md"
+            current = _read_bytes(skill_path)
+            if current is None:
+                checks.append(Check(f"{label}: skill {name}", "warn", f"missing at {skill_path}", fix))
+            elif current.replace(b"\r\n", b"\n") != skill.replace(b"\r\n", b"\n"):
+                checks.append(Check(f"{label}: skill {name}", "warn", f"out of date at {skill_path}", fix))
+            else:
+                checks.append(Check(f"{label}: skill {name}", "ok", str(skill_path)))
     return checks
 
 
@@ -1414,12 +1422,12 @@ def run_doctor(
         raw = (env.get("AGENT_BRIDGE_STATE_DIR") or "").strip()
         state_dir = Path(raw).expanduser() if raw else roots.home / ".agent-bridge"
     checks = check_backends(env, path_lookup, runner or _version_runner)
-    skill = packaged_skill()
+    skills = {name: packaged_skill(name) for name in SKILL_NAMES}
     detected = hosts_mod.detect_installed(env, path_lookup, roots=roots, exists=_exists)
     if not detected:
         checks.append(Check("hosts", "warn", "no host found on this machine", "agent-bridge install --host NAME"))
     for host in detected:
-        checks += check_host(host, roots, path_lookup, skill)
+        checks += check_host(host, roots, path_lookup, skills)
     checks += check_state(args.state_dir.expanduser() if args.state_dir is not None else state_dir)
     if (env.get(ENV_PARENT_JOB) or "").strip():
         checks.append(Check("nesting", "fail", f"{ENV_PARENT_JOB} is set: a bridge started here refuses to start jobs", f"unset {ENV_PARENT_JOB} (it is meant only for a bridge's own subagents)"))
