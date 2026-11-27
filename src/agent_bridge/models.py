@@ -152,14 +152,6 @@ class JobRecord:
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
 
-    def elapsed_seconds(self) -> float:
-        if self.duration_seconds is not None:
-            return round(self.duration_seconds, 2)
-        if self.started_at is not None:
-            end = self.finished_at if self.finished_at is not None else time.time()
-            return round(max(0.0, end - self.started_at), 2)
-        return 0.0
-
     # --- Replies to a host ---
     #
     # Every reply about a job opens with its status line, then carries only what the host can act on.

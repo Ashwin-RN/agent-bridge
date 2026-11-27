@@ -82,26 +82,6 @@ EFFORT_ALIASES: dict[str, EffortLevel] = {
     "max": "xhigh",
 }
 
-QUOTA_POOL_ALIASES: dict[str, QuotaPool] = {
-    "agy_gemini": "agy_gemini",
-    "agy-gemini": "agy_gemini",
-    "gemini": "agy_gemini",
-    "neon": "agy_gemini",
-    "agy_claude_gpt": "agy_claude_gpt",
-    "agy-claude-gpt": "agy_claude_gpt",
-    "agy_3p": "agy_claude_gpt",
-    "agy-3p": "agy_claude_gpt",
-    "3p": "agy_claude_gpt",
-    "agy-claude": "agy_claude_gpt",
-    "agy-gpt": "agy_claude_gpt",
-    "claude_gpt": "agy_claude_gpt",
-    "codex": "codex",
-    "claude": "claude",
-    "claude-code": "claude",
-    "claude_code": "claude",
-    "anthropic": "claude",
-}
-
 _AGY_THIRD_PARTY_MODEL_RE = re.compile(
     r"(?:^|-)(claude|opus|sonnet|haiku|gpt|oss)(?:-|$)",
     re.I,
@@ -134,17 +114,6 @@ def resolve_backend_and_model_hint(
         return resolved_backend, model.strip()
     hinted = BACKEND_DEFAULT_MODEL_HINTS.get(key)
     return resolved_backend, hinted
-
-
-def normalize_quota_pool(value: str | None) -> QuotaPool | None:
-    if value is None or not value.strip():
-        return None
-    key = value.strip().lower()
-    if key not in QUOTA_POOL_ALIASES:
-        raise ValueError(
-            f"Unknown quota_pool {value!r}. Expected one of: agy_gemini, agy_claude_gpt, codex, claude."
-        )
-    return QUOTA_POOL_ALIASES[key]
 
 
 def classify_quota_pool(backend: str, model: str | None = None) -> QuotaPool:

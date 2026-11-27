@@ -160,6 +160,16 @@ async def test_jobs_waits_no_longer_than_the_bound(tmp_path: Path, monkeypatch: 
         await manager.shutdown()
 
 
+async def test_jobs_refuses_a_negative_response_offset(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        done = await _call(mcp, "run", {"backend": "codex", "prompt": "paged", "wait_seconds": 30})
+        with pytest.raises(Exception, match="response_offset cannot be negative"):
+            await mcp.call_tool("jobs", {"job_ids": [done["job_id"]], "response_offset": -1})
+    finally:
+        await manager.shutdown()
+
+
 async def test_jobs_list_is_short(tmp_path: Path) -> None:
     mcp, manager = _bridge(tmp_path)
     try:

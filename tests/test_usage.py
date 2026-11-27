@@ -263,8 +263,10 @@ def test_sqlite_usage_scopes_coverage_and_compact(tmp_path: Path) -> None:
     assert all_summary["overview"]["usage_coverage"]["missing"] == 1
 
     # A since/until bound applies on top of the period: records are kept by when they were written.
-    hour_ago = time.time() - 3600
+    hour_ago, in_a_minute = time.time() - 3600, time.time() + 60
     assert store.summarize_usage(period="all", owner_id="owner-1", since_ts=hour_ago)["overview"]["runs"] == 2
+    assert store.summarize_usage(period="all", owner_id="owner-1", since_ts=in_a_minute)["overview"]["runs"] == 0
+    assert store.summarize_usage(period="all", owner_id="owner-1", until_ts=in_a_minute)["overview"]["runs"] == 2
     assert store.summarize_usage(period="all", owner_id="owner-1", until_ts=hour_ago)["overview"]["runs"] == 0
 
 

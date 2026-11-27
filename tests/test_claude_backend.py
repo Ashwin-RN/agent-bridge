@@ -24,7 +24,6 @@ from agent_bridge.config import (
     Settings,
     classify_quota_pool,
     normalize_backend,
-    normalize_quota_pool,
     split_claude_model_and_effort,
 )
 from agent_bridge.jobs import JobManager
@@ -211,7 +210,6 @@ def test_claude_backend_names_and_pool_do_not_collide_with_agy_claude_models() -
     assert normalize_backend("claude") == "claude"
     assert normalize_backend("claude-code") == "claude"
     assert normalize_backend("agy-claude") == "neon"
-    assert normalize_quota_pool("claude") == "claude"
 
     for model in ("sonnet", "opus", "haiku", "fable", "claude-opus-5-5", None):
         assert classify_quota_pool("claude", model) == "claude"
