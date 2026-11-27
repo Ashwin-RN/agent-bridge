@@ -40,6 +40,7 @@ from typing import Any, Literal
 
 from agent_bridge import hosts as hosts_mod
 from agent_bridge.hosts import HOSTS, SERVER_NAME, WANTED_TIMEOUT_SECONDS, Host, Roots, Source
+from agent_bridge.nesting import CREDENTIAL_NAME_RE
 
 ENV_PARENT_JOB = "AGENT_BRIDGE_PARENT_JOB"  # the same name as nesting.ENV_PARENT_JOB
 # The skills under skills/ that the wheel ships (pyproject.toml force-include) and install offers.
@@ -260,13 +261,13 @@ def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise Unsafe(f"duplicate JSON object key {key!r}")
+            raise Unsafe("duplicate JSON object key")
         result[key] = value
     return result
 
 
-def _nonfinite_json_number(token: str) -> Any:
-    raise Unsafe(f"non-finite JSON number {token}")
+def _nonfinite_json_number(_token: str) -> Any:
+    raise Unsafe("non-finite JSON number")
 
 
 def _json_number(token: str, parse: type[int] | type[float]) -> int | float:
@@ -277,7 +278,7 @@ def _json_number(token: str, parse: type[int] | type[float]) -> int | float:
     if isinstance(value, float) and not math.isfinite(value):
         _nonfinite_json_number(token)
     if json.dumps(value) != token:
-        raise Unsafe(f"JSON number {token} would change on round trip")
+        raise Unsafe("a JSON number would change on round trip")
     return value
 
 
@@ -631,14 +632,94 @@ def packaged_skill(name: str) -> bytes:
 # A plan: the edits for one host, built from what is on disk now.
 
 
+_REDACTED = "<redacted>"
+_CREDENTIAL_TEXT = re.compile(
+    r"\bBearer[ \t]+[A-Za-z0-9._~+/\-=]+"
+    r"""|\b[a-z][a-z0-9+.-]*://[^\s/\\?#<>"'@]+@[^\s\\<>"']+""",
+    re.IGNORECASE,
+)
+_TOML_ASSIGNMENT = re.compile(r"""^(?:[^"'=\n]|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')+=""")
+
+
+def _redact_tokens(text: str) -> str:
+    return _CREDENTIAL_TEXT.sub(_REDACTED, text)
+
+
+def _redact_values(
+    value: Any, path: tuple[str, ...] = (), visible: frozenset[tuple[str, ...]] = frozenset()
+) -> Any:
+    if isinstance(value, dict):
+        private_values = any(key.casefold() in {"env", "headers"} for key in path)
+        return {
+            key: _REDACTED if private_values and (*path, key) not in visible
+            else _redact_values(item, (*path, key), visible)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_values(item, path, visible) for item in value]
+    if isinstance(value, str):
+        if any(CREDENTIAL_NAME_RE.search(key) or key.casefold() == "authorization" for key in path):
+            return _REDACTED
+        return _redact_tokens(value)
+    return value
+
+
+def _json_previews(old: str, new: str, ops: Iterable[JsonOp]) -> tuple[str, str]:
+    old_data = json.loads(old) if old.strip() else {}
+    new_data = json.loads(new)
+    added = frozenset(
+        op.path for op in ops if isinstance(op, SetKey)
+        and get_path(old_data, op.path) != op.value and get_path(new_data, op.path) == op.value
+    )
+    return (
+        _dump_json(_redact_values(old_data), "  ") + "\n" if old.strip() else "",
+        _dump_json(_redact_values(new_data, visible=added), "  ") + "\n",
+    )
+
+
+def _toml_preview(text: str) -> str:
+    """Keep TOML's lines and comments. Hide an entire assignment if any of its values are private."""
+    lines = iter(text.splitlines(keepends=True))
+    preview: list[str] = []
+    table: tuple[str, ...] = ()
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            preview.append(line)
+            continue
+        statement = line
+        while True:
+            try:
+                values = tomllib.loads(statement)
+                break
+            except tomllib.TOMLDecodeError:
+                continuation = next(lines, None)
+                if continuation is None:
+                    return "".join(preview) + _REDACTED + "\n"
+                statement += continuation
+        if line.lstrip().startswith("["):
+            # Parsing the header resolves quoted and escaped keys, including dots inside quotes.
+            table = ()
+            while values:
+                key, values = next(iter(values.items()))
+                table += (key,)
+                if isinstance(values, list):
+                    values = values[0]
+        elif values != _redact_values(values, table):
+            match = _TOML_ASSIGNMENT.match(line)
+            prefix = f"{match[0]} " if match else ""
+            statement = f'{prefix}"{_REDACTED}"\n' + "\n" * (statement.count("\n") - 1)
+        preview.append(statement)
+    return "".join(preview)
+
+
 @dataclass
 class FileEdit:
     path: Path
     labels: list[str]
     raw_old: bytes | None
     new_bytes: bytes
-    old_text: str
-    new_text: str
+    old_preview: str
+    new_preview: str
 
 
 @dataclass
@@ -703,6 +784,7 @@ class Planner:
                     new = new.rstrip("\n")
                 new_bytes = text.encode(new)
                 reformats = load_json(text.text)[2]
+                old_preview, new_preview = _json_previews(text.text, new, (op for _, op in items))
             except (Unsafe, OSError, UnicodeEncodeError, RecursionError) as exc:
                 self.snippets.append(
                     Snippet(str(path), _json_snippet_for(items), f"{path.name} not edited: {exc}")
@@ -710,7 +792,7 @@ class Planner:
                 continue
             if reformats:
                 labels.append("re-indents lines it does not change: read the whole diff")
-            edits.append(FileEdit(path, labels, raw, new_bytes, text.text, new))
+            edits.append(FileEdit(path, labels, raw, new_bytes, old_preview, new_preview))
         for path, (label, table, values, minimum_key) in self.toml_ops.items():
             try:
                 raw = _read_edit_bytes(path)
@@ -724,7 +806,7 @@ class Planner:
             if new is None:
                 self.already.append(f"{label} ({path})")
                 continue
-            edits.append(FileEdit(path, [label], raw, text.encode(new), text.text, new))
+            edits.append(FileEdit(path, [label], raw, text.encode(new), _toml_preview(text.text), _toml_preview(new)))
         for path, (label, data) in self.raw_files.items():
             try:
                 raw = _read_edit_bytes(path)
@@ -949,11 +1031,11 @@ class Session:
         state = "new file" if edit.raw_old is None else "changes"
         self.out(f">> {edit.path} ({label}; {state})")
         if edit.raw_old is None and edit.labels in ([skill_label(name)] for name in SKILL_NAMES):
-            self.out(f"(the packaged {edit.path.parent.name}/SKILL.md, {len(edit.new_text.splitlines())} lines)")
+            self.out(f"(the packaged {edit.path.parent.name}/SKILL.md, {len(edit.new_preview.splitlines())} lines)")
             return
         diff = difflib.unified_diff(
-            edit.old_text.splitlines(keepends=True),
-            edit.new_text.splitlines(keepends=True),
+            edit.old_preview.splitlines(keepends=True),
+            edit.new_preview.splitlines(keepends=True),
             fromfile=str(edit.path) if edit.raw_old is not None else "/dev/null",
             tofile=str(edit.path),
         )
@@ -1125,6 +1207,11 @@ def run_install(
     The optional runner is retained for callers of this entry point. Install never invokes it.
     """
     args = _install_parser().parse_args(argv)
+    emit = out
+
+    def out(message: str) -> None:
+        emit(_redact_tokens(message))
+
     env = dict(os.environ) if env is None else dict(env)
     if args.command:
         try:

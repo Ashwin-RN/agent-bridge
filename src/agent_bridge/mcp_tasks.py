@@ -139,7 +139,9 @@ class JobTasks(Extension):
         if view is None:
             raise MCPError(code=INVALID_PARAMS, message="Failed to retrieve task: Task not found")
         response = {"resultType": "complete", **_task_fields(params.task_id, view)}
-        if response["status"] == "completed":
+        if response["status"] == "completed" or (
+            view.status == "cancelled" and view.detail and view.detail.get("provider_state") == "possibly_running"
+        ):
             response["result"] = {
                 "content": [{"type": "text", "text": json.dumps(view.detail, ensure_ascii=False, separators=(",", ":"))}],
                 "structuredContent": view.detail,

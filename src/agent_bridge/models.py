@@ -256,11 +256,15 @@ class JobRecord:
         if self.effective_cwd and self.effective_cwd != self.cwd:
             out["effective_cwd"] = self.effective_cwd
         if response_file is not None:
+            kept = len(self.response)
+            total = max(self.response_chars or 0, kept)
             out.update(
                 response_file=response_file,
                 response_head=self.response[:400],
-                response_total_chars=len(self.response),
+                response_total_chars=total,
             )
+            if total > kept:
+                out.update(self._response_storage_cut(kept, total))
         elif self.is_terminal or self.response:
             out.update(self._response_page(response_offset, response_chars))
         if self.usage:
@@ -303,20 +307,23 @@ class JobRecord:
                 ),
             )
         elif total > kept:
-            out.update(
-                response_truncated=True,
-                response_total_chars=total,
-                response_note=(
-                    f"The bridge kept only the first {kept} of {total} characters of this reply; "
-                    "the rest was not kept."
-                ),
-            )
+            out.update(self._response_storage_cut(kept, total))
         if self.status == "completed" and not stored.strip() and total == kept:
             out["warning"] = (
                 "The job completed with an empty reply: the subagent returned no text. Check what it did "
                 "(git status and diff for an edit job) before relying on it, or run it again."
             )
         return out
+
+    @staticmethod
+    def _response_storage_cut(kept: int, total: int) -> dict[str, Any]:
+        return {
+            "response_truncated": True,
+            "response_total_chars": total,
+            "response_note": (
+                f"The bridge kept only the first {kept} of {total} characters of this reply; the rest was not kept."
+            ),
+        }
 
     def _failure_fields(self) -> dict[str, Any]:
         out: dict[str, Any] = {}

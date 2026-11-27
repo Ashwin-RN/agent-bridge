@@ -134,6 +134,25 @@ def test_a_job_that_completed_with_an_empty_reply_carries_a_warning() -> None:
     assert "warning" not in _job(status="failed", response="").to_detail(now=NOW)
 
 
+async def test_reply_file_reports_the_storage_cut(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        record = _job(owner_id=manager.owner_id, response="x" * 250_000, response_chars=250_000)
+        manager.store.insert_job(replace(record, status="running", response="", response_chars=None))
+        manager.store.finalize_job(record)
+        args = {"job_ids": [record.job_id]}
+        [last] = (await _call(mcp, "jobs", {**args, "response_offset": 180_000}))["jobs"]
+        [reply] = (await _call(mcp, "jobs", {**args, "response_file": True}))["jobs"]
+        assert reply["response_total_chars"] == last["response_total_chars"] == 250_000
+        assert reply["response_truncated"] is last["response_truncated"] is True
+        assert reply["response_note"] == last["response_note"]
+        assert "the rest was not kept" in reply["response_note"]
+        assert Path(reply["response_file"]).read_text(encoding="utf-8") == record.response[:200_000]
+        assert not {"response", "next_offset", "response_offset"} & reply.keys()
+    finally:
+        await manager.shutdown()
+
+
 async def test_jobs_writes_the_full_stored_reply_and_returns_a_small_entry(tmp_path: Path) -> None:
     mcp, manager = _bridge(tmp_path)
     try:

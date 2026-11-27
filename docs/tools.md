@@ -24,7 +24,7 @@ Starts one subagent job and answers at once with a small receipt whose `next` fi
 
 With `wait_seconds` (max 300), `run` waits up to that long first: a job that finishes in time returns its full job detail, and one still active returns a receipt. Waits are capped under the host's tool-call limit; a shortened wait whose job has not ended carries `wait_note`.
 
-A host that supports the MCP tasks extension (`io.modelcontextprotocol/tasks`, such as Claude Code) receives each `run` as a background task row instead of waiting, shows the job's `line` as its status message, and delivers the finished job reply when the job ends with no polling by the model.
+A host that supports the MCP tasks extension (`io.modelcontextprotocol/tasks`, such as Claude Code) receives each `run` as a background task row. The row shows the job's `line` and delivers the finished reply. If cancellation leaves the provider turn possibly running, the status message and final reply include the cancellation guidance.
 
 | Argument | Default | What it does |
 |---|---|---|
@@ -36,7 +36,7 @@ A host that supports the MCP tasks extension (`io.modelcontextprotocol/tasks`, s
 | `effort` | `None` | `"low"`, `"medium"`, `"high"` or `"xhigh"`. Defaults to the backend's |
 | `timeout_seconds` | `None` | The job's own deadline in seconds, clamped to 10–3600 (defaults to `AGENT_BRIDGE_DEFAULT_TIMEOUT`, 300) |
 | `wait_seconds` | `0` | Wait up to this many seconds before answering (max 300, also capped by the host's limit). Ignored on MCP task calls |
-| `response_file` | `False` | Save a finished non-empty reply to `<state_dir>/replies/<job_id>.md` and return a preview instead of `response`. Forwarded into `next` on a receipt |
+| `response_file` | `False` | Save a finished non-empty reply to `<state_dir>/replies/<job_id>.md` and return a preview instead of `response`. Applies to the final task result and is forwarded into `next` on a receipt |
 | `fast` | `False` | Codex only: ask for the faster service tier for this job, at about twice the quota. Worth it when Codex's weekly window is about to reset with quota unused. Not inherited by a resume: pass it on each turn. Another backend runs as usual and its reply carries a `warning` |
 | `resume_from` | `None` | A prior `job_id` or `session_id` to continue. Inherits `cwd`, worktree, `model`, `effort` and `parent_run` |
 | `worktree` | `False` | For `codex` and `claude` in `edit` mode: give the job its own Git worktree |
@@ -72,7 +72,7 @@ Refused as a tool error before any job is created when:
 
 ## jobs
 
-With `job_ids`: waits up to `wait_seconds` for all or any of those jobs to end and returns each in full. A job still `queued` or `running` carries on. Without `job_ids`: lists recent jobs from every window of every host.
+With `job_ids`: waits up to `wait_seconds` for all or any of those jobs to end and returns each in full. A job still `queued` or `running` carries on. Without `job_ids`: lists recent jobs from every window of every host. The tool is annotated as non-destructive and idempotent because reply exports write to a fixed path per job.
 
 | Argument | Default | What it does |
 |---|---|---|
@@ -154,7 +154,7 @@ Refused as a tool error when `job_id` does not exist or belongs to another live 
 
 ## usage
 
-Reports what the bridge ran in a period, and optionally what subscription quota is left across every pool.
+Reports what the bridge ran in a period, and optionally what subscription quota is left across every pool. Quota probes can update the local cache.
 
 | Argument | Default | What it does |
 |---|---|---|
@@ -221,7 +221,7 @@ Refused as a tool error when:
 
 ## backends
 
-Checks each CLI's health and version, reports backend defaults, `agy`'s live models and shortcuts, the detected `host` and its `wait_cap` in seconds, and whether the bridge is nested.
+Checks each CLI's health and version, reports backend defaults, `agy`'s live models and shortcuts, the detected `host` and its `wait_cap` in seconds, and whether the bridge is nested. Fetching live models can update the local cache.
 
 | Argument | Default | What it does |
 |---|---|---|
@@ -275,7 +275,7 @@ Null fields are omitted.
 | `worktree_path`, `worktree_branch` | Present on worktree jobs |
 | `response` | Paged reply text (default up to 20,000 chars, max 100,000). Omitted when `response_file=True` writes a file |
 | `response_offset`, `response_truncated`, `response_total_chars`, `next_offset`, `response_note` | Present when a reply is paged or was cut at the 200,000-character storage cap |
-| `response_file`, `response_head`, `response_total_chars` | Returned instead of `response` when `response_file=True` wrote the full stored reply to `<state_dir>/replies/<job_id>.md`; `response_head` is the first 400 characters |
+| `response_file`, `response_head`, `response_total_chars` | File path, first 400 characters, and original reply length. If the reply was cut at the storage cap, the file contains the kept portion and the tool result includes `response_truncated: true` and `response_note` |
 | `warning` | Present on an empty completed reply, or when `response_file=True` fell back to a paged reply |
 | `usage`, `usage_status` | `{"total_tokens": N}` by default (full token breakdown with `verbose=True`). `usage_status` is omitted when `"exact"` and shown for `"delta"`, `"partial"` or `"missing"` |
 | `failure_reason`, `provider_state`, `retry_guidance`, `error`, `exit_code`, `cleanup_seconds`, `stderr_tail` | Present on non-completed terminal jobs |
