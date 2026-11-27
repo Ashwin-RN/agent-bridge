@@ -2234,38 +2234,6 @@ class BridgeStore:
 
     # --- Usage aggregation (direct SQL GROUP BY) ---
 
-    def session_compact_summary(self, owner_id: str) -> dict[str, Any]:
-        with self._tx(write=False) as cur:
-            rows = cur.execute(
-                """
-                SELECT backend,
-                       COUNT(DISTINCT job_id) AS runs,
-                       COUNT(*) AS attempts,
-                       SUM(CASE WHEN is_final_attempt = 1 AND status = 'completed' THEN 1 ELSE 0 END) AS completed,
-                       ROUND(COALESCE(SUM(duration_seconds), 0.0), 2) AS duration_seconds,
-                       SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
-                       SUM(CASE WHEN usage_status IN ('partial', 'missing') THEN 1 ELSE 0 END) AS incomplete_usage_runs
-                FROM usage_events
-                WHERE owner_id = ?
-                GROUP BY backend
-                """,
-                (owner_id,),
-            ).fetchall()
-        out: dict[str, Any] = {}
-        for r in rows:
-            entry: dict[str, Any] = {
-                "runs": int(r["runs"]),
-                "completed": int(r["completed"] or 0),
-                "duration_seconds": round(float(r["duration_seconds"] or 0.0), 2),
-                "total_tokens": int(r["total_tokens"] or 0),
-            }
-            if int(r["attempts"] or 0) > int(r["runs"] or 0):
-                entry["attempts"] = int(r["attempts"])
-            if int(r["incomplete_usage_runs"] or 0) > 0:
-                entry["incomplete_usage_runs"] = int(r["incomplete_usage_runs"])
-            out[str(r["backend"])] = entry
-        return out
-
     def summarize_usage(
         self,
         *,
@@ -2275,9 +2243,14 @@ class BridgeStore:
         quota_pool: str | None = None,
         cwd: str | None = None,
         parent_run: str | None = None,
-        recent_limit: int = 10,
-        compact: bool = False,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
     ) -> dict[str, Any]:
+        """Runs, outcomes, time and counted tokens over the usage records, per backend and per quota pool.
+
+        `since_ts` (inclusive) and `until_ts` (exclusive) bound the records by when they were written,
+        on top of `period`.
+        """
         clauses: list[str] = []
         vals: list[Any] = []
         if period == "session":
@@ -2288,6 +2261,12 @@ class BridgeStore:
             if cutoff is not None:
                 clauses.append("ts >= ?")
                 vals.append(cutoff)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            vals.append(since_ts)
+        if until_ts is not None:
+            clauses.append("ts < ?")
+            vals.append(until_ts)
         if backend:
             clauses.append("backend = ?")
             vals.append(backend)
@@ -2304,7 +2283,6 @@ class BridgeStore:
             vals.append(parent_run)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        recent_n = max(0, min(int(recent_limit), 50))
         pool_expr = "COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END)"
 
         with self._tx(write=False) as cur:
@@ -2372,45 +2350,6 @@ class BridgeStore:
                 """,
                 vals,
             ).fetchall()
-
-            model_rows: list[sqlite3.Row] = []
-            recent_rows: list[sqlite3.Row] = []
-            if not compact:
-                model_rows = cur.execute(
-                    f"""
-                    SELECT
-                        backend,
-                        COALESCE(NULLIF(model, ''), backend || '-default') AS model_name,
-                        COUNT(DISTINCT job_id) AS runs,
-                        COUNT(*) AS attempts,
-                        SUM(CASE WHEN is_final_attempt = 1 AND status = 'completed' THEN 1 ELSE 0 END) AS completed,
-                        ROUND(COALESCE(SUM(duration_seconds), 0.0), 2) AS duration_seconds,
-                        SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
-                        SUM(CASE WHEN usage_status = 'exact' THEN 1 ELSE 0 END) AS cov_exact,
-                        SUM(CASE WHEN usage_status = 'delta' THEN 1 ELSE 0 END) AS cov_delta,
-                        SUM(CASE WHEN usage_status = 'partial' THEN 1 ELSE 0 END) AS cov_partial,
-                        SUM(CASE WHEN usage_status NOT IN ('exact', 'delta', 'partial') THEN 1 ELSE 0 END) AS cov_missing
-                    FROM usage_events
-                    {where}
-                    GROUP BY backend, model_name
-                    """,
-                    vals,
-                ).fetchall()
-
-                if recent_n > 0:
-                    recent_rows = cur.execute(
-                        f"""
-                        SELECT iso_time, job_id, attempt_number, is_final_attempt, backend,
-                               {pool_expr} AS quota_pool, model,
-                               status, duration_seconds, usage_status, total_tokens,
-                               effort, parent_run, label
-                        FROM usage_events
-                        {where}
-                        ORDER BY ts DESC, id DESC
-                        LIMIT ?
-                        """,
-                        [*vals, recent_n],
-                    ).fetchall()
 
         def _empty_bucket(in_flight_cnt: int) -> dict[str, Any]:
             return {
@@ -2534,68 +2473,6 @@ class BridgeStore:
             "by_quota_pool": by_quota_pool,
         }
 
-        if compact:
-            return summary
-
-        if "neon" in by_backend:
-            by_backend["neon"]["token_note"] = (
-                "Per-turn Antigravity tokens across agy_gemini and agy_claude_gpt pools "
-                "(agy cache_read_tokens can exceed reported total_tokens; compare pools via quota)."
-            )
-        if "codex" in by_backend:
-            by_backend["codex"]["token_note"] = (
-                "Per-turn Codex tokens (cached_tokens is a subset of input_tokens; "
-                "reasoning_tokens is a subset of output_tokens)."
-            )
-
-        if "claude" in by_backend:
-            by_backend["claude"]["token_note"] = (
-                "Per-run Claude Code tokens (input_tokens includes cache reads and cache writes; "
-                "cached_tokens is the cache-read part)."
-            )
-
-        by_model: dict[str, dict[str, Any]] = {}
-        for mr in model_rows:
-            mkey = f"{mr['backend']}:{mr['model_name']}"
-            by_model[mkey] = {
-                "runs": int(mr["runs"] or 0),
-                "attempts": int(mr["attempts"] or 0),
-                "completed": int(mr["completed"] or 0),
-                "duration_seconds": round(float(mr["duration_seconds"] or 0.0), 2),
-                "total_tokens": int(mr["total_tokens"] or 0),
-                "usage_coverage": {
-                    "exact": int(mr["cov_exact"] or 0),
-                    "delta": int(mr["cov_delta"] or 0),
-                    "partial": int(mr["cov_partial"] or 0),
-                    "missing": int(mr["cov_missing"] or 0),
-                },
-            }
-        summary["by_model"] = by_model
-
-        recent: list[dict[str, Any]] = []
-        for rr in recent_rows:
-            item: dict[str, Any] = {
-                "time": rr["iso_time"],
-                "job_id": rr["job_id"],
-                "attempt": int(rr["attempt_number"] or 1),
-                "backend": rr["backend"],
-                "quota_pool": rr["quota_pool"],
-                "model": rr["model"],
-                "status": rr["status"],
-                "duration_seconds": rr["duration_seconds"],
-                "usage_status": rr["usage_status"],
-                "total_tokens": rr["total_tokens"],
-            }
-            if int(rr["is_final_attempt"] if rr["is_final_attempt"] is not None else 1) == 0:
-                item["is_final_attempt"] = False
-            if rr["effort"]:
-                item["effort"] = rr["effort"]
-            if rr["parent_run"]:
-                item["parent_run"] = rr["parent_run"]
-            if rr["label"]:
-                item["label"] = rr["label"]
-            recent.append(item)
-        summary["recent"] = recent
         return summary
 
     def dashboard_records(

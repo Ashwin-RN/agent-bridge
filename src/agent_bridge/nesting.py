@@ -86,7 +86,7 @@ class Nesting:
             f"{NESTED_ERROR_CODE}: this agent-bridge was started inside {where} (detected by {self.via}). "
             f"A subagent may not start further bridge jobs, so `{tool}` is refused. "
             "Do the work yourself, or report back to the session that started you. "
-            "check_jobs, get_usage and list_backends still work."
+            "jobs, cancel, usage and backends still work."
         )
 
 

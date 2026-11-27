@@ -298,7 +298,7 @@ async def test_the_tool_writes_nothing_and_lists_a_job_whose_window_closed_under
     mcp, _ = create_server(settings=manager.settings, manager=manager)
     before = _dump(manager.store.db_path)
 
-    raw = await mcp.call_tool("usage_dashboard", {"period": "all"})
+    raw = await mcp.call_tool("usage", {"period": "all", "view": "dashboard", "verbose": True})
     d = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
 
     assert _dump(manager.store.db_path) == before
@@ -314,7 +314,7 @@ async def test_the_tool_writes_nothing_and_lists_a_job_whose_window_closed_under
     await manager.shutdown()
 
 
-async def test_get_usage_still_recovers_the_job_and_the_dashboard_reads_it_the_same_after(tmp_path: Path) -> None:
+async def test_the_usage_summary_still_recovers_the_job_and_the_dashboard_reads_it_the_same_after(tmp_path: Path) -> None:
     manager = _manager_with_a_closed_window(tmp_path)
 
     await manager.get_usage_summary(period="all")
@@ -440,9 +440,13 @@ async def test_the_tool_answers_inside_a_nested_bridge(tmp_path: Path) -> None:
     nested = Nesting(nested=True, via="env", parent_job="codex-parent")
     mcp, _ = create_server(settings=manager.settings, manager=manager, nesting=nested)
 
-    raw = await mcp.call_tool("usage_dashboard", {"period": "all"})
+    raw = await mcp.call_tool("usage", {"period": "all", "view": "dashboard", "verbose": True})
     data = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
     assert _total(data["totals"]) == 7 and data["text"].startswith("agent-bridge usage, all")
+    # Without `verbose`, the view is the text alone.
+    raw = await mcp.call_tool("usage", {"period": "all", "view": "dashboard"})
+    data = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
+    assert list(data) == ["text"]
     await manager.shutdown()
 
 
@@ -643,13 +647,15 @@ async def test_a_quota_reading_taken_for_the_view_is_not_stored_and_a_fresh_cach
     mcp, _ = create_server(settings=manager.settings, manager=manager)
     before = _dump(manager.store.db_path)
 
-    raw = await mcp.call_tool("usage_dashboard", {"period": "all"})
+    raw = await mcp.call_tool("usage", {"period": "all", "view": "dashboard", "quota": True})
     d = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
 
-    assert calls == {"codex": 1, "agy": 1} and _pools(d)["codex"]["status"] == "ok"
+    # The quota view is built from the dashboard's own readings: one probe per CLI, not two.
+    assert calls == {"codex": 1, "agy": 1}
+    assert _pools(d)["codex"]["five_hour"] is not None and "Codex" in d["text"]
     assert _dump(manager.store.db_path) == before  # the reading was shown, and nothing was written
 
-    # A reading `get_usage` has stored is used while it is fresh, with no second probe.
+    # A reading the summary view has stored is used while it is fresh, with no second probe.
     await manager.get_quota(["codex"])
     assert calls["codex"] == 2
     again = await manager.usage_dashboard(period="all")

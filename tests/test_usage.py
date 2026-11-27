@@ -249,7 +249,6 @@ def test_sqlite_usage_scopes_coverage_and_compact(tmp_path: Path) -> None:
         owner_id="owner-1",
         cwd=proj_a,
         parent_run="pr-42",
-        compact=True,
     )
     assert scoped["overview"]["runs"] == 1
     assert scoped["overview"]["in_flight"] == 1
@@ -262,7 +261,11 @@ def test_sqlite_usage_scopes_coverage_and_compact(tmp_path: Path) -> None:
     assert all_summary["overview"]["runs"] == 2
     assert all_summary["overview"]["usage_coverage"]["exact"] == 1
     assert all_summary["overview"]["usage_coverage"]["missing"] == 1
-    assert len(all_summary["recent"]) == 2
+
+    # A since/until bound applies on top of the period: records are kept by when they were written.
+    hour_ago = time.time() - 3600
+    assert store.summarize_usage(period="all", owner_id="owner-1", since_ts=hour_ago)["overview"]["runs"] == 2
+    assert store.summarize_usage(period="all", owner_id="owner-1", until_ts=hour_ago)["overview"]["runs"] == 0
 
 
 def test_legacy_jobs_and_usage_upgrade_import_is_idempotent(tmp_path: Path) -> None:
@@ -342,13 +345,13 @@ def test_legacy_jobs_and_usage_upgrade_import_is_idempotent(tmp_path: Path) -> N
     assert rec2.failure_reason == "owner_exited"
     assert rec2.provider_state == "unknown"
 
-    summary = store1.summarize_usage(period="all", owner_id="new-owner", compact=True)
+    summary = store1.summarize_usage(period="all", owner_id="new-owner")
     assert summary["overview"]["runs"] == 1
     assert summary["by_backend"]["codex"]["tokens"]["total_tokens"] == 120
 
     # Re-opening BridgeStore does not duplicate legacy rows.
     store2 = BridgeStore(state_dir)
-    summary2 = store2.summarize_usage(period="all", owner_id="new-owner", compact=True)
+    summary2 = store2.summarize_usage(period="all", owner_id="new-owner")
     assert summary2["overview"]["runs"] == 1
 
 
@@ -471,14 +474,14 @@ def test_sqlite_usage_tracks_agy_claude_gpt_pool_separately(tmp_path: Path) -> N
         store.insert_job(_started(j))
         store.finalize_job(j)
 
-    summary = store.summarize_usage(period="today", owner_id="o1", compact=True)
+    summary = store.summarize_usage(period="today", owner_id="o1")
     assert summary["by_backend"]["neon"]["runs"] == 2
     assert summary["by_quota_pool"]["agy_gemini"]["runs"] == 1
     assert summary["by_quota_pool"]["agy_gemini"]["tokens"]["total_tokens"] == 550
     assert summary["by_quota_pool"]["agy_claude_gpt"]["runs"] == 1
     assert summary["by_quota_pool"]["agy_claude_gpt"]["tokens"]["total_tokens"] == 900
 
-    only_3p = store.summarize_usage(period="today", owner_id="o1", quota_pool="agy_claude_gpt", compact=True)
+    only_3p = store.summarize_usage(period="today", owner_id="o1", quota_pool="agy_claude_gpt")
     assert only_3p["overview"]["runs"] == 1
     assert list(only_3p["by_quota_pool"].keys()) == ["agy_claude_gpt"]
 
@@ -616,7 +619,7 @@ def test_concurrent_sqlite_schema_upgrade_no_duplicate_column_and_backfills_null
     assert store.get_job("codex-old-1").quota_pool == "codex"  # type: ignore[union-attr]
     assert store.get_job("neon-old-3p").provider_invoked is True  # type: ignore[union-attr]
 
-    summary = store.summarize_usage(period="all", owner_id="o1", compact=True)
+    summary = store.summarize_usage(period="all", owner_id="o1")
     assert summary["by_quota_pool"]["agy_claude_gpt"]["tokens"]["total_tokens"] == 500
     assert summary["by_quota_pool"]["agy_gemini"]["tokens"]["total_tokens"] == 300
     assert summary["by_quota_pool"]["codex"]["tokens"]["total_tokens"] == 200
@@ -628,7 +631,7 @@ def test_concurrent_sqlite_schema_upgrade_no_duplicate_column_and_backfills_null
     conn2.close()
 
     healed = BridgeStore(state_dir)
-    healed_summary = healed.summarize_usage(period="all", owner_id="o1", compact=True)
+    healed_summary = healed.summarize_usage(period="all", owner_id="o1")
     assert healed_summary["by_quota_pool"]["agy_claude_gpt"]["tokens"]["total_tokens"] == 500
 
 
@@ -674,7 +677,7 @@ def test_legacy_usage_jsonl_marks_ambiguous_neon_totals_as_partial(tmp_path: Pat
     )
 
     store = BridgeStore(state_dir)
-    summary = store.summarize_usage(period="all", owner_id="new-win", compact=True)
+    summary = store.summarize_usage(period="all", owner_id="new-win")
     assert summary["by_backend"]["neon"]["usage_coverage"]["partial"] == 1
     assert summary["by_backend"]["neon"]["usage_coverage"]["exact"] == 0
     assert summary["by_backend"]["neon"]["tokens"]["total_tokens"] == 0

@@ -386,7 +386,7 @@ def build_quota_advisory(
             priority = "stale"
             rec = (
                 f"Quota reading for {label} is stale (a reset timestamp has already passed). "
-                "Re-run get_usage(include_quota=True, refresh_quota=True) for fresh post-reset capacity."
+                "Call usage(quota=True) again for fresh post-reset capacity."
             )
         elif rate_limit_reached or w5_sig == "exhausted" or wk_sig == "exhausted":
             priority = "avoid"
@@ -578,7 +578,7 @@ def build_quota_advisory(
         stale_names = ", ".join(p["pool"] for p in stale_pools)
         summary_text = (
             f"No fresh eligible pools ({stale_names} reading(s) passed reset time); "
-            "refresh with get_usage(include_quota=True, refresh_quota=True)."
+            "call usage(quota=True) again."
         )
     elif pools_sorted:
         summary_text = (

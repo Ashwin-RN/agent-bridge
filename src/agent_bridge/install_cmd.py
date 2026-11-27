@@ -811,7 +811,7 @@ class Session:
             self.out(
                 f"note: {host.label}'s tool-call limit cannot be raised"
                 + (f" ({limit:g} s)" if limit else "")
-                + ": use start_agent, and check_jobs waits under the limit"
+                + ": run answers at once, and jobs waits under the limit"
             )
         elif host.timeout.key is None and host.timeout.needs_raising():
             self.out(f"note: no verified key raises {host.label}'s tool-call limit; set it to {WANTED_TIMEOUT_SECONDS} s in its settings if it has one")
@@ -1085,7 +1085,7 @@ def check_host(host: Host, roots: Roots, path_lookup: PathLookup, skill: bytes) 
         spec = host.timeout
         if not spec.raisable:
             limit = f"{spec.default_seconds:g} s" if spec.default_seconds else "unknown"
-            checks.append(Check(f"{label}: tool-call limit", "warn", f"fixed at {limit}, cannot be raised", "use start_agent, and check_jobs waits under the limit"))
+            checks.append(Check(f"{label}: tool-call limit", "warn", f"fixed at {limit}, cannot be raised", "run answers at once, and jobs waits under the limit"))
         elif not spec.needs_raising():
             checks.append(Check(f"{label}: tool-call limit", "ok", f"default {spec.default_seconds:g} s is enough"))
         elif spec.key is None:

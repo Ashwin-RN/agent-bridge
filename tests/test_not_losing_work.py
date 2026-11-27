@@ -89,94 +89,45 @@ async def _wait_for_file(path: Path, timeout: float = 15.0) -> None:
             await asyncio.sleep(0.02)
 
 
-# --- 1. Batch receipts ---
+# --- 1. A run cancelled while its job is being started ---
 
 
-async def test_batch_that_fails_to_start_a_job_cancels_the_jobs_it_started_and_names_them(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = _settings(tmp_path)
-    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _holding_codex(tmp_path)))
-    mcp, _ = create_server(settings=settings, manager=manager, nesting=NOT_NESTED)
-    real_insert = manager.store.insert_job
-    inserts = 0
-
-    def insert_job(record: JobRecord) -> None:
-        nonlocal inserts
-        inserts += 1
-        if inserts == 2:
-            # Fail the second job's row only once the first job's CLI is really running.
-            deadline = time.monotonic() + 15
-            while not (tmp_path / "pid-one").exists() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            raise sqlite3.OperationalError("disk I/O error")
-        real_insert(record)
-
-    monkeypatch.setattr(manager.store, "insert_job", insert_job)
-    try:
-        tasks = [{"backend": "codex", "prompt": p} for p in ("one", "two", "three")]
-        with pytest.raises(Exception) as excinfo:
-            await mcp.call_tool("run_parallel", {"tasks": tasks, "cwd": str(tmp_path), "wait": False})
-        first = _row_for_prompt(manager, "one")
-        # The host's error names the job that had started, and says what became of it.
-        assert f"{first.job_id} (cancelled)" in str(excinfo.value)
-        assert "Starting task 2 of 3 failed" in str(excinfo.value)
-        assert "disk I/O error" in str(excinfo.value)
-        assert first.status == "cancelled"
-        assert not is_pid_alive(int((tmp_path / "pid-one").read_text()))
-        assert inserts == 2  # the third task was never submitted
-        assert len(manager.store.list_jobs(limit=50)) == 1
-    finally:
-        await manager.shutdown()
-
-
-async def test_batch_cancelled_while_starting_its_jobs_cancels_the_ones_already_started(
+async def test_run_cancelled_while_its_job_row_is_written_leaves_no_queued_orphan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(tmp_path)
     manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _holding_codex(tmp_path)))
     real_insert = manager.store.insert_job
-    second_insert_entered = threading.Event()
-    second_insert_done = threading.Event()
+    insert_entered = threading.Event()
+    insert_done = threading.Event()
     release = threading.Event()
-    inserts = 0
 
     def insert_job(record: JobRecord) -> None:
-        nonlocal inserts
-        inserts += 1
-        if inserts == 2:
-            second_insert_entered.set()
-            release.wait(20)
-            real_insert(record)
-            second_insert_done.set()
-            return
+        insert_entered.set()
+        release.wait(20)
         real_insert(record)
+        insert_done.set()
 
     monkeypatch.setattr(manager.store, "insert_job", insert_job)
-    requests = [manager.prepare_request(backend="codex", prompt=p) for p in ("one", "two")]
-    batch = asyncio.create_task(manager.run_parallel(requests, wait=False))
+    call = asyncio.create_task(manager.run(manager.prepare_request(backend="codex", prompt="two"), wait_seconds=0))
     try:
-        await _wait_for_file(tmp_path / "pid-one")
         async with asyncio.timeout(15):
-            while not second_insert_entered.is_set():
+            while not insert_entered.is_set():
                 await asyncio.sleep(0.02)
-        batch.cancel()
+        call.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await batch
-        first = _row_for_prompt(manager, "one")
-        assert first.status == "cancelled"
-        assert not is_pid_alive(int((tmp_path / "pid-one").read_text()))
-        # The second job's row lands only now, after the cancel: it must not stay behind as a queued
-        # orphan, and its CLI must never start.
+            await call
+        # The job's row lands only now, after the cancel: it must not stay behind as a queued orphan,
+        # and its CLI must never start.
         release.set()
         async with asyncio.timeout(15):
-            while not second_insert_done.is_set():
+            while not insert_done.is_set():
                 await asyncio.sleep(0.02)
             while any(r.prompt_preview == "two" for r in manager.store.list_jobs(limit=50)):
                 await asyncio.sleep(0.05)
         await asyncio.sleep(0.5)
         assert not (tmp_path / "pid-two").exists()
-        assert [r.prompt_preview for r in manager.store.list_jobs(limit=50)] == ["one"]
+        assert manager.store.list_jobs(limit=50) == []
     finally:
         release.set()
         await manager.shutdown()
@@ -188,10 +139,10 @@ async def test_batch_cancelled_while_starting_its_jobs_cancels_the_ones_already_
 @pytest.mark.parametrize(
     "tool,args",
     [
-        ("run_agent", {"backend": "codex", "prompt": "hold"}),
-        ("run_parallel", {"tasks": [{"backend": "codex", "prompt": "hold"}]}),
-        ("review_code", {"backends": ["codex"]}),
+        ("run", {"backend": "codex", "prompt": "hold", "wait_seconds": 60}),
+        ("run", {"backend": "codex", "review": {"scope": "uncommitted"}, "wait_seconds": 60}),
     ],
+    ids=["run", "review"],
 )
 async def test_host_cancel_of_a_waiting_call_stops_the_job_through_the_mcp_sdk(
     tmp_path: Path, tool: str, args: dict,
@@ -268,61 +219,6 @@ async def test_run_cancelled_during_its_last_lookup_cancels_the_job(
             while manager.store.get_job(job.job_id).status != "cancelled":
                 await asyncio.sleep(0.05)
         assert not is_pid_alive(int((tmp_path / "pid-one").read_text()))
-    finally:
-        await manager.shutdown()
-
-
-async def test_host_cancel_during_the_reply_s_usage_lookup_cancels_the_job_through_the_mcp_sdk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`mode="legacy"`: JSON-RPC over memory streams, so the cancel is a real notifications/cancelled."""
-    settings = _settings(tmp_path, default_timeout_seconds=120)
-    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _holding_codex(tmp_path)))
-    mcp, _ = create_server(settings=settings, manager=manager, nesting=NOT_NESTED)
-    entered = asyncio.Event()
-
-    async def slow_usage() -> dict:
-        entered.set()
-        await asyncio.Event().wait()
-        return {}
-
-    monkeypatch.setattr(manager, "session_compact_summary_async", slow_usage)
-    async with Client(mcp, mode="legacy") as client:
-        # The wait ends with the job still running; the reply then waits on its usage lookup.
-        call = asyncio.create_task(client.call_tool(
-            "run_agent", {"backend": "codex", "prompt": "one", "cwd": str(tmp_path), "wait_seconds": 1},
-        ))
-        async with asyncio.timeout(15):
-            await entered.wait()
-        job = _row_for_prompt(manager, "one")
-        assert job.status == "running"
-        call.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await call
-        async with asyncio.timeout(10):
-            while manager.store.get_job(job.job_id).status != "cancelled":
-                await asyncio.sleep(0.05)
-        assert not is_pid_alive(int((tmp_path / "pid-one").read_text()))
-
-
-async def test_a_failing_usage_lookup_does_not_cost_the_caller_the_job_ids(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = _settings(tmp_path)
-    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _holding_codex(tmp_path)))
-    mcp, _ = create_server(settings=settings, manager=manager, nesting=NOT_NESTED)
-
-    async def broken_usage() -> dict:
-        raise sqlite3.OperationalError("disk I/O error")
-
-    monkeypatch.setattr(manager, "session_compact_summary_async", broken_usage)
-    try:
-        out = _tool_data(await mcp.call_tool(
-            "run_parallel", {"tasks": [{"backend": "codex", "prompt": "one"}], "cwd": str(tmp_path), "wait": False},
-        ))
-        [result] = out["results"]
-        assert result["job_id"] == _row_for_prompt(manager, "one").job_id
-        assert "disk I/O error" in out["session_usage"]["error"]
     finally:
         await manager.shutdown()
 
@@ -1150,7 +1046,7 @@ async def test_resume_from_a_job_id_that_is_not_found_is_refused_not_sent_as_a_s
         with pytest.raises(ValueError, match=r"No job 'codex-deadbeef' was found to resume"):
             manager.prepare_request(backend="codex", prompt="go on", resume_from="codex-deadbeef")
         with pytest.raises(Exception, match=r"No job 'neon-0badc0de' was found to resume"):
-            await mcp.call_tool("start_agent", {"backend": "neon", "prompt": "go on", "resume_from": "neon-0badc0de"})
+            await mcp.call_tool("run", {"backend": "neon", "prompt": "go on", "resume_from": "neon-0badc0de"})
         # Anything not shaped like a job id is still a session id.
         session_id = "019a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8"
         req = manager.prepare_request(backend="codex", prompt="go on", resume_from=session_id)
@@ -1160,19 +1056,19 @@ async def test_resume_from_a_job_id_that_is_not_found_is_refused_not_sent_as_a_s
         await manager.shutdown()
 
 
-async def test_check_jobs_refuses_an_unknown_status_and_lists_the_valid_ones(tmp_path: Path) -> None:
+async def test_jobs_refuses_an_unknown_status_and_lists_the_valid_ones(tmp_path: Path) -> None:
     mcp, manager = create_server(settings=_settings(tmp_path), nesting=NOT_NESTED)
     try:
         with pytest.raises(Exception) as excinfo:
-            await mcp.call_tool("check_jobs", {"status": "done"})
+            await mcp.call_tool("jobs", {"status": "done"})
         assert "Unknown status 'done'" in str(excinfo.value)
         assert "queued, running, completed, failed, cancelled, timed_out" in str(excinfo.value)
-        assert _tool_data(await mcp.call_tool("check_jobs", {"status": "completed"}))["count"] == 0
+        assert _tool_data(await mcp.call_tool("jobs", {"status": "completed"}))["count"] == 0
     finally:
         await manager.shutdown()
 
 
-async def test_check_jobs_gives_an_unknown_id_a_not_found_entry_and_still_answers_for_the_rest(
+async def test_jobs_gives_an_unknown_id_a_not_found_entry_and_still_answers_for_the_rest(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -1185,7 +1081,7 @@ async def test_check_jobs_gives_an_unknown_id_a_not_found_entry_and_still_answer
             peer = await manager.start_async(manager.prepare_request(backend="codex", prompt=mode))
             started = time.monotonic()
             out = _tool_data(await mcp.call_tool(
-                "check_jobs", {"job_ids": ["codex-00000000", peer.job_id], "wait_seconds": 30, "wait_mode": mode},
+                "jobs", {"job_ids": ["codex-00000000", peer.job_id], "wait_seconds": 30, "wait_mode": mode},
             ))
             took = time.monotonic() - started
             assert 1.0 < took < 15, (mode, took)  # waited for the peer, and only for it
@@ -1196,7 +1092,7 @@ async def test_check_jobs_gives_an_unknown_id_a_not_found_entry_and_still_answer
         # Ids that are all unknown do not hold an "any" wait open.
         started = time.monotonic()
         out = _tool_data(await mcp.call_tool(
-            "check_jobs", {"job_ids": ["codex-00000000"], "wait_seconds": 30, "wait_mode": "any"},
+            "jobs", {"job_ids": ["codex-00000000"], "wait_seconds": 30, "wait_mode": "any"},
         ))
         assert time.monotonic() - started < 5
         assert [j["status"] for j in out["jobs"]] == ["not_found"]
@@ -1208,11 +1104,11 @@ async def test_check_jobs_gives_an_unknown_id_a_not_found_entry_and_still_answer
 # --- 8. Honest annotation and a trimmed child environment ---
 
 
-async def test_review_code_is_not_marked_read_only(tmp_path: Path) -> None:
+async def test_run_is_not_marked_read_only(tmp_path: Path) -> None:
     mcp, manager = create_server(settings=_settings(tmp_path), nesting=NOT_NESTED)
     try:
         tools = {t.name: t for t in await mcp.list_tools()}
-        annotations = tools["review_code"].annotations
+        annotations = tools["run"].annotations
         assert annotations is not None and annotations.read_only_hint is False
     finally:
         await manager.shutdown()

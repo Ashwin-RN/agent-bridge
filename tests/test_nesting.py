@@ -33,12 +33,11 @@ from agent_bridge.runners import CodexRunner, NeonRunner
 from agent_bridge.server import create_server
 from agent_bridge.storage import BridgeStore
 
-JOB_TOOLS: dict[str, dict[str, Any]] = {
-    "run_agent": {"backend": "claude", "prompt": "hi"},
-    "start_agent": {"backend": "claude", "prompt": "hi"},
-    "run_parallel": {"tasks": [{"backend": "claude", "prompt": "hi"}]},
-    "review_code": {"backends": ["claude"]},
-}
+# Every way to start a job: `run` is the one tool that does, plain and as a review.
+JOB_CALLS: list[tuple[str, dict[str, Any]]] = [
+    ("run", {"backend": "claude", "prompt": "hi", "wait_seconds": 30}),
+    ("run", {"backend": "claude", "review": {"scope": "uncommitted"}}),
+]
 
 
 def _make_settings(tmp_path: Path) -> Settings:
@@ -86,7 +85,7 @@ def test_marker_in_the_environment_means_nested() -> None:
     )
     assert found.nested is True and found.via == "env"
     assert found.parent_job == "codex-1a2b3c4d" and found.parent_owner == "pid-1-abc"
-    assert "nested_bridge" in found.refusal("run_agent") and "codex-1a2b3c4d" in found.refusal("run_agent")
+    assert "nested_bridge" in found.refusal("run") and "codex-1a2b3c4d" in found.refusal("run")
 
 
 def test_live_bridge_among_the_ancestors_means_nested_even_with_no_marker(
@@ -186,11 +185,13 @@ async def test_tools_refuse_in_process_when_nested_and_read_tools_still_answer(t
         settings=settings,
         nesting=Nesting(nested=True, via="env", parent_job="neon-99"),
     )
-    for tool, args in JOB_TOOLS.items():
+    for tool, args in JOB_CALLS:
         with pytest.raises(Exception, match="nested_bridge") as excinfo:
             await mcp.call_tool(tool, args)
         # The tool itself refuses, before it looks at its arguments or reaches the job manager.
         assert f"`{tool}` is refused" in str(excinfo.value)
+        # It names the tools that do still work, as the host sees them.
+        assert "jobs, cancel, usage and backends still work" in str(excinfo.value)
     assert manager.store.list_jobs(limit=10) == []
     await manager.shutdown()
 
@@ -202,22 +203,22 @@ async def test_real_bridge_with_the_marker_refuses_every_job_tool(tmp_path: Path
     async with stdio_client(params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             init = await session.initialize()
-            assert "INSIDE one of its own jobs" in (init.instructions or "")
+            assert "inside one of its own jobs" in (init.instructions or "")
 
-            for tool, args in JOB_TOOLS.items():
+            for tool, args in JOB_CALLS:
                 res = await session.call_tool(tool, args)
                 assert res.is_error, tool
                 assert "nested_bridge" in _text(res), tool
                 assert "codex-feedbeef" in _text(res), tool
 
-            jobs = await session.call_tool("check_jobs", {})
+            jobs = await session.call_tool("jobs", {})
             assert not jobs.is_error
             assert json.loads(jobs.content[0].text)["count"] == 0
 
-            usage = await session.call_tool("get_usage", {"period": "session", "compact": True})
+            usage = await session.call_tool("usage", {"period": "session"})
             assert not usage.is_error
 
-            backends = await session.call_tool("list_backends", {})
+            backends = await session.call_tool("backends", {})
             assert not backends.is_error
             nesting = json.loads(backends.content[0].text)["nesting"]
             assert nesting == {"nested": True, "via": "env", "parent_job": "codex-feedbeef"}
@@ -240,12 +241,12 @@ async def test_real_bridge_under_a_live_bridge_process_refuses_with_no_marker(tm
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
 
-            res = await session.call_tool("run_agent", {"backend": "claude", "prompt": "hi"})
+            res = await session.call_tool("run", {"backend": "claude", "prompt": "hi", "wait_seconds": 30})
             assert res.is_error
             assert "nested_bridge" in _text(res)
             assert "detected by ancestry" in _text(res)
 
-            backends = await session.call_tool("list_backends", {})
+            backends = await session.call_tool("backends", {})
             nesting = json.loads(backends.content[0].text)["nesting"]
             assert nesting["nested"] is True and nesting["via"] == "ancestry"
             assert nesting["parent_owner"] == "pid-outer-bridge"
@@ -288,14 +289,14 @@ async def test_job_start_retries_unknown_ancestry_and_accepts_it_while_unavailab
     mcp, manager = create_server(settings=_make_settings(tmp_path))
     try:
         assert manager.nesting.nested is None
-        result = await mcp.call_tool("run_agent", JOB_TOOLS["run_agent"])
+        result = await mcp.call_tool(*JOB_CALLS[0])
         assert "AGENT_BRIDGE_CLAUDE_BIN" in str(result)
         assert manager.nesting.nested is None
 
         manager.store.register_owner("outer", 12345)
         chain = [(12345, time.time() - 1)]
         with pytest.raises(Exception, match="nested_bridge"):
-            await mcp.call_tool("run_agent", JOB_TOOLS["run_agent"])
+            await mcp.call_tool(*JOB_CALLS[0])
         assert manager.nesting.parent_owner == "outer"
     finally:
         await manager.shutdown()
@@ -313,13 +314,13 @@ async def test_real_bridge_started_by_a_plain_host_is_not_nested(
     async with stdio_client(params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             init = await session.initialize()
-            assert "whichever CLI you are yourself" in (init.instructions or "")
+            assert "whichever CLI you are" in (init.instructions or "")
 
-            backends = await session.call_tool("list_backends", {})
+            backends = await session.call_tool("backends", {})
             assert json.loads(backends.content[0].text)["nesting"] == {"nested": False}
 
             # The job is accepted and then fails for the reason set up here: there is no CLI.
-            res = await session.call_tool("run_agent", {"backend": "claude", "prompt": "hi"})
+            res = await session.call_tool("run", {"backend": "claude", "prompt": "hi", "wait_seconds": 30})
             assert "nested_bridge" not in _text(res)
             detail = json.loads(res.content[0].text)
             assert detail["status"] == "failed"

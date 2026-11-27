@@ -58,7 +58,7 @@ CLI_OUTPUT_CUT_SHORT_ERROR = (
 )
 CLI_OUTPUT_CUT_SHORT_GUIDANCE = (
     "The CLI exited cleanly, but its output stopped before its final event. Read response and "
-    "stderr_tail, check the CLI's version with list_backends, and for edit tasks inspect git status/diff "
+    "stderr_tail, check the CLI's version with backends, and for edit tasks inspect git status/diff "
     "before retrying."
 )
 STDERR_TAIL_MAX_CHARS = 4_000
@@ -375,7 +375,7 @@ def classify_failure(
             "failed",
             "quota_exceeded",
             local_state,
-            "Subscription quota or rate limit reached. Call get_usage(include_quota=True) to check reset "
+            "Subscription quota or rate limit reached. Call usage(quota=True) to check reset "
             "times or delegate to another backend.",
         )
 
@@ -384,7 +384,7 @@ def classify_failure(
             "failed",
             "model_unavailable",
             local_state,
-            "Requested model was rejected by the CLI. Refresh models via list_backends(refresh_models=True) "
+            "Requested model was rejected by the CLI. Refresh models via backends(refresh_models=True) "
             "or use a versionless shortcut.",
         )
 
@@ -1776,7 +1776,7 @@ class NeonRunner:
                     failure_reason="model_unavailable",
                     provider_state="stopped",
                     retry_guidance=(
-                        "Refresh models via list_backends(refresh_models=True), select a model in an "
+                        "Refresh models via backends(refresh_models=True), select a model in an "
                         "available quota pool, or pass allow_cross_pool_fallback=True."
                     ),
                     provider_invoked=False,
@@ -1841,7 +1841,7 @@ class NeonRunner:
                         failure_reason="model_unavailable",
                         provider_state="stopped",
                         retry_guidance=(
-                            "Refresh models via list_backends(refresh_models=True), select a model in an "
+                            "Refresh models via backends(refresh_models=True), select a model in an "
                             "available quota pool, or pass allow_cross_pool_fallback=True."
                         ),
                         provider_invoked=result.provider_invoked,
@@ -1879,7 +1879,7 @@ class NeonRunner:
                         failure_reason="model_unavailable",
                         provider_state=result.provider_state,
                         retry_guidance=(
-                            "Refresh models via list_backends(refresh_models=True), select another model in "
+                            "Refresh models via backends(refresh_models=True), select another model in "
                             f"quota pool {requested_pool!r}, or pass allow_cross_pool_fallback=True."
                         ),
                         stderr_tail=result.stderr_tail,

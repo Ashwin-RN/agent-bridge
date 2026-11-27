@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
 import time
 from dataclasses import replace
@@ -476,7 +477,8 @@ print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 10, "out
     # Simultaneous turns on the SAME session_id serialize strictly (START->END before next START)
     r_a = manager.prepare_request(backend="codex", prompt="A", resume_from="thr-ser")
     r_b = manager.prepare_request(backend="codex", prompt="B", resume_from="thr-ser")
-    results = await manager.run_parallel([r_a, r_b], wait=True, wait_seconds=15)
+    # Two `run` calls at once, as a host fans out.
+    results = await asyncio.gather(manager.run(r_a, wait_seconds=15), manager.run(r_b, wait_seconds=15))
     assert all(r.status == "completed" for r in results)
 
     events = overlap_log.read_text(encoding="utf-8").strip().splitlines()
@@ -535,8 +537,8 @@ print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 5, "outp
     await manager.shutdown()
 
 
-async def test_list_backends_reports_unhealthy_for_invalid_binary(tmp_path: Path) -> None:
-    """Finding 5: list_backends distinguishes command_found vs healthy and rejects invalid binaries."""
+async def test_backends_reports_unhealthy_for_invalid_binary(tmp_path: Path) -> None:
+    """Finding 5: backends distinguishes command_found vs healthy and rejects invalid binaries."""
     settings = _make_settings(
         tmp_path,
         agy_bin=str(tmp_path / "does-not-exist-agy.exe"),
@@ -779,7 +781,7 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "outpu
 
     req_a = mgr.prepare_request(backend="codex", prompt="EDIT_A first", cwd=str(repo), mode="edit", worktree=True)
     req_b = mgr.prepare_request(backend="codex", prompt="EDIT_B second", cwd=str(repo), mode="edit", worktree=True)
-    res_a, res_b = await mgr.run_parallel([req_a, req_b], wait=True, wait_seconds=20)
+    res_a, res_b = await asyncio.gather(mgr.run(req_a, wait_seconds=20), mgr.run(req_b, wait_seconds=20))
 
     assert res_a.status == "completed", res_a.error
     assert res_b.status == "completed", res_b.error
@@ -1066,7 +1068,7 @@ elif prompt == "PARTIAL_TIMEOUT":
     assert g3.usage is None  # Cumulative-only blob kept in provider_metrics, NOT counted as per-turn delta!
     assert g3.provider_metrics is not None and g3.provider_metrics.get("cumulative_only") is True
 
-    gap_summary = await mgr.get_usage_summary(period="session", parent_run="gap", compact=True)
+    gap_summary = await mgr.get_usage_summary(period="session", parent_run="gap")
     # Never 280. T2's partial count is listed apart, not added in.
     assert gap_summary["by_backend"]["neon"]["tokens"]["total_tokens"] == 100
     assert gap_summary["by_backend"]["neon"]["usage_coverage"] == {
@@ -1083,7 +1085,7 @@ elif prompt == "PARTIAL_TIMEOUT":
     assert a1.usage_status == "exact" and a1.usage and a1.usage["total_tokens"] == 100
     assert a2.usage_status == "delta" and a2.usage and a2.usage["total_tokens"] == 70
     assert a3.usage_status == "delta" and a3.usage and a3.usage["total_tokens"] == 40
-    adj_summary = await mgr.get_usage_summary(period="session", parent_run="adj", compact=True)
+    adj_summary = await mgr.get_usage_summary(period="session", parent_run="adj")
     assert adj_summary["by_backend"]["neon"]["tokens"]["total_tokens"] == 210
     assert adj_summary["by_backend"]["neon"]["usage_coverage"]["delta"] == 2
 
@@ -1167,7 +1169,7 @@ print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status"
     assert r_gpt.model == "gpt-oss-120b-medium" and r_gpt.quota_pool == "agy_claude_gpt"
     assert r_gem.model == "gemini-4-neon-high" and r_gem.quota_pool == "agy_gemini"
 
-    usage = await mgr.get_usage_summary(period="session", compact=True)
+    usage = await mgr.get_usage_summary(period="session")
     assert usage["by_quota_pool"]["agy_claude_gpt"]["runs"] == 3
     assert usage["by_quota_pool"]["agy_gemini"]["runs"] == 1
     await mgr.shutdown()
@@ -1419,7 +1421,7 @@ elif prompt == "E3":
     assert e3.usage_status == "partial"
     assert e3.usage is None
 
-    summary = await mgr.get_usage_summary(period="session", parent_run="emp", compact=True)
+    summary = await mgr.get_usage_summary(period="session", parent_run="emp")
     assert summary["by_backend"]["neon"]["tokens"]["total_tokens"] == 170  # Never 380!
 
     # Cached quota whose reset timestamp already passed MUST bypass cache and fetch fresh!
@@ -1459,13 +1461,13 @@ elif prompt == "E3":
     monkeypatch.setattr(jobs_mod, "fetch_codex_quota", fake_fetch_codex)
     monkeypatch.setattr(mgr.codex_runner, "resolve_command", lambda: ["codex"])
 
-    refreshed = await mgr.get_quota(["codex"], refresh=False)
+    refreshed = await mgr.get_quota(["codex"])
     assert fetch_calls == 1
     assert refreshed["codex"]["cached"] is False
     assert refreshed["codex"]["windows"][0]["remaining_percent"] == 100.0
 
     # Second call with future reset_time SHOULD hit cache!
-    cached_hit = await mgr.get_quota(["codex"], refresh=False)
+    cached_hit = await mgr.get_quota(["codex"])
     assert fetch_calls == 1
     assert cached_hit["codex"]["cached"] is True
 
@@ -1549,7 +1551,7 @@ async def test_posix_process_group_escalation_when_grandchild_survives_sigterm(
 
 async def test_uncertain_prior_turn_blocks_automatic_resume_until_confirmed(tmp_path: Path) -> None:
     """Audit High #2: when Turn 1 ends with provider_state=possibly_running, a queued follow-up in
-    another window is blocked with `prior_turn_uncertain` until `confirm_prior_stopped=True`."""
+    another window is blocked with `prior_turn_uncertain` until `confirm_prior_job_id` names Turn 1."""
     calls_log = tmp_path / "agy_calls.log"
     fake_agy = tmp_path / "fake_agy_uncertain.py"
     fake_agy.write_text(
@@ -1616,7 +1618,7 @@ print(json.dumps({{"event": "result", "result": {{"conversation_id": cid, "statu
     assert r2.failure_reason == "prior_turn_uncertain"
     assert r2.provider_state == "stopped"
     assert r2.provider_invoked is False
-    assert "confirm_prior_stopped=True" in (r2.retry_guidance or "")
+    assert f"confirm_prior_job_id={j1.job_id!r}" in (r2.retry_guidance or "")
     # Turn 2 MUST NOT have invoked agy!
     assert calls_log.read_text(encoding="utf-8").strip().splitlines() == ["T1_TIMEOUT3"]
 
@@ -1627,13 +1629,13 @@ print(json.dumps({{"event": "result", "result": {{"conversation_id": cid, "statu
             model="neon-medium",
             prompt="T3_CONFIRMED",
             resume_from=j1.job_id,
-            confirm_prior_stopped=True,
+            confirm_prior_job_id=j1.job_id,
         )
     )
     assert r3.status == "completed"
     assert "OK:T3_CONFIRMED" in r3.response
 
-    # Subsequent turn without confirm_prior_stopped now succeeds because T3 completed cleanly!
+    # Subsequent turn without a confirmation now succeeds because T3 completed cleanly!
     r4 = await mgr2.run(
         mgr2.prepare_request(backend="neon", model="neon-medium", prompt="T4_NORMAL", resume_from=r3.job_id)
     )
@@ -2369,7 +2371,7 @@ print(json.dumps({
             model="neon-medium",
             prompt="CONFIRMED_OK",
             resume_from="conv-mixed-ver",
-            confirm_prior_stopped=True,
+            confirm_prior_job_id="neon-oldwin2",
         )
     )
     assert confirmed.status == "completed"
@@ -2690,7 +2692,7 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 30, "outpu
     assert persisted.status == "completed"
     assert "LOCK_SURVIVED_RESULT" in persisted.response
     assert persisted.usage is not None and persisted.usage["total_tokens"] == 42
-    summary = await mgr.get_usage_summary(period="session", compact=True)
+    summary = await mgr.get_usage_summary(period="session")
     assert summary["by_backend"]["codex"]["tokens"]["total_tokens"] == 42
     await mgr.shutdown()
 
@@ -2809,14 +2811,14 @@ async def test_retry_guards_uncertain_and_resumed_turns_and_preserves_attempt_us
     )
     assert rec.status == "completed"
     assert rec.duration_seconds == 2.0  # 1.2 + 0.8!
-    detail = rec.to_detail()
+    detail = rec.to_detail(verbose=True)
     assert len(detail["attempts"]) == 2
     assert detail["attempts"][0]["usage"]["total_tokens"] == 50
     assert detail["attempts"][0]["usage_status"] == "partial"
     assert detail["attempts"][1]["usage"]["total_tokens"] == 25
     assert detail["attempts"][1]["usage_status"] == "exact"
 
-    usage_sum = await mgr.get_usage_summary(period="session", parent_run="retry-wf", compact=False)
+    usage_sum = await mgr.get_usage_summary(period="session", parent_run="retry-wf")
     codex_bucket = usage_sum["by_backend"]["codex"]
     assert usage_sum["overview"]["runs"] == 1
     assert usage_sum["overview"]["attempts"] == 2
@@ -2829,10 +2831,18 @@ async def test_retry_guards_uncertain_and_resumed_turns_and_preserves_attempt_us
     assert codex_bucket["partial_total_tokens"] == 50
     assert codex_bucket["usage_coverage"]["exact"] == 1
     assert codex_bucket["usage_coverage"]["partial"] == 1
-    assert len(usage_sum["recent"]) == 2
-    assert all(entry["job_id"] == rec.job_id for entry in usage_sum["recent"])
-    assert all(mgr.get(entry["job_id"]).job_id == rec.job_id for entry in usage_sum["recent"])
+    rows = _usage_job_ids(mgr, "retry-wf")
+    assert rows == [rec.job_id, rec.job_id]
+    assert all(mgr.get(job_id).job_id == rec.job_id for job_id in rows)
     await mgr.shutdown()
+
+
+def _usage_job_ids(mgr: JobManager, parent_run: str) -> list[str]:
+    """The job id each usage row of a workflow was written under, one row per attempt."""
+    with sqlite3.connect(mgr.store.db_path) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT job_id FROM usage_events WHERE parent_run = ? ORDER BY id", (parent_run,)
+        )]
 
 
 async def test_agy_resume_inherits_model_effort_parent_run_and_discloses_pool_change(
@@ -2913,7 +2923,7 @@ print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status"
     assert "agy_claude_gpt" in t3.model_notice and "agy_gemini" in t3.model_notice
 
     # All 3 turns appear under `parent_run="wf-pool"`!
-    rollup = await mgr.get_usage_summary(period="session", parent_run="wf-pool", compact=True)
+    rollup = await mgr.get_usage_summary(period="session", parent_run="wf-pool")
     assert rollup["overview"]["runs"] == 3
     assert rollup["by_quota_pool"]["agy_claude_gpt"]["runs"] == 2
     assert rollup["by_quota_pool"]["agy_gemini"]["runs"] == 1
@@ -2957,10 +2967,10 @@ async def test_startup_deadline_enforced_on_git_probe_and_cleanup_seconds_report
     await mgr.shutdown()
 
 
-async def test_list_backends_isolates_empty_agy_catalog_and_returns_codex_health(
+async def test_backends_isolates_empty_agy_catalog_and_returns_codex_health(
     tmp_path: Path,
 ) -> None:
-    """Audit Medium #6: an empty/failing Antigravity model catalog does NOT break `list_backends`;
+    """Audit Medium #6: an empty/failing Antigravity model catalog does NOT break `backends`;
     it reports the catalog failure as an Antigravity diagnostic while returning healthy Codex info."""
     healthy_empty_agy = tmp_path / "agy_empty_cat.py"
     healthy_empty_agy.write_text(
@@ -2998,7 +3008,7 @@ sys.exit(0)
         codex_runner=StubCodexRunner(settings, healthy_codex),
     )
     mcp, _ = create_server(settings=settings, manager=mgr)
-    raw = await mcp.call_tool("list_backends", {"refresh_models": True})
+    raw = await mcp.call_tool("backends", {"refresh_models": True})
     # FastMCP returns either (content, structured_dict) or content list with JSON text
     if isinstance(raw, tuple) and len(raw) == 2 and isinstance(raw[1], dict):
         data = raw[1]
@@ -3595,7 +3605,7 @@ async def test_cancel_during_retry_backoff_preserves_attempt1_usage_and_real_job
     pre_dl = time.monotonic() + 3.0
     pre_sum = None
     while time.monotonic() < pre_dl:
-        pre_sum = await mgr.get_usage_summary(period="session", parent_run="backoff-cancel-wf", compact=False)
+        pre_sum = await mgr.get_usage_summary(period="session", parent_run="backoff-cancel-wf")
         if pre_sum["overview"]["attempts"] >= 1:
             break
         await asyncio.sleep(0.02)
@@ -3610,14 +3620,14 @@ async def test_cancel_during_retry_backoff_preserves_attempt1_usage_and_real_job
     assert cancelled.usage_status == "partial"
     assert cancelled.duration_seconds is not None and cancelled.duration_seconds >= 1.1
 
-    detail = cancelled.to_detail()
+    detail = cancelled.to_detail(verbose=True)
     assert len(detail["attempts"]) == 2
     assert detail["attempts"][0]["attempt"] == 1
     assert detail["attempts"][0]["usage"]["total_tokens"] == 50
     assert detail["attempts"][1]["attempt"] == 2
     assert detail["attempts"][1]["status"] == "cancelled"
 
-    usage_sum = await mgr.get_usage_summary(period="session", parent_run="backoff-cancel-wf", compact=False)
+    usage_sum = await mgr.get_usage_summary(period="session", parent_run="backoff-cancel-wf")
     assert usage_sum["overview"]["runs"] == 1
     assert usage_sum["overview"]["attempts"] == 2
     codex_bucket = usage_sum["by_backend"]["codex"]
@@ -3627,11 +3637,11 @@ async def test_cancel_during_retry_backoff_preserves_attempt1_usage_and_real_job
     assert codex_bucket["failed"] == 0
     assert codex_bucket["partial_total_tokens"] == 50
     assert codex_bucket["duration_seconds"] >= 1.1
-    assert len(usage_sum["recent"]) == 2
-    for entry in usage_sum["recent"]:
-        assert entry["job_id"] == job.job_id
-        assert "#attempt-" not in entry["job_id"]
-        assert mgr.get(entry["job_id"]).job_id == job.job_id
+    rows = _usage_job_ids(mgr, "backoff-cancel-wf")
+    assert rows == [job.job_id, job.job_id]
+    for job_id in rows:
+        assert "#attempt-" not in job_id
+        assert mgr.get(job_id).job_id == job.job_id
     await mgr.shutdown()
 
 
