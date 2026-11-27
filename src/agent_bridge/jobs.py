@@ -10,13 +10,15 @@ import re
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+from agent_bridge.backends.base import BackendAdapter
+from agent_bridge.backends.registry import BackendRegistry, get_default_registry
 from agent_bridge.config import (
     BackendName,
     Settings,
@@ -27,7 +29,6 @@ from agent_bridge.config import (
     normalize_mode,
     resolve_backend_and_model_hint,
 )
-from agent_bridge.claude_runner import ClaudeRunner
 from agent_bridge.dashboard import build_dashboard, resolve_window
 from agent_bridge.models import JobRecord, JobStatus, RunCancelled, RunRequest, RunResult
 from agent_bridge.nesting import NOT_NESTED, NestedBridgeError, Nesting, process_identity
@@ -37,21 +38,7 @@ from agent_bridge.process_control import (
     ProcessTracker,
     is_pid_alive,
 )
-from agent_bridge.quota import (
-    CLAUDE_QUOTA_NOTE,
-    claude_quota_from_rate_limit,
-    enrich_quota_reading,
-    fetch_codex_quota,
-    fetch_neon_quota,
-    has_passed_reset,
-    merge_claude_quota,
-    without_passed_windows,
-)
-from agent_bridge.runners import CodexRunner, ModelSource, NeonRunner, prepare_job_worktree
-
-ALL_BACKENDS: tuple[str, ...] = ("neon", "codex", "claude")
-# Backends whose edit jobs can run in a Git worktree the bridge makes for them.
-WORKTREE_BACKENDS: frozenset[str] = frozenset({"codex", "claude"})
+from agent_bridge.runners import ModelSource, prepare_job_worktree
 from agent_bridge.storage import (
     BridgeStore,
     SessionHeldError,
@@ -61,6 +48,14 @@ from agent_bridge.storage import (
 )
 
 logger = logging.getLogger("agent_bridge.jobs")
+
+
+def __getattr__(name: str) -> Any:
+    if name == "ALL_BACKENDS":
+        return get_default_registry().backend_names()
+    if name == "WORKTREE_BACKENDS":
+        return frozenset(a.name for a in get_default_registry().adapters() if a.capabilities.worktree)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _is_path_within(candidate: str, root: str) -> bool:
@@ -98,27 +93,13 @@ class WorktreeMissingError(RuntimeError):
         )
 
 
-AGY_REMOTE_TURN_CANCEL_ERROR = (
-    "Job cancelled. agy had reported that its turn may still be running at the server; stopping the local "
-    "CLI does not stop that turn."
-)
-
-
-def _agy_remote_turn_cancel_guidance(job_id: str) -> str:
-    return (
-        "The session stays blocked, as after a timeout with the same signal. Confirm that this turn has "
-        "ended (and inspect git status/diff for edits), then resume with "
-        f"confirm_prior_job_id={job_id!r}."
-    )
-
-
 def _identity_unknown(_pid: int) -> str | None:
     return None
 
 
 JOB_STATUSES: tuple[str, ...] = get_args(JobStatus)
 # The shape of a job id the bridge hands out: `<backend>-<8 hex>`.
-_JOB_ID_RE = re.compile(r"(?:neon|codex|claude)-[0-9a-f]{8}")
+_JOB_ID_RE = re.compile(r"[a-z][a-z0-9_-]*-[0-9a-f]{8}")
 
 
 def _status_filter(status: str | None) -> str | None:
@@ -176,9 +157,11 @@ class JobManager:
         self,
         settings: Settings,
         *,
-        neon_runner: NeonRunner | None = None,
-        codex_runner: CodexRunner | None = None,
-        claude_runner: ClaudeRunner | None = None,
+        registry: BackendRegistry | None = None,
+        runners: Mapping[str, Any] | None = None,
+        neon_runner: Any | None = None,
+        codex_runner: Any | None = None,
+        claude_runner: Any | None = None,
         store: BridgeStore | None = None,
         owner_id: str | None = None,
         pid: int | None = None,
@@ -186,6 +169,7 @@ class JobManager:
         process_identity_fn: Callable[[int], str | None] | None = None,
     ) -> None:
         self.settings = settings
+        self.registry = registry or get_default_registry()
         self.owner_id = owner_id or f"pid-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self._pid = pid if pid is not None else os.getpid()
         self._is_pid_alive = is_pid_alive_fn or is_pid_alive
@@ -202,9 +186,17 @@ class JobManager:
             settings.state_dir,
             max_stored_jobs=settings.max_stored_jobs,
         )
-        self.neon_runner = neon_runner or NeonRunner(settings)
-        self.codex_runner = codex_runner or CodexRunner(settings)
-        self.claude_runner = claude_runner or ClaudeRunner(settings)
+        self._runners: dict[str, Any] = dict(runners) if runners else {}
+        for name, override in (
+            ("neon", neon_runner),
+            ("codex", codex_runner),
+            ("claude", claude_runner),
+        ):
+            if override is not None:
+                self._runners[name] = override
+        for adapter in self.registry.adapters():
+            if adapter.name not in self._runners:
+                self._runners[adapter.name] = adapter.create_runner(settings)
         # Set by the server at startup when this bridge runs inside a bridge job. Nothing starts then.
         self.nesting: Nesting = NOT_NESTED
 
@@ -247,14 +239,41 @@ class JobManager:
             process_identity_fn=self._process_identity,
         )
 
-    def _runner_for(self, backend: str) -> NeonRunner | CodexRunner | ClaudeRunner:
-        if backend == "neon":
-            return self.neon_runner
-        if backend == "codex":
-            return self.codex_runner
-        if backend == "claude":
-            return self.claude_runner
-        raise ValueError(f"No runner for backend {backend!r}.")
+    @property
+    def neon_runner(self) -> Any:
+        return self.runner_for("neon")
+
+    @neon_runner.setter
+    def neon_runner(self, value: Any) -> None:
+        self._runners["neon"] = value
+
+    @property
+    def codex_runner(self) -> Any:
+        return self.runner_for("codex")
+
+    @codex_runner.setter
+    def codex_runner(self, value: Any) -> None:
+        self._runners["codex"] = value
+
+    @property
+    def claude_runner(self) -> Any:
+        return self.runner_for("claude")
+
+    @claude_runner.setter
+    def claude_runner(self, value: Any) -> None:
+        self._runners["claude"] = value
+
+    def runner_for(self, backend: str) -> Any:
+        runner = self._runners.get(backend)
+        if runner is not None:
+            return runner
+        adapter = self.registry.get(backend)
+        runner = adapter.create_runner(self.settings)
+        self._runners[adapter.name] = runner
+        return runner
+
+    def _runner_for(self, backend: str) -> Any:
+        return self.runner_for(backend)
 
     async def _db(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Run a SQLite store call off the asyncio event loop so lock waits never stall MCP traffic."""
@@ -420,7 +439,7 @@ class JobManager:
                     prior.backend,
                     prior_model_label,
                 )
-            elif _JOB_ID_RE.fullmatch(token):
+            elif self.registry.is_job_id(token):
                 # Shaped like a job id, and no such job: never forward it to the CLI as a session id.
                 raise ValueError(
                     f"No job {token!r} was found to resume. It may have been removed from the stored history "
@@ -432,7 +451,7 @@ class JobManager:
 
         hinted_model: str | None = model.strip() if model and model.strip() else None
         if backend and backend.strip():
-            resolved_backend, hinted_model = resolve_backend_and_model_hint(backend, model)
+            resolved_backend, hinted_model = self.registry.resolve_backend_and_model_hint(backend, model)
             if inferred_backend and resolved_backend != inferred_backend:
                 raise ValueError(
                     f"Job {resume_from!r} belongs to backend {inferred_backend!r}, "
@@ -441,9 +460,13 @@ class JobManager:
         elif inferred_backend is not None:
             resolved_backend = inferred_backend
         else:
-            raise ValueError(
-                "backend is required ('neon', 'agy-claude', 'agy-opus', 'agy-gpt', 'codex', or 'claude')."
-            )
+            available = ", ".join(repr(n) for n in self.registry.backend_names())
+            raise ValueError(f"backend is required ({available}).")
+
+        adapter = self.registry.get(resolved_backend)
+
+        if resolved_session_id and not adapter.capabilities.resume:
+            raise ValueError(f"Backend {resolved_backend!r} does not support resuming sessions.")
 
         # Also inherit latest executed session context when resuming by raw session_id (or if newer turn exists).
         if resolved_session_id:
@@ -472,17 +495,23 @@ class JobManager:
                     prior_quota_pool = latest_ctx.get("quota_pool")
 
         resolved_mode = normalize_mode(mode)
-        if worktree and resolved_backend not in WORKTREE_BACKENDS:
-            raise ValueError("worktree=True is only supported for the 'codex' and 'claude' backends.")
+        if worktree and not adapter.capabilities.worktree:
+            supported = [repr(a.name) for a in self.registry.adapters() if a.capabilities.worktree]
+            supported_text = (
+                " and ".join(supported)
+                if len(supported) <= 2
+                else ", ".join(supported[:-1]) + f", and {supported[-1]}"
+            )
+            raise ValueError(f"worktree=True is only supported for the {supported_text} backends.")
         if worktree and resolved_mode != "edit":
             raise ValueError("worktree=True requires mode='edit'.")
 
         explicit_effort = bool(effort and effort.strip())
-        # Don't let an inherited effort from a prior turn override an explicitly supplied Neon model tier (e.g. `neon-low`).
+        # Don't let an inherited effort override an explicit model name on backends whose model encodes effort.
         should_inherit_effort = (
             (not explicit_effort)
             and (inferred_effort is not None)
-            and (resolved_backend != "neon" or hinted_model is None)
+            and (not adapter.capabilities.model_encodes_effort or hinted_model is None)
         )
         resolved_effort = normalize_effort(effort if explicit_effort else (inferred_effort if should_inherit_effort else None))
         explicit_cwd = bool(cwd and cwd.strip())
@@ -533,13 +562,13 @@ class JobManager:
             resolved_cwd = self._validate_cwd(cwd if explicit_cwd else inferred_cwd)
 
         resolved_extra_dirs = self._validate_extra_dirs(extra_dirs)
-        resolved_timeout = clamp_timeout(timeout_seconds, self.settings.default_timeout_seconds)
+        default_timeout = adapter.defaults(self.settings).timeout_seconds or self.settings.default_timeout_seconds
+        resolved_timeout = clamp_timeout(timeout_seconds, default_timeout)
 
-        if resolved_backend == "codex" and resolved_session_id and resolved_extra_dirs:
-            raise ValueError(
-                "extra_dirs is not supported when resuming a Codex session "
-                "(`codex exec resume` does not accept --add-dir). Start a new Codex session instead."
-            )
+        if resolved_extra_dirs and not adapter.capabilities.extra_dirs:
+            raise ValueError(f"extra_dirs is not supported for backend {resolved_backend!r}.")
+        if not adapter.capabilities.extra_dirs_on_resume and resolved_session_id and resolved_extra_dirs:
+            raise ValueError(adapter.extra_dirs_on_resume_error())
 
         # Inherit prior model intent & parent_run on resume unless caller explicitly overrode them.
         requested_model = hinted_model if hinted_model is not None else inferred_model
@@ -1096,6 +1125,7 @@ class JobManager:
         tracker: ProcessTracker,
         deadline: float,
     ) -> None:
+        adapter = self.registry.get(request.backend)
         runner = self._runner_for(request.backend)
         progress_pending: list[dict[str, Any]] = []
         progress_flusher: asyncio.Task[None] | None = None
@@ -1391,7 +1421,7 @@ class JobManager:
             record.last_activity_at = started_ts
 
             # 3. Pre-assign a dedicated Git worktree BEFORE launch and persist planned path before invoking Git.
-            if request.backend in WORKTREE_BACKENDS and request.worktree:
+            if adapter.capabilities.worktree and request.worktree:
                 on_activity("preparing git worktree")
                 wt_info = await prepare_job_worktree(
                     job_id=record.job_id,
@@ -1430,7 +1460,7 @@ class JobManager:
 
             prior_watermark = (
                 await self._db(self.store.get_session_watermark, request.backend, request.session_id)
-                if request.backend == "neon" and request.session_id
+                if adapter.capabilities.cumulative_session_usage and request.session_id
                 else None
             )
 
@@ -1480,9 +1510,9 @@ class JobManager:
             record.status = "cancelled"
             record.failure_reason = "cancelled"
             record.provider_state = "stopped" if (stopped and not remote_running) else "possibly_running"
-            record.error = AGY_REMOTE_TURN_CANCEL_ERROR if remote_running else "Job cancelled."
+            record.error = adapter.remote_turn_cancel_error() if remote_running else "Job cancelled."
             record.retry_guidance = (
-                _agy_remote_turn_cancel_guidance(record.job_id)
+                adapter.remote_turn_cancel_guidance(record.job_id)
                 if remote_running
                 else "Subprocess tree was verified stopped. For edit tasks inspect git status/diff before retrying."
                 if stopped
@@ -1672,9 +1702,9 @@ class JobManager:
                 record.status = "cancelled"
                 record.failure_reason = "cancelled"
                 record.provider_state = "stopped" if (stopped and not remote_running) else "possibly_running"
-                record.error = AGY_REMOTE_TURN_CANCEL_ERROR if remote_running else "Job cancelled."
+                record.error = adapter.remote_turn_cancel_error() if remote_running else "Job cancelled."
                 record.retry_guidance = (
-                    _agy_remote_turn_cancel_guidance(record.job_id)
+                    adapter.remote_turn_cancel_guidance(record.job_id)
                     if remote_running
                     else "Subprocess tree was verified stopped. For edit tasks inspect git status/diff before retrying."
                     if stopped
@@ -1771,8 +1801,8 @@ class JobManager:
             )
             # Only after the job's terminal row is committed: a quota reading is a nicety, and nothing
             # that happens while storing it (a lock, a cancel) may stand between a finished job and its row.
-            if finalized_committed and record.backend == "claude":
-                await self._remember_claude_rate_limit(result.provider_metrics)
+            if finalized_committed:
+                await self._remember_job_quota(adapter, result.provider_metrics)
         finally:
             CURRENT_PROCESS_TRACKER.reset(tracker_token)
             if tracker.has_alive_processes():
@@ -2104,14 +2134,19 @@ class JobManager:
         remote_running = local_record.provider_state == "possibly_running"
 
         if not local_record.is_terminal:
+            local_adapter = self.registry.get_optional(local_record.backend)
             self._cancelled_ids.discard(job_id)
             local_record.status = "cancelled"
             local_record.failure_reason = "cancelled"
             local_record.provider_state = "stopped" if (verified_stopped and not remote_running) else "possibly_running"
-            local_record.error = AGY_REMOTE_TURN_CANCEL_ERROR if remote_running else "Job cancelled."
+            local_record.error = (
+                local_adapter.remote_turn_cancel_error()
+                if remote_running and local_adapter is not None
+                else "Job cancelled."
+            )
             local_record.retry_guidance = (
-                _agy_remote_turn_cancel_guidance(job_id)
-                if remote_running
+                local_adapter.remote_turn_cancel_guidance(job_id)
+                if remote_running and local_adapter is not None
                 else "Job was cancelled and verified stopped."
                 if verified_stopped
                 else "Job cancellation requested, but process cleanup did not finish within timeout. "
@@ -2286,12 +2321,13 @@ class JobManager:
             process_identity_fn=self._process_identity,
         )
         # Each backend on its own, so that one reading that fails does not take the others with it.
+        quota_backends = [a.name for a in self.registry.adapters() if a.quota_pools]
         results = await asyncio.gather(
-            *(self.get_quota([name], store=False) for name in ALL_BACKENDS),
+            *(self.get_quota([name], store=False) for name in quota_backends),
             return_exceptions=True,
         )
         readings: dict[str, Any] = {}
-        for name, result in zip(ALL_BACKENDS, results):
+        for name, result in zip(quota_backends, results):
             if isinstance(result, Exception):
                 logger.debug("Could not read %s quota for the dashboard: %s", name, result)
                 readings[name] = {
@@ -2307,17 +2343,21 @@ class JobManager:
             readings_out.update(readings)
         return build_dashboard(records, window=window, owner_id=self.owner_id, now_ts=now_ts, quota=readings)
 
-    async def _remember_claude_rate_limit(self, provider_metrics: dict[str, Any] | None) -> None:
-        """Keep the plan limits a Claude job reported, as the only quota reading there is for that pool."""
+    async def _remember_job_quota(
+        self,
+        adapter: BackendAdapter,
+        provider_metrics: dict[str, Any] | None,
+    ) -> None:
+        """Persist a passive quota reading reported by a finished job, when its adapter provides one."""
         try:
-            info = provider_metrics.get("rate_limit") if isinstance(provider_metrics, dict) else None
-            reading = claude_quota_from_rate_limit(info)
+            reading = adapter.extract_job_quota(provider_metrics)
             if reading is None:
                 return
-            previous = await self._db(self.store.get_cached_quota, "claude", float("inf"))
-            await self._db(self.store.set_cached_quota, "claude", merge_claude_quota(previous, reading))
+            previous = await self._db(self.store.get_cached_quota, adapter.name, float("inf"))
+            merged = adapter.merge_cached_quota(previous, reading)
+            await self._db(self.store.set_cached_quota, adapter.name, merged)
         except Exception as exc:
-            logger.debug("Could not store Claude rate limit reading: %s", exc)
+            logger.debug("Could not store %s rate limit reading: %s", adapter.name, exc)
 
     async def get_quota(
         self,
@@ -2327,55 +2367,20 @@ class JobManager:
     ) -> dict[str, Any]:
         """Each backend's quota reading. `store=False` keeps a fresh reading out of the cache."""
 
-        async def _probe_one(bname: str) -> tuple[str, dict[str, Any]]:
-            if bname == "claude":
-                # Claude Code has no command that prints the plan limits. The reading is whatever the
-                # Claude jobs' output carried, however old, each window until its own reset passes.
-                last = without_passed_windows(
-                    await self._db(self.store.get_cached_quota, "claude", float("inf"))
-                )
-                if last is None:
-                    return bname, {
-                        "backend": "claude",
-                        "pool": "claude",
-                        "status": "unknown",
-                        "source": "last_claude_job",
-                        "note": CLAUDE_QUOTA_NOTE,
-                    }
-                return bname, enrich_quota_reading(last)
-
-            cached = await self._db(
-                self.store.get_cached_quota,
-                bname,
-                self.settings.quota_cache_ttl_seconds,
+        async def _probe_one(bname: str) -> tuple[str, dict[str, Any] | None]:
+            adapter = self.registry.get(bname)
+            runner = self._runner_for(adapter.name)
+            res = await adapter.read_quota(
+                runner,
+                store=self.store,
+                db_call=self._db,
+                ttl_seconds=self.settings.quota_cache_ttl_seconds,
+                save_to_cache=store,
             )
-            if cached is not None and not has_passed_reset(cached):
-                return bname, enrich_quota_reading(cached)
-
-            if bname == "codex":
-                try:
-                    cmd = self.codex_runner.resolve_command()
-                except Exception as exc:
-                    return bname, {"backend": "codex", "pool": "codex", "status": "unknown", "error": str(exc)}
-                res = await fetch_codex_quota(cmd)
-            else:
-                try:
-                    cmd = self.neon_runner.resolve_command()
-                except Exception as exc:
-                    return bname, {"backend": "neon", "status": "unknown", "error": str(exc)}
-                res = await fetch_neon_quota(cmd)
-
-            res = enrich_quota_reading(res)
-            res["cached"] = False
-            if store and res.get("status") == "ok":
-                try:
-                    await self._db(self.store.set_cached_quota, bname, res)
-                except Exception:
-                    pass
             return bname, res
 
         pairs = await asyncio.gather(*(_probe_one(b) for b in backends))
-        return dict(pairs)
+        return {name: reading for name, reading in pairs if reading is not None}
 
     async def shutdown(self, *, flush_timeout: float = 20.0) -> None:
         # 1. Cancel ONLY active jobs that have NOT already reached terminal finalization.

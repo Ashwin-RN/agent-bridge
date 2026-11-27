@@ -1,28 +1,31 @@
-"""Opt-in live subscription quota lookups, reset countdowns, and weekly-reset routing advisory."""
+"""Subscription quota enrichment, reset countdowns, and weekly-reset routing advisory."""
 
 from __future__ import annotations
 
-import asyncio
 import copy
-import json
 import logging
 import math
 import re
-import time
 from datetime import datetime, timezone
 from typing import Any
 
-from agent_bridge.process_control import ManagedProcess, communicate_managed, spawn_managed_process
+from agent_bridge.backends.agy import (
+    fetch_neon_quota,
+    parse_neon_usage_envelope,
+)
+from agent_bridge.backends.claude import (
+    CLAUDE_QUOTA_NOTE,
+    claude_quota_from_rate_limit,
+    merge_claude_quota,
+)
+from agent_bridge.backends.codex import (
+    fetch_codex_quota,
+    parse_codex_rate_limits,
+)
+from agent_bridge.backends.registry import get_adapter_optional, get_default_registry
 
 logger = logging.getLogger("agent_bridge.quota")
 
-_QUOTA_VIEW_POOLS: tuple[tuple[str, str, str], ...] = (
-    ("codex", "codex", "Codex CLI"),
-    ("agy_gemini", "neon", "Antigravity Gemini"),
-    ("agy_claude_gpt", "neon", "Antigravity Claude+GPT"),
-    ("claude", "claude", "Claude Code"),
-)
-_AGY_POOLS: frozenset[str] = frozenset({"agy_gemini", "agy_claude_gpt"})
 _FIVE_HOUR_MAX_MINS = 6 * 60
 _WEEKLY_MIN_MINS = 6 * 1440
 _REASON_LIMIT = 160
@@ -126,36 +129,6 @@ def _as_number(val: Any) -> float | None:
     return float(val)
 
 
-def _infer_agy_group_pool(group_name: str, buckets: list[dict[str, Any]]) -> str | None:
-    low = group_name.lower()
-    if any(tok in low for tok in ("claude", "gpt", "3p", "third")):
-        return "agy_claude_gpt"
-    for b in buckets:
-        if not isinstance(b, dict):
-            continue
-        bid = str(b.get("id") or "").lower()
-        if bid.startswith("3p-"):
-            return "agy_claude_gpt"
-    if "gemini" in low:
-        return "agy_gemini"
-    for b in buckets:
-        if not isinstance(b, dict):
-            continue
-        bid = str(b.get("id") or "").lower()
-        if bid == "gemini" or bid.startswith("gemini-") or bid.startswith("1p-"):
-            return "agy_gemini"
-    return None
-
-
-def _extract_models_from_description(description: str | None) -> list[str]:
-    if not description or not isinstance(description, str):
-        return []
-    m = re.search(r"models\s+within\s+this\s+group\s*:\s*(.+)$", description.strip(), re.I)
-    if not m:
-        return []
-    return [part.strip() for part in m.group(1).split(",") if part.strip()]
-
-
 def _enrich_window(
     win: dict[str, Any],
     *,
@@ -253,11 +226,7 @@ def without_passed_windows(
     *,
     now_utc: datetime | None = None,
 ) -> dict[str, Any] | None:
-    """A reading without the windows whose reset has passed. None when no window is left.
-
-    For the Claude plan, whose windows are reported by different jobs and reset on their own: a 5h
-    window that has reset says nothing about the week.
-    """
+    """A reading without the windows whose reset has passed. None when no window is left."""
     if not isinstance(reading, dict) or reading.get("status") != "ok":
         return None
     now = now_utc or datetime.now(timezone.utc)
@@ -282,24 +251,25 @@ def enrich_quota_reading(
     *,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
-    """Return a copy of a Codex or Neon quota reading with live reset countdowns and pacing signals."""
+    """Return a copy of a quota reading with live reset countdowns and pacing signals."""
     now = now_utc or datetime.now(timezone.utc)
     out = copy.deepcopy(reading)
     if out.get("status") != "ok":
         return out
 
+    enrich_win = lambda w: _enrich_window(w, now_utc=now)
+    adapter = get_adapter_optional(out.get("backend"))
+    if adapter is not None:
+        return adapter.enrich_quota_reading(out, enrich_win)
+
     if isinstance(out.get("windows"), list):
         out["pool"] = out.get("pool") or "codex"
-        out["windows"] = [_enrich_window(w, now_utc=now) for w in out["windows"]]
-
+        out["windows"] = [enrich_win(w) for w in out["windows"]]
     if isinstance(out.get("groups"), list):
-        for g in out["groups"]:
-            if not isinstance(g, dict):
-                continue
-            wins = g.get("windows") or []
-            g["pool"] = g.get("pool") or _infer_agy_group_pool(str(g.get("name") or ""), wins)
-            g["windows"] = [_enrich_window(w, now_utc=now) for w in wins]
-
+        for candidate in get_default_registry().adapters():
+            if len(candidate.quota_pools) > 1:
+                out = candidate.enrich_quota_reading(out, enrich_win)
+                break
     return out
 
 
@@ -316,6 +286,9 @@ def build_quota_advisory(
     pools_info: list[dict[str, Any]] = []
     expiring_weekly_alerts: list[str] = []
     upcoming_resets: list[dict[str, Any]] = []
+    registry = get_default_registry()
+    spec_by_pool = {spec.pool: spec for spec in registry.quota_pools()}
+    default_labels = {"codex": codex_default_label, "claude": claude_default_label}
 
     def _summarize_pool(
         *,
@@ -380,6 +353,7 @@ def build_quota_advisory(
         w5_rem = _as_number(win_5h.get("remaining_percent")) if win_5h else None
         wk_rem = _as_number(win_weekly.get("remaining_percent")) if win_weekly else None
         has_stale = any(bool(w.get("stale_reset")) for w in windows)
+        spec = spec_by_pool.get(pool)
 
         # Determine routing priority & human recommendation.
         if has_stale:
@@ -401,10 +375,14 @@ def build_quota_advisory(
             # What is left of this plan before its reset is also what the user's own sessions run on.
             # Say what is there, and never urge a host to spend it.
             priority = "normal"
+            shared_tail = (
+                spec.shared_advisory_note
+                if spec is not None and spec.shared_advisory_note
+                else "It is the same allowance the user's own sessions use."
+            )
             rec = (
                 f"{label} has weekly {wk_rem if wk_rem is not None else '?'}% left, resetting in "
-                f"{win_weekly.get('resets_in') if win_weekly else 'unknown'}. It is the same allowance the "
-                "user's own Claude sessions use: spend it only when the task calls for Claude."
+                f"{win_weekly.get('resets_in') if win_weekly else 'unknown'}. {shared_tail}"
             )
         elif wk_sig == "expiring_soon_use_it" and (w5_rem is None or w5_rem > 5.0):
             priority = "use_before_reset"
@@ -468,64 +446,17 @@ def build_quota_advisory(
             pool_entry["shared_with_own_use"] = True
         pools_info.append(pool_entry)
 
-    # Codex pool
-    codex_q = quota_by_backend.get("codex")
-    if isinstance(codex_q, dict) and codex_q.get("status") == "ok":
-        enriched_codex = enrich_quota_reading(codex_q, now_utc=now)
-        codex_models = [codex_default_label] if codex_default_label else ["gpt-6.2-sol (high)"]
-        _summarize_pool(
-            pool="codex",
-            backend="codex",
-            label="Codex CLI",
-            windows=enriched_codex.get("windows") or [],
-            models=codex_models,
-            rate_limit_reached=bool(enriched_codex.get("rate_limit_reached")),
-        )
-
-    # Claude plan pool: known only from what the last Claude job reported.
-    claude_q = quota_by_backend.get("claude")
-    if isinstance(claude_q, dict) and claude_q.get("status") == "ok":
-        enriched_claude = enrich_quota_reading(claude_q, now_utc=now)
-        _summarize_pool(
-            pool="claude",
-            backend="claude",
-            label="Claude Code",
-            windows=enriched_claude.get("windows") or [],
-            models=[claude_default_label] if claude_default_label else ["sonnet (high)"],
-            rate_limit_reached=bool(enriched_claude.get("rate_limit_reached")),
-            shared_with_own_use=True,
-        )
-
-    # Antigravity pools (both `Gemini Models` AND `Claude and GPT models`!)
-    neon_q = quota_by_backend.get("neon")
-    if isinstance(neon_q, dict) and neon_q.get("status") == "ok":
-        enriched_neon = enrich_quota_reading(neon_q, now_utc=now)
-        agy_grouped: dict[str, dict[str, Any]] = {}
-        for group in enriched_neon.get("groups") or []:
-            if not isinstance(group, dict):
-                continue
-            pool_name = group.get("pool")
-            if pool_name not in _AGY_POOLS:
-                continue
-            bucket = agy_grouped.setdefault(
-                str(pool_name),
-                {
-                    "label": str(group.get("name") or pool_name),
-                    "windows": [],
-                    "models": list((neon_pool_models or {}).get(str(pool_name)) or []),
-                },
-            )
-            bucket["windows"].extend(w for w in group.get("windows") or [] if isinstance(w, dict))
-            if not bucket["models"] and group.get("models"):
-                bucket["models"] = list(group["models"])
-        for pool_name, bucket in agy_grouped.items():
-            _summarize_pool(
-                pool=pool_name,
-                backend="neon",
-                label=bucket["label"],
-                windows=bucket["windows"],
-                models=bucket["models"],
-            )
+    for adapter in registry.dashboard_backends():
+        reading = quota_by_backend.get(adapter.name)
+        if not isinstance(reading, dict) or reading.get("status") != "ok":
+            continue
+        enriched = enrich_quota_reading(reading, now_utc=now)
+        for descriptor in adapter.advisory_pools(
+            enriched,
+            neon_pool_models=neon_pool_models,
+            default_label=default_labels.get(adapter.name),
+        ):
+            _summarize_pool(**descriptor)
 
     priority_rank = {
         "use_before_reset": 0,
@@ -668,33 +599,21 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
     """Build one compact quota view with every pool listed once in fixed order."""
     now_utc = datetime.fromtimestamp(float(now), tz=timezone.utc) if now is not None else datetime.now(timezone.utc)
     readings = quota if isinstance(quota, dict) else {}
+    registry = get_default_registry()
+    pool_specs = registry.quota_pools()
+    spec_by_pool = {spec.pool: spec for spec in pool_specs}
 
     raw_windows_by_pool: dict[str, list[dict[str, Any]]] = {}
-    unrecognised_agy_groups: list[str] = []
+    unrecognised_entries: list[tuple[str, str, str]] = []
 
-    for backend in ("codex", "claude"):
-        reading = readings.get(backend)
+    for adapter in registry.adapters():
+        reading = readings.get(adapter.name)
         if isinstance(reading, dict) and reading.get("status") == "ok":
-            raw_windows_by_pool[backend] = [w for w in reading.get("windows") or [] if isinstance(w, dict)]
-
-    neon_reading = readings.get("neon")
-    if isinstance(neon_reading, dict) and neon_reading.get("status") == "ok":
-        for group in neon_reading.get("groups") or []:
-            if not isinstance(group, dict):
-                continue
-            gname = str(group.get("name") or "unnamed")
-            gwins = [w for w in group.get("windows") or [] if isinstance(w, dict)]
-            explicit_pool = group.get("pool")
-            if explicit_pool in _AGY_POOLS:
-                resolved_pool: str | None = str(explicit_pool)
-            elif explicit_pool is None or explicit_pool == "":
-                resolved_pool = _infer_agy_group_pool(gname, gwins)
-            else:
-                resolved_pool = None
-            if resolved_pool in _AGY_POOLS:
-                raw_windows_by_pool.setdefault(resolved_pool, []).extend(gwins)
-            else:
-                unrecognised_agy_groups.append(gname)
+            extracted, unrec = adapter.extract_quota_windows(reading)
+            for pool_name, wins in extracted.items():
+                raw_windows_by_pool.setdefault(pool_name, []).extend(wins)
+            for gname in unrec:
+                unrecognised_entries.append(adapter.format_unrecognised_quota_group(gname))
 
     pools_out: list[dict[str, Any]] = []
     unread: list[dict[str, str]] = []
@@ -702,7 +621,10 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
     used_read_times: list[Any] = []
     sort_meta: dict[str, tuple[str, float, float]] = {}
 
-    for pool, backend, label in _QUOTA_VIEW_POOLS:
+    for spec in pool_specs:
+        pool = spec.pool
+        backend = spec.backend
+        label = spec.label
         reading = readings.get(backend)
         reading_dict = reading if isinstance(reading, dict) else {}
         pool_raw_wins = raw_windows_by_pool.get(pool)
@@ -724,8 +646,8 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
         vw_wk = _view_window(win_wk)
 
         if vw_5h is None and vw_wk is None:
-            if pool == "claude" and not reading_dict.get("error") and reading_dict.get("status") != "ok":
-                reason = "no reading: no Claude job has reported one"
+            if spec.quota_view_no_reading and not reading_dict.get("error") and reading_dict.get("status") != "ok":
+                reason = spec.quota_view_no_reading
                 failed = False
             elif reading_dict.get("error"):
                 reason = _short_reason(reading_dict["error"])
@@ -734,7 +656,7 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
                 reason = "reading holds no 5h or weekly window"
                 failed = True
             elif reading_dict.get("status") == "ok":
-                source_label = "Antigravity" if backend == "neon" else label
+                source_label = spec.source_label or label
                 reason = f"{source_label} reported no window for this pool"
                 failed = True
             elif not reading_dict:
@@ -774,7 +696,7 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
         rate_limit_reached = bool(reading_dict.get("rate_limit_reached"))
         w5_state = vw_5h["state"] if vw_5h else None
         wk_state = vw_wk["state"] if vw_wk else None
-        shared = pool == "claude"
+        shared = spec.shared_with_own_use
 
         if has_stale:
             priority = "stale"
@@ -789,18 +711,19 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
             else:
                 note = "exhausted"
         elif shared:
+            suffix = spec.shared_note_suffix
             if wk_sig in {"low", "burning_fast"} or w5_sig == "low":
                 priority = "conserve"
-                note = f"running low ({_pct_summary(vw_5h, vw_wk)}); shared with your own Claude sessions"
+                note = f"running low ({_pct_summary(vw_5h, vw_wk)}); {suffix}"
             elif wk_sig == "expiring_soon_use_it" or w5_sig == "expiring_soon_use_it":
                 priority = "normal"
-                note = f"{_pct_summary(vw_5h, vw_wk)} left; shared with your own Claude sessions"
+                note = f"{_pct_summary(vw_5h, vw_wk)} left; {suffix}"
             elif eff_rem >= 70.0 or wk_sig == "ahead_of_pace":
                 priority = "high"
-                note = f"healthy headroom ({_pct_summary(vw_5h, vw_wk)}); shared with your own Claude sessions"
+                note = f"healthy headroom ({_pct_summary(vw_5h, vw_wk)}); {suffix}"
             else:
                 priority = "normal"
-                note = f"moderate headroom ({_pct_summary(vw_5h, vw_wk)}); shared with your own Claude sessions"
+                note = f"moderate headroom ({_pct_summary(vw_5h, vw_wk)}); {suffix}"
         elif (
             wk_sig == "expiring_soon_use_it"
             and wk_rem is not None
@@ -843,9 +766,9 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
         wk_secs = float(wk_secs_raw) if isinstance(wk_secs_raw, int) and wk_secs_raw > 0 else float(10**9)
         sort_meta[pool] = (priority, eff_rem, wk_secs)
 
-    for gname in unrecognised_agy_groups:
-        unread.append({"pool": "agy_unknown", "reason": f"unrecognised Antigravity group: {gname}"})
-        failed_unread_names.append(f"agy_unknown ({gname})")
+    for pool_key, reason, failed_label in unrecognised_entries:
+        unread.append({"pool": pool_key, "reason": reason})
+        failed_unread_names.append(failed_label)
 
     priority_rank = {
         "use_before_reset": 0,
@@ -857,7 +780,8 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
     routable = [
         p
         for p in pools_out
-        if p["pool"] != "claude" and p["priority"] not in {"avoid", "stale", "unknown"}
+        if not spec_by_pool[p["pool"]].shared_with_own_use
+        and p["priority"] not in {"avoid", "stale", "unknown"}
     ]
 
     def _order_key(p: dict[str, Any]) -> tuple[int, float, float]:
@@ -872,7 +796,12 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
 
     stale_names = [p["pool"] for p in pools_out if p["priority"] == "stale"]
     avoid_names = [p["pool"] for p in pools_out if p["priority"] == "avoid"]
-    claude_entry = next(p for p in pools_out if p["pool"] == "claude")
+    shared_usable = [
+        p["pool"]
+        for p in pools_out
+        if spec_by_pool[p["pool"]].shared_with_own_use
+        and p["priority"] not in {"avoid", "stale", "unknown"}
+    ]
 
     if routable_sorted:
         top = routable_sorted[0]
@@ -883,8 +812,8 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
         else:
             _, top_eff, _ = sort_meta[top["pool"]]
             headline = f"Route to {top['pool']} first ({_clean_pct(top_eff)}% left)"
-    elif claude_entry["priority"] not in {"avoid", "stale", "unknown"}:
-        headline = "No routable pool available; only claude has room (shared with your own sessions)"
+    elif shared_usable:
+        headline = f"No routable pool available; only {', '.join(shared_usable)} has room (shared with your own sessions)"
     elif stale_names:
         headline = f"No fresh usable pools ({', '.join(stale_names)} stale); refresh quota"
     elif avoid_names:
@@ -906,430 +835,17 @@ def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict
     }
 
 
-CLAUDE_QUOTA_NOTE = (
-    "Claude Code has no command that prints the plan limits. This pool's reading is what the Claude "
-    "jobs the bridge ran reported: each window is kept until its own reset passes, and the pool is "
-    "unknown when none is left. Claude jobs draw on the same plan limits as your own Claude Code and "
-    "claude.ai use."
-)
-
-# The names Claude Code gives its limit windows, as the bridge labels them.
-_CLAUDE_WINDOW_LABELS = {"five_hour": "5h", "seven_day": "weekly"}
-
-
-def claude_quota_from_rate_limit(
-    info: Any,
-    *,
-    fetched_at: str | None = None,
-) -> dict[str, Any] | None:
-    """Turn the `rate_limit_info` of a `claude -p` stream into a quota reading. None if it holds no window."""
-    if not isinstance(info, dict):
-        return None
-
-    raw_windows: dict[str, Any] = {}
-    unified = info.get("unifiedWindows")
-    if isinstance(unified, dict):
-        raw_windows.update({str(k): v for k, v in unified.items() if isinstance(v, dict)})
-    kind = info.get("rateLimitType")
-    if isinstance(kind, str) and kind and kind not in raw_windows:
-        raw_windows[kind] = info
-
-    windows: list[dict[str, Any]] = []
-    for key, raw in raw_windows.items():
-        used = _as_number(raw.get("utilization"))
-        if used is None or used < 0.0:
-            continue
-        used_pct = round(min(100.0, used * 100.0), 1)
-        windows.append(
-            {
-                "id": key,
-                "window": _CLAUDE_WINDOW_LABELS.get(key, key),
-                "used_percent": used_pct,
-                "remaining_percent": round(max(0.0, 100.0 - used_pct), 1),
-                "reset_time": _epoch_to_iso(raw.get("resetsAt")),
-            }
-        )
-    if not windows:
-        return None
-
-    return {
-        "backend": "claude",
-        "pool": "claude",
-        "status": "ok",
-        "source": "last_claude_job",
-        "fetched_at": fetched_at or _iso_now(),
-        "rate_limit_reached": info.get("status") == "rejected",
-        "windows": windows,
-        "note": CLAUDE_QUOTA_NOTE,
-    }
-
-
-def merge_claude_quota(
-    previous: dict[str, Any] | None,
-    new: dict[str, Any],
-    *,
-    now_utc: datetime | None = None,
-) -> dict[str, Any]:
-    """Keep the windows an older reading had and the new one does not mention, while they are still current.
-
-    A Claude job reports only the window that is closest to its limit, so one job's reading is partial.
-    A window that is kept carries the time it was read, which is older than the merged reading's.
-    """
-    now = now_utc or datetime.now(timezone.utc)
-    merged = {k: v for k, v in new.items() if k not in {"cached", "cache_age_seconds"}}
-    seen = {str(w.get("id")) for w in merged.get("windows") or []}
-    kept: list[dict[str, Any]] = []
-    if isinstance(previous, dict) and previous.get("status") == "ok":
-        for w in previous.get("windows") or []:
-            if not isinstance(w, dict) or str(w.get("id")) in seen:
-                continue
-            reset_dt = _parse_iso_utc(w.get("reset_time"))
-            if reset_dt is None or (reset_dt - now).total_seconds() <= 0:
-                continue
-            carried = {
-                k: w[k] for k in ("id", "window", "used_percent", "remaining_percent", "reset_time") if k in w
-            }
-            carried["fetched_at"] = w.get("fetched_at") or previous.get("fetched_at")
-            kept.append(carried)
-    merged["windows"] = [*(merged.get("windows") or []), *kept]
-    return merged
-
-
-def parse_codex_rate_limits(
-    result: dict[str, Any],
-    *,
-    fetched_at: str | None = None,
-    now_utc: datetime | None = None,
-) -> dict[str, Any]:
-    """Parse `codex app-server` `account/rateLimits/read` result into a clean quota summary."""
-    ts = fetched_at or _iso_now()
-    rl = result.get("rateLimits")
-    if not isinstance(rl, dict):
-        return {
-            "backend": "codex",
-            "pool": "codex",
-            "status": "unknown",
-            "fetched_at": ts,
-            "error": "Missing rateLimits object in Codex app-server response.",
-        }
-
-    windows: list[dict[str, Any]] = []
-    for slot in ("primary", "secondary"):
-        bucket = rl.get(slot)
-        if not isinstance(bucket, dict):
-            continue
-        used_num = _as_number(bucket.get("usedPercent"))
-        if used_num is None or used_num < 0.0 or used_num > 100.0:
-            continue
-        used_pct = round(used_num, 1)
-        rem_pct = round(max(0.0, 100.0 - used_pct), 1)
-        windows.append(
-            {
-                "slot": slot,
-                "window": _window_label(bucket.get("windowDurationMins")),
-                "used_percent": used_pct,
-                "remaining_percent": rem_pct,
-                "reset_time": _epoch_to_iso(bucket.get("resetsAt")),
-            }
-        )
-
-    if not windows:
-        return {
-            "backend": "codex",
-            "pool": "codex",
-            "status": "unknown",
-            "fetched_at": ts,
-            "plan_type": rl.get("planType"),
-            "windows": [],
-            "error": "Codex rateLimits contained no usable quota windows.",
-        }
-
-    out: dict[str, Any] = {
-        "backend": "codex",
-        "pool": "codex",
-        "status": "ok",
-        "fetched_at": ts,
-        "plan_type": rl.get("planType"),
-        "ordinary_usage_allowed": result.get("ordinaryUsageAllowed"),
-        "rate_limit_reached": bool(rl.get("rateLimitReachedType")) or bool(rl.get("spendControlReached")),
-        "windows": windows,
-    }
-    if rl.get("rateLimitReachedType"):
-        out["rate_limit_reached_type"] = rl.get("rateLimitReachedType")
-    return enrich_quota_reading(out, now_utc=now_utc)
-
-
-def parse_neon_usage_envelope(
-    payload: dict[str, Any],
-    *,
-    fetched_at: str | None = None,
-    now_utc: datetime | None = None,
-) -> dict[str, Any]:
-    """Parse `agy --output-format json --print=/usage` envelope (structured JSON + text fallback)."""
-    ts = fetched_at or _iso_now()
-    groups_out: list[dict[str, Any]] = []
-
-    cmd_data = payload.get("command", {}).get("data") if isinstance(payload.get("command"), dict) else None
-    raw_groups = cmd_data.get("groups") if isinstance(cmd_data, dict) else None
-
-    if isinstance(raw_groups, list):
-        for g in raw_groups:
-            if not isinstance(g, dict):
-                continue
-            windows: list[dict[str, Any]] = []
-            for b in g.get("buckets") or []:
-                if not isinstance(b, dict):
-                    continue
-                rem_frac = _as_number(b.get("remaining_fraction"))
-                if rem_frac is None or rem_frac < 0.0 or rem_frac > 1.0:
-                    continue
-                rem_pct = round(rem_frac * 100.0, 1)
-                used_pct = round(max(0.0, 100.0 - rem_pct), 1)
-                reset = b.get("reset_time")
-                if reset == "1970-01-01T00:00:00Z":
-                    reset = None
-                windows.append(
-                    {
-                        "id": b.get("id"),
-                        "window": b.get("window") or b.get("name"),
-                        "used_percent": used_pct,
-                        "remaining_percent": rem_pct,
-                        "reset_time": reset,
-                    }
-                )
-            if windows:
-                gname = str(g.get("name") or "unknown")
-                group_entry: dict[str, Any] = {
-                    "name": gname,
-                    "pool": _infer_agy_group_pool(gname, windows),
-                    "windows": windows,
-                }
-                models_list = _extract_models_from_description(g.get("description"))
-                if models_list:
-                    group_entry["models"] = models_list
-                groups_out.append(group_entry)
-
-    # Fallback: parse tab-separated response text if command.data had no usable windows.
-    if not groups_out and isinstance(payload.get("response"), str):
-        by_group: dict[str, list[dict[str, Any]]] = {}
-        for line in payload["response"].splitlines():
-            parts = [p.strip() for p in line.split("\t") if p.strip()]
-            if len(parts) < 3:
-                continue
-            gname, wname, pct_raw = parts[0], parts[1], parts[2]
-            reset = parts[3] if len(parts) >= 4 else None
-            if reset == "1970-01-01T00:00:00Z":
-                reset = None
-            m = re.search(r"(\d+(?:\.\d+)?)%", pct_raw)
-            if not m:
-                continue
-            rem_num = float(m.group(1))
-            if rem_num < 0.0 or rem_num > 100.0:
-                continue
-            rem_pct = round(rem_num, 1)
-            used_pct = round(max(0.0, 100.0 - rem_pct), 1)
-            by_group.setdefault(gname, []).append(
-                {
-                    "window": wname,
-                    "used_percent": used_pct,
-                    "remaining_percent": rem_pct,
-                    "reset_time": reset,
-                }
-            )
-        groups_out = [
-            {"name": k, "pool": _infer_agy_group_pool(k, v), "windows": v}
-            for k, v in by_group.items()
-            if v
-        ]
-
-    if not groups_out or not any(g.get("windows") for g in groups_out):
-        return {
-            "backend": "neon",
-            "status": "unknown",
-            "fetched_at": ts,
-            "error": "Could not parse usable quota windows from agy /usage output.",
-        }
-
-    return enrich_quota_reading(
-        {
-            "backend": "neon",
-            "status": "ok",
-            "fetched_at": ts,
-            "groups": groups_out,
-        },
-        now_utc=now_utc,
-    )
-
-
-async def fetch_codex_quota(codex_cmd: list[str], *, timeout_seconds: float = 12.0) -> dict[str, Any]:
-    """Perform a short-lived one-shot `codex app-server` `account/rateLimits/read` RPC."""
-    ts = _iso_now()
-    managed: ManagedProcess | None = None
-    deadline = time.monotonic() + max(0.1, timeout_seconds)
-    try:
-        proc, managed = await spawn_managed_process(
-            *codex_cmd,
-            "app-server",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=max(0.05, deadline - time.monotonic()),
-        )
-        assert proc.stdin is not None and proc.stdout is not None
-
-        messages = [
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {"name": "agent-bridge", "version": "0.3.0"},
-                    "capabilities": {},
-                },
-            },
-            {"jsonrpc": "2.0", "method": "initialized", "params": {}},
-            {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}},
-        ]
-        payload = "".join(json.dumps(m) + "\n" for m in messages).encode("utf-8")
-        proc.stdin.write(payload)
-        await asyncio.wait_for(proc.stdin.drain(), timeout=max(0.05, deadline - time.monotonic()))
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return {
-                    "backend": "codex",
-                    "pool": "codex",
-                    "status": "unknown",
-                    "fetched_at": ts,
-                    "error": f"Timed out reading Codex rate limits after {timeout_seconds:g}s.",
-                }
-            raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
-            if not raw_line:
-                break
-            text = raw_line.decode("utf-8", errors="replace").strip()
-            if not text.startswith("{"):
-                continue
-            try:
-                msg = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            if msg.get("id") == 2:
-                if "result" in msg and isinstance(msg["result"], dict):
-                    return parse_codex_rate_limits(msg["result"], fetched_at=ts)
-                err = msg.get("error", {})
-                return {
-                    "backend": "codex",
-                    "pool": "codex",
-                    "status": "unknown",
-                    "fetched_at": ts,
-                    "error": str(err.get("message") if isinstance(err, dict) else err),
-                }
-
-        return {
-            "backend": "codex",
-            "pool": "codex",
-            "status": "unknown",
-            "fetched_at": ts,
-            "error": "Codex app-server closed before returning rate limits.",
-        }
-    except TimeoutError:
-        return {
-            "backend": "codex",
-            "pool": "codex",
-            "status": "unknown",
-            "fetched_at": ts,
-            "error": f"Timed out reading Codex rate limits after {timeout_seconds:g}s.",
-        }
-    except Exception as exc:
-        return {
-            "backend": "codex",
-            "pool": "codex",
-            "status": "unknown",
-            "fetched_at": ts,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    finally:
-        if managed is not None:
-            await managed.terminate()
-
-
-async def fetch_neon_quota(agy_cmd: list[str], *, timeout_seconds: float = 15.0) -> dict[str, Any]:
-    """Perform a short-lived one-shot `agy --output-format json --print=/usage` probe."""
-    ts = _iso_now()
-    managed: ManagedProcess | None = None
-    deadline = time.monotonic() + max(0.1, timeout_seconds)
-    try:
-        proc, managed = await spawn_managed_process(
-            *agy_cmd,
-            "--mode",
-            "plan",
-            "--output-format",
-            "json",
-            "--print-timeout",
-            f"{max(1, int(timeout_seconds))}s",
-            "--print=/usage",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            timeout=max(0.05, deadline - time.monotonic()),
-        )
-        rem = deadline - time.monotonic()
-        if rem <= 0:
-            raise asyncio.TimeoutError("Timed out launching agy /usage probe.")
-        stdout_b, stderr_b, _ = await communicate_managed(proc, managed, timeout=rem)
-
-        stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
-        if proc.returncode != 0 or not stdout_text:
-            err = stderr_b.decode("utf-8", errors="replace").strip() or f"agy /usage exited {proc.returncode}"
-            return {
-                "backend": "neon",
-                "status": "unknown",
-                "fetched_at": ts,
-                "error": err[:400],
-            }
-
-        envelope: dict[str, Any] | None = None
-        try:
-            parsed = json.loads(stdout_text)
-            if isinstance(parsed, dict):
-                envelope = parsed
-        except json.JSONDecodeError:
-            for line in reversed(stdout_text.splitlines()):
-                line = line.strip()
-                if line.startswith("{"):
-                    try:
-                        parsed = json.loads(line)
-                        if isinstance(parsed, dict):
-                            envelope = parsed
-                            break
-                    except json.JSONDecodeError:
-                        continue
-
-        if envelope is None:
-            return {
-                "backend": "neon",
-                "status": "unknown",
-                "fetched_at": ts,
-                "error": "Non-JSON response from agy /usage.",
-            }
-
-        return parse_neon_usage_envelope(envelope, fetched_at=ts)
-    except TimeoutError as exc:
-        msg = str(exc).strip() or f"Timed out reading agy /usage after {timeout_seconds:g}s."
-        return {
-            "backend": "neon",
-            "status": "unknown",
-            "fetched_at": ts,
-            "error": msg,
-        }
-    except Exception as exc:
-        return {
-            "backend": "neon",
-            "status": "unknown",
-            "fetched_at": ts,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    finally:
-        if managed is not None:
-            await managed.terminate()
+__all__ = [
+    "CLAUDE_QUOTA_NOTE",
+    "build_quota_advisory",
+    "build_quota_view",
+    "claude_quota_from_rate_limit",
+    "enrich_quota_reading",
+    "fetch_codex_quota",
+    "fetch_neon_quota",
+    "has_passed_reset",
+    "merge_claude_quota",
+    "parse_codex_rate_limits",
+    "parse_neon_usage_envelope",
+    "without_passed_windows",
+]

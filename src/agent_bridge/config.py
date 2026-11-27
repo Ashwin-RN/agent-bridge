@@ -1,60 +1,32 @@
-"""Configuration, backend/mode/effort normalization, quota pool classification, and Codex config inspection."""
+"""Configuration, backend/mode/effort normalization, and quota pool classification."""
 
 from __future__ import annotations
 
 import os
-import re
-import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-BackendName = Literal["neon", "codex", "claude"]
-QuotaPool = Literal["agy_gemini", "agy_claude_gpt", "codex", "claude"]
+from agent_bridge.backends.claude import (
+    CLAUDE_MODEL_ALIASES,
+    DEFAULT_CLAUDE_EFFORT,
+    DEFAULT_CLAUDE_MODEL,
+    split_claude_model_and_effort,
+)
+from agent_bridge.backends.codex import (
+    DEFAULT_CODEX_EFFORT,
+    DEFAULT_CODEX_MODEL,
+    read_codex_local_defaults,
+)
+from agent_bridge.backends.registry import get_default_registry
+
+BackendName = str
+QuotaPool = str
 ExecutionMode = Literal["read_only", "edit"]
 EffortLevel = Literal["low", "medium", "high", "xhigh"]
 
-DEFAULT_CODEX_MODEL = "gpt-6.2-sol"
-DEFAULT_CODEX_EFFORT: EffortLevel = "high"
-DEFAULT_CLAUDE_MODEL = "sonnet"
-DEFAULT_CLAUDE_EFFORT: EffortLevel = "high"
-
-# Names the `claude` CLI resolves to its newest model of that family.
-CLAUDE_MODEL_ALIASES: frozenset[str] = frozenset({"sonnet", "opus", "haiku", "fable"})
 _INHERIT_TOKENS: frozenset[str] = frozenset({"auto", "latest", "default", "inherit", "cli"})
-
-BACKEND_ALIASES: dict[str, BackendName] = {
-    "neon": "neon",
-    "agy": "neon",
-    "gemini": "neon",
-    "antigravity": "neon",
-    "agy-claude": "neon",
-    "agy_claude": "neon",
-    "agy-sonnet": "neon",
-    "agy_sonnet": "neon",
-    "agy-opus": "neon",
-    "agy_opus": "neon",
-    "agy-gpt": "neon",
-    "agy_gpt": "neon",
-    "codex": "codex",
-    "gpt": "codex",
-    "openai": "codex",
-    "claude": "claude",
-    "claude-code": "claude",
-    "claude_code": "claude",
-    "anthropic": "claude",
-}
-
-BACKEND_DEFAULT_MODEL_HINTS: dict[str, str] = {
-    "agy-claude": "claude-sonnet-high",
-    "agy_claude": "claude-sonnet-high",
-    "agy-sonnet": "claude-sonnet-high",
-    "agy_sonnet": "claude-sonnet-high",
-    "agy-opus": "claude-opus-high",
-    "agy_opus": "claude-opus-high",
-    "agy-gpt": "gpt-oss",
-    "agy_gpt": "gpt-oss",
-}
 
 MODE_ALIASES: dict[str, ExecutionMode] = {
     "read_only": "read_only",
@@ -82,25 +54,20 @@ EFFORT_ALIASES: dict[str, EffortLevel] = {
     "max": "xhigh",
 }
 
-_AGY_THIRD_PARTY_MODEL_RE = re.compile(
-    r"(?:^|-)(claude|opus|sonnet|haiku|gpt|oss)(?:-|$)",
-    re.I,
-)
-
 MIN_TIMEOUT_SECONDS = 10
 MAX_TIMEOUT_SECONDS = 3600
 
 
+def __getattr__(name: str) -> Any:
+    if name == "BACKEND_ALIASES":
+        return get_default_registry().aliases_map()
+    if name == "BACKEND_DEFAULT_MODEL_HINTS":
+        return get_default_registry().alias_model_hints_map()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def normalize_backend(value: str) -> BackendName:
-    key = value.strip().lower()
-    if key not in BACKEND_ALIASES:
-        valid = ", ".join(sorted(set(BACKEND_ALIASES.values())))
-        raise ValueError(
-            f"Unknown backend {value!r}. Expected one of: {valid} "
-            f"(aliases: agy, gemini, agy-claude, agy-opus, agy-sonnet, agy-gpt, gpt, openai, "
-            f"claude-code, anthropic)."
-        )
-    return BACKEND_ALIASES[key]
+    return get_default_registry().normalize_backend(value)
 
 
 def resolve_backend_and_model_hint(
@@ -108,24 +75,12 @@ def resolve_backend_and_model_hint(
     model: str | None,
 ) -> tuple[BackendName, str | None]:
     """Normalize backend while turning pool shortcuts (`agy-claude`, `agy-opus`, `agy-gpt`) into model defaults."""
-    key = backend.strip().lower()
-    resolved_backend = normalize_backend(backend)
-    if model and model.strip():
-        return resolved_backend, model.strip()
-    hinted = BACKEND_DEFAULT_MODEL_HINTS.get(key)
-    return resolved_backend, hinted
+    return get_default_registry().resolve_backend_and_model_hint(backend, model)
 
 
 def classify_quota_pool(backend: str, model: str | None = None) -> QuotaPool:
-    """Map `(backend, model)` onto one of the four independent subscription quota pools."""
-    if backend == "codex":
-        return "codex"
-    # The backend decides first: `sonnet` on the `claude` backend is the Claude plan, not the agy pool.
-    if backend == "claude":
-        return "claude"
-    if model and _AGY_THIRD_PARTY_MODEL_RE.search(model.strip()):
-        return "agy_claude_gpt"
-    return "agy_gemini"
+    """Map `(backend, model)` onto its subscription quota pool via the backend adapter."""
+    return get_default_registry().classify_quota_pool(backend, model)
 
 
 def normalize_mode(value: str | None) -> ExecutionMode:
@@ -150,26 +105,6 @@ def normalize_effort(value: str | None) -> EffortLevel | None:
     return EFFORT_ALIASES[key]
 
 
-def split_claude_model_and_effort(model: str | None) -> tuple[str | None, EffortLevel | None]:
-    """Split `opus-high` or `claude-sonnet-medium` into `("opus", "high")`; leave full model ids alone.
-
-    The `claude` CLI takes the family name and the effort as separate flags, while the other backends
-    accept `<model>-<effort>` shortcuts. Only a known family name followed by a known effort is split.
-    """
-    if model is None or not model.strip():
-        return None, None
-    raw = model.strip()
-    key = raw.lower()
-    if key.startswith("claude-") and key[len("claude-"):].split("-")[0] in CLAUDE_MODEL_ALIASES:
-        key = key[len("claude-"):]
-    if key in CLAUDE_MODEL_ALIASES:
-        return key, None
-    family, _, tail = key.partition("-")
-    if family in CLAUDE_MODEL_ALIASES and tail in EFFORT_ALIASES:
-        return family, EFFORT_ALIASES[tail]
-    return raw, None
-
-
 STATE_DB_FILENAME = "bridge.db"
 
 
@@ -186,29 +121,6 @@ def state_dir_from_env() -> Path:
 def clamp_timeout(timeout_seconds: int | None, default: int) -> int:
     value = default if timeout_seconds is None else int(timeout_seconds)
     return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, value))
-
-
-def read_codex_local_defaults() -> dict[str, str | None]:
-    """Read non-secret model/effort/sandbox defaults from `~/.codex/config.toml` if present."""
-    codex_home_raw = os.environ.get("CODEX_HOME", "").strip()
-    codex_home = Path(codex_home_raw).expanduser() if codex_home_raw else Path.home() / ".codex"
-    cfg_path = codex_home / "config.toml"
-    out: dict[str, str | None] = {
-        "model": None,
-        "model_reasoning_effort": None,
-        "sandbox_mode": None,
-    }
-    if not cfg_path.exists():
-        return out
-    try:
-        data = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
-        for key in out:
-            val = data.get(key)
-            if isinstance(val, str) and val.strip():
-                out[key] = val.strip()
-    except Exception:
-        pass
-    return out
 
 
 @dataclass(frozen=True)
@@ -237,6 +149,8 @@ class Settings:
     child_env: str = "trim"
     # Exact variable names exempted from trimming, using Windows' uppercase environment keys there.
     child_env_keep: frozenset[str] = frozenset()
+    # Optional per-backend settings map for additional adapters.
+    backend_options: Mapping[str, Any] | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -331,3 +245,31 @@ class Settings:
             child_env=raw_child_env,
             child_env_keep=child_env_keep,
         )
+
+
+__all__ = [
+    "BackendName",
+    "CLAUDE_MODEL_ALIASES",
+    "DEFAULT_CLAUDE_EFFORT",
+    "DEFAULT_CLAUDE_MODEL",
+    "DEFAULT_CODEX_EFFORT",
+    "DEFAULT_CODEX_MODEL",
+    "EFFORT_ALIASES",
+    "EffortLevel",
+    "ExecutionMode",
+    "MAX_TIMEOUT_SECONDS",
+    "MIN_TIMEOUT_SECONDS",
+    "MODE_ALIASES",
+    "QuotaPool",
+    "STATE_DB_FILENAME",
+    "Settings",
+    "clamp_timeout",
+    "classify_quota_pool",
+    "normalize_backend",
+    "normalize_effort",
+    "normalize_mode",
+    "read_codex_local_defaults",
+    "resolve_backend_and_model_hint",
+    "split_claude_model_and_effort",
+    "state_dir_from_env",
+]

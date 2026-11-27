@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -13,6 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent_bridge.backends.codex import (
+    is_newer_codex_model_in_same_family,
+    parse_codex_model_family_version,
+)
 from agent_bridge.config import classify_quota_pool
 
 logger = logging.getLogger("agent_bridge.model_resolver")
@@ -59,32 +62,6 @@ def is_model_unavailable_error(text: str | None) -> bool:
     if not text:
         return False
     return any(pattern.search(text) for pattern in MODEL_ERROR_PATTERNS)
-
-
-def parse_codex_model_family_version(model_id: str | None) -> tuple[str, tuple[int, ...]] | None:
-    """Extract `(family_key, version_tuple)` from Codex model IDs like `gpt-6.2-sol` -> `('gpt-sol', (6, 2))`."""
-    if not model_id or not model_id.strip():
-        return None
-    tokens = [t for t in model_id.strip().lower().split("-") if t]
-    ver: list[int] = []
-    family_parts: list[str] = []
-    for tok in tokens:
-        if re.fullmatch(r"\d+(?:\.\d+)*", tok):
-            ver.extend(int(piece) for piece in tok.split("."))
-        else:
-            family_parts.append(tok)
-    if not ver or not family_parts:
-        return None
-    return "-".join(family_parts), tuple(ver)
-
-
-def is_newer_codex_model_in_same_family(candidate: str | None, baseline: str | None) -> bool:
-    """Return True if `candidate` is a strictly newer version of the same Codex model family as `baseline`."""
-    p_cand = parse_codex_model_family_version(candidate)
-    p_base = parse_codex_model_family_version(baseline)
-    if p_cand is None or p_base is None:
-        return False
-    return p_cand[0] == p_base[0] and p_cand[1] > p_base[1]
 
 
 class ModelPoolUnavailableError(ValueError):
@@ -449,6 +426,8 @@ class NeonModelCatalog:
         refresh: bool = False,
         timeout_seconds: float | None = None,
     ) -> list[dict[str, str]]:
+        import asyncio
+
         if not refresh and self.is_fresh():
             if self._last_status != "live":
                 self._last_status = "cached"

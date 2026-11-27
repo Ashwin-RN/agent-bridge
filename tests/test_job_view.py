@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_bridge import runners
+from agent_bridge.backends import codex as codex_backend
 from agent_bridge.config import Settings
 from agent_bridge.jobs import JobManager
 from agent_bridge.models import JobRecord
@@ -26,7 +26,7 @@ from agent_bridge.storage import BridgeStore
 
 @pytest.fixture
 def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
-    monkeypatch.setattr(runners, "read_codex_local_defaults", lambda: {})
+    monkeypatch.setattr(codex_backend, "read_codex_local_defaults", lambda: {})
     return Settings(
         default_neon_model="neon-high",
         default_codex_model=None,

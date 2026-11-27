@@ -532,8 +532,11 @@ def _stand_in_clis(
         calls["agy"] += 1
         return agy if agy is not None else _agy_reading()
 
-    monkeypatch.setattr(jobs_module, "fetch_codex_quota", fetch_codex)
-    monkeypatch.setattr(jobs_module, "fetch_neon_quota", fetch_agy)
+    from agent_bridge.backends import agy as agy_backend
+    from agent_bridge.backends import codex as codex_backend
+
+    monkeypatch.setattr(codex_backend, "fetch_codex_quota", fetch_codex)
+    monkeypatch.setattr(agy_backend, "fetch_neon_quota", fetch_agy)
     monkeypatch.setattr(manager.codex_runner, "resolve_command", lambda: ["codex"])
     monkeypatch.setattr(manager.neon_runner, "resolve_command", lambda: ["agy"])
     return calls
@@ -772,7 +775,9 @@ async def test_quota_readings_change_no_total_and_a_bad_period_or_one_failing_cl
     async def broken(_cmd: list[str]) -> dict[str, Any]:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(jobs_module, "fetch_codex_quota", broken)
+    from agent_bridge.backends import codex as codex_backend
+
+    monkeypatch.setattr(codex_backend, "fetch_codex_quota", broken)
     d = await manager.usage_dashboard(period="all")
     pools = _pools(d)
     assert pools["codex"]["status"] == "unknown" and "boom" in pools["codex"]["reason"]

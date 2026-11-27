@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from agent_bridge.backends.registry import get_adapter_optional
 from agent_bridge.config import classify_quota_pool
 from agent_bridge.models import TERMINAL_STATUSES, JobRecord
 
@@ -517,8 +518,14 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
     cur.execute("DELETE FROM session_claims WHERE job_id = ?", (rec.job_id,))
     if changed:
         _insert_usage_event_cur(cur, rec)
-        # Only invalidate Antigravity's usage checkpoint when the recovered job had actually invoked the provider!
-        if rec.provider_invoked and rec.backend == "neon" and rec.session_id:
+        # Only invalidate cumulative usage checkpoints when the recovered job had actually invoked the provider!
+        adapter = get_adapter_optional(rec.backend)
+        if (
+            rec.provider_invoked
+            and adapter is not None
+            and adapter.capabilities.cumulative_session_usage
+            and rec.session_id
+        ):
             cur.execute(
                 "DELETE FROM session_usage_watermarks WHERE backend = ? AND session_id = ?",
                 (rec.backend, rec.session_id),
@@ -1029,7 +1036,8 @@ class BridgeStore:
             if not isinstance(entry, dict) or not entry.get("job_id"):
                 continue
             backend = str(entry.get("backend") or "")
-            if backend not in {"neon", "codex"}:
+            adapter = get_adapter_optional(backend)
+            if adapter is None:
                 continue
             cwd = str(entry.get("cwd") or "")
             if not cwd:
@@ -1052,8 +1060,8 @@ class BridgeStore:
             if not usage_status:
                 if usage is None:
                     usage_status = "missing"
-                elif backend == "neon" and entry.get("requested_session_id"):
-                    # Legacy resumed Neon turns may have stored cumulative counts; never trust as exact.
+                elif adapter.capabilities.cumulative_session_usage and entry.get("requested_session_id"):
+                    # Legacy resumed cumulative-usage turns may have stored cumulative counts; never trust as exact.
                     usage_status = "partial"
                 elif status == "completed":
                     usage_status = "exact"
@@ -1144,7 +1152,8 @@ class BridgeStore:
             if not isinstance(entry, dict):
                 continue
             backend = str(entry.get("backend") or "")
-            if backend not in {"neon", "codex"}:
+            adapter = get_adapter_optional(backend)
+            if adapter is None:
                 continue
             job_id = str(entry.get("job_id") or f"legacy-usage-{idx}")
             ts = float(entry.get("ts") or time.time())
@@ -1168,9 +1177,9 @@ class BridgeStore:
                 usage_status = explicit_ustatus
             elif not has_numeric_usage:
                 usage_status = "missing"
-            elif backend == "neon":
-                # Legacy v1 `usage.jsonl` lacked resume metadata and stored cumulative Antigravity blobs on
-                # resumed turns; mark ambiguous legacy Neon totals as `partial` so they never inflate totals.
+            elif adapter.capabilities.cumulative_session_usage:
+                # Legacy v1 `usage.jsonl` lacked resume metadata and stored cumulative blobs on
+                # resumed turns; mark ambiguous legacy totals as `partial` so they never inflate totals.
                 usage_status = "partial"
             elif status == "completed":
                 usage_status = "exact"
@@ -1930,10 +1939,16 @@ class BridgeStore:
             )
             _insert_usage_event_cur(cur, record, attempts=att_list)
 
-            # Watermark hygiene for Neon sessions: ONLY touch the checkpoint if the provider was actually
+            # Watermark hygiene for cumulative-usage sessions: ONLY touch the checkpoint if the provider was actually
             # invoked! Pre-launch cancellations/timeouts never executed on the session and must preserve
             # the prior turn's valid checkpoint.
-            if invoked and record.backend == "neon" and record.session_id:
+            adapter = get_adapter_optional(record.backend)
+            if (
+                invoked
+                and adapter is not None
+                and adapter.capabilities.cumulative_session_usage
+                and record.session_id
+            ):
                 if (
                     record.status == "completed"
                     and watermark_cumulative is not None
@@ -2188,7 +2203,7 @@ class BridgeStore:
             clauses.append("backend = ?")
             vals.append(backend)
         if quota_pool:
-            clauses.append("COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END) = ?")
+            clauses.append("COALESCE(quota_pool, CASE WHEN backend = 'neon' THEN 'agy_gemini' ELSE backend END) = ?")
             vals.append(quota_pool)
         if cwd:
             clauses.append("cwd = ?")
@@ -2200,7 +2215,7 @@ class BridgeStore:
         rows = cur.execute(
             f"""
             SELECT backend,
-                   COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END) AS pool,
+                   COALESCE(quota_pool, CASE WHEN backend = 'neon' THEN 'agy_gemini' ELSE backend END) AS pool,
                    COUNT(*) AS cnt
             FROM jobs
             {where}
@@ -2298,7 +2313,7 @@ class BridgeStore:
             vals.append(backend)
         if quota_pool:
             clauses.append(
-                "COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END) = ?"
+                "COALESCE(quota_pool, CASE WHEN backend = 'neon' THEN 'agy_gemini' ELSE backend END) = ?"
             )
             vals.append(quota_pool)
         if cwd:
@@ -2309,7 +2324,7 @@ class BridgeStore:
             vals.append(parent_run)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        pool_expr = "COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END)"
+        pool_expr = "COALESCE(quota_pool, CASE WHEN backend = 'neon' THEN 'agy_gemini' ELSE backend END)"
 
         with self._tx(write=False) as cur:
             in_flight, in_flight_by_pool = self._count_in_flight_cur(
@@ -2539,9 +2554,8 @@ class BridgeStore:
             usage_rows = cur.execute(
                 f"""
                 SELECT u.job_id, u.attempt_number, u.is_final_attempt, u.owner_id, u.ts, u.backend,
-                       COALESCE(u.quota_pool, CASE WHEN u.backend = 'codex' THEN 'codex'
-                                                   WHEN u.backend = 'claude' THEN 'claude'
-                                                   ELSE 'agy_gemini' END) AS quota_pool,
+                       COALESCE(u.quota_pool, CASE WHEN u.backend = 'neon' THEN 'agy_gemini'
+                                                   ELSE u.backend END) AS quota_pool,
                        COALESCE(NULLIF(u.model, ''), u.backend || '-default') AS model,
                        u.status, u.duration_seconds, u.usage_status,
                        u.input_tokens, u.output_tokens, u.cached_tokens, u.cache_write_tokens,

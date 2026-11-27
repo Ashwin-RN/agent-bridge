@@ -17,20 +17,14 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from agent_bridge.backends.registry import get_adapter_optional
+
 SEP = " · "
 ELLIPSIS = "…"
 ACTIVE_STATUSES: frozenset[str] = frozenset({"queued", "running"})
 WINDOW_CLOSED = "window closed"
 ACTIVITY_MAX_CHARS = 60
 ACTIVITY_STALE_SECONDS = 30.0
-
-# The model column for Codex holds what was asked for, never what ran.
-_CODEX_DEFAULT_PLACEHOLDER = "codex-default"
-_DEFAULT_MODEL_LABEL = {
-    "codex": "Codex's default model",
-    "neon": "agy's default model",
-    "claude": "Claude's default model",
-}
 
 # Escape sequences first (CSI with its parameters, OSC up to BEL or ST, then any other two-byte
 # escape), so their printable tails go with them; then every remaining control or invisible
@@ -97,14 +91,15 @@ def _num(value: Any) -> float | None:
 def model_label(job: Mapping[str, Any]) -> str:
     """The model as the bridge actually knows it: observed, requested, or the CLI's default."""
     backend = sanitize(job.get("backend")).lower()
+    adapter = get_adapter_optional(backend)
     reported = sanitize(job.get("model"))
     model = reported or sanitize(job.get("requested_model"))
-    if model == _CODEX_DEFAULT_PLACEHOLDER:
+    if model == f"{backend}-default":
         model = ""
     source = sanitize(job.get("model_source")).lower()
     if source not in {"observed", "requested", "default"}:
-        # The backend rule: Codex never reports the model that ran; agy and Claude do.
-        if backend == "codex":
+        reports_observed = adapter.capabilities.reports_observed_model if adapter is not None else True
+        if not reports_observed:
             source = "requested" if model else "default"
         elif reported:
             source = "observed"
@@ -113,7 +108,7 @@ def model_label(job: Mapping[str, Any]) -> str:
         else:
             return ""
     if source == "default":
-        return _DEFAULT_MODEL_LABEL.get(backend, "default model")
+        return adapter.default_model_label if adapter is not None else "default model"
     if not model:
         return ""
     if source == "requested":

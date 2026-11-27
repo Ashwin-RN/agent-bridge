@@ -74,7 +74,10 @@ class StubCodexRunner(CodexRunner):
 async def test_runner_startup_deadline_and_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str, deadline_expires_before_spawn: bool,
 ) -> None:
-    from agent_bridge import claude_runner, process_control, runners
+    from agent_bridge import process_control
+    from agent_bridge.backends import agy as agy_backend
+    from agent_bridge.backends import claude as claude_backend
+    from agent_bridge.backends import codex as codex_backend
 
     settings = _make_settings(tmp_path)
     script = tmp_path / "stand_in.py"
@@ -85,7 +88,7 @@ async def test_runner_startup_deadline_and_cleanup(
         "neon": StubAgyRunner(settings, script),
     }[backend]
     monkeypatch.setattr(runner, "resolve_command", lambda: [sys.executable, str(script)])
-    module = claude_runner if backend == "claude" else runners
+    module = {"claude": claude_backend, "codex": codex_backend, "neon": agy_backend}[backend]
     now = 100.0
     deadline = 100.125
     monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: now))
@@ -1426,7 +1429,7 @@ elif prompt == "E3":
 
     # Cached quota whose reset timestamp already passed MUST bypass cache and fetch fresh!
     from datetime import datetime, timedelta, timezone
-    from agent_bridge import jobs as jobs_mod
+    from agent_bridge.backends import codex as codex_backend
 
     past_iso = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
     future_iso = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(timespec="seconds")
@@ -1458,7 +1461,7 @@ elif prompt == "E3":
             ],
         }
 
-    monkeypatch.setattr(jobs_mod, "fetch_codex_quota", fake_fetch_codex)
+    monkeypatch.setattr(codex_backend, "fetch_codex_quota", fake_fetch_codex)
     monkeypatch.setattr(mgr.codex_runner, "resolve_command", lambda: ["codex"])
 
     refreshed = await mgr.get_quota(["codex"])

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from agent_bridge import process_control as process_control_module
 from agent_bridge import quota as quota_module
 from agent_bridge.quota import (
     CLAUDE_QUOTA_NOTE,
@@ -408,7 +409,7 @@ async def test_fetch_codex_quota_timeout_reports_wait_duration(monkeypatch: pyte
     async def _fake_spawn(*_args: Any, **_kwargs: Any) -> tuple[_FakeProc, _FakeManaged]:
         return _FakeProc(), _FakeManaged()
 
-    monkeypatch.setattr(quota_module, "spawn_managed_process", _fake_spawn)
+    monkeypatch.setattr(process_control_module, "spawn_managed_process", _fake_spawn)
 
     res = await fetch_codex_quota(["nonexistent-codex"], timeout_seconds=0.1)
     assert terminated is True
