@@ -6,12 +6,13 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from agent_bridge.config import (
     BackendName,
@@ -27,7 +28,7 @@ from agent_bridge.config import (
 )
 from agent_bridge.claude_runner import ClaudeRunner
 from agent_bridge.dashboard import build_dashboard, resolve_window
-from agent_bridge.models import JobRecord, RunCancelled, RunRequest, RunResult
+from agent_bridge.models import JobRecord, JobStatus, RunCancelled, RunRequest, RunResult
 from agent_bridge.nesting import NOT_NESTED, NestedBridgeError, Nesting, process_start_time
 from agent_bridge.process_control import (
     CURRENT_PROCESS_TRACKER,
@@ -116,6 +117,19 @@ def _agy_remote_turn_cancel_guidance(job_id: str) -> str:
 
 def _start_time_unknown(_pid: int) -> float | None:
     return None
+
+
+JOB_STATUSES: tuple[str, ...] = get_args(JobStatus)
+# The shape of a job id the bridge hands out: `<backend>-<8 hex>`.
+_JOB_ID_RE = re.compile(r"(?:neon|codex|claude)-[0-9a-f]{8}")
+
+
+def _status_filter(status: str | None) -> str | None:
+    """A `status` filter for listing jobs, refused when it is not a status a job can have."""
+    norm = status.strip().lower() if status and status.strip() else None
+    if norm is not None and norm not in JOB_STATUSES:
+        raise ValueError(f"Unknown status {status!r}. Expected one of: {', '.join(JOB_STATUSES)}.")
+    return norm
 
 
 def _sum_attempt_usage(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -381,6 +395,13 @@ class JobManager:
                 prior_quota_pool = prior.quota_pool or classify_quota_pool(
                     prior.backend,
                     prior_model_label,
+                )
+            elif _JOB_ID_RE.fullmatch(token):
+                # Shaped like a job id, and no such job: never forward it to the CLI as a session id.
+                raise ValueError(
+                    f"No job {token!r} was found to resume. It may have been removed from the stored history "
+                    f"(the newest {self.store.max_stored_jobs} jobs are kept), or it is mistyped. Pass that "
+                    "job's session_id as resume_from instead."
                 )
             else:
                 resolved_session_id = token
@@ -1847,9 +1868,27 @@ class JobManager:
         *,
         wait_seconds: int = 0,
         wait_mode: Literal["all", "any"] = "all",
+        missing: list[str] | None = None,
     ) -> list[JobRecord]:
-        records = [await self.get_async(jid) for jid in job_ids]
-        if wait_seconds <= 0:
+        """The jobs `job_ids`, after waiting up to `wait_seconds` for all or any of them to end.
+
+        An unknown id raises `KeyError`, unless `missing` is given: then it is added there and left out,
+        so it neither ends the wait for "any" nor holds up the wait for "all".
+        """
+        if missing is None:
+            records = [await self.get_async(jid) for jid in job_ids]
+        else:
+            records = []
+            known_ids: list[str] = []
+            for jid in job_ids:
+                try:
+                    records.append(await self.get_async(jid))
+                except KeyError:
+                    missing.append(jid)
+                    continue
+                known_ids.append(jid)
+            job_ids = known_ids
+        if wait_seconds <= 0 or not records:
             return records
 
         if wait_mode == "any" and any(r.is_terminal for r in records):
@@ -2060,13 +2099,13 @@ class JobManager:
         cwd: str | None = None,
         parent_run: str | None = None,
     ) -> list[dict[str, Any]]:
+        norm_status = _status_filter(status)
         self.store.recover_dead_owner_jobs(
             self.owner_id,
             is_pid_alive_fn=self._is_pid_alive,
             process_start_time_fn=self._process_start_time,
         )
         norm_backend = normalize_backend(backend) if backend and backend.strip() else None
-        norm_status = status.strip().lower() if status and status.strip() else None
         norm_cwd = str(Path(cwd).expanduser().resolve()) if cwd and cwd.strip() else None
         norm_parent = parent_run.strip() if parent_run and parent_run.strip() else None
         recs = self.store.list_jobs(
@@ -2093,6 +2132,7 @@ class JobManager:
         cwd: str | None = None,
         parent_run: str | None = None,
     ) -> list[dict[str, Any]]:
+        norm_status = _status_filter(status)
         try:
             await self._db(
                 self.store.recover_dead_owner_jobs,
@@ -2103,7 +2143,6 @@ class JobManager:
         except Exception:
             pass
         norm_backend = normalize_backend(backend) if backend and backend.strip() else None
-        norm_status = status.strip().lower() if status and status.strip() else None
         norm_cwd = str(Path(cwd).expanduser().resolve()) if cwd and cwd.strip() else None
         norm_parent = parent_run.strip() if parent_run and parent_run.strip() else None
         recs = await self._db(

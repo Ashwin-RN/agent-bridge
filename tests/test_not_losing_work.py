@@ -664,3 +664,101 @@ def test_an_older_owners_table_gains_the_column_and_its_rows_read_as_unknown(tmp
     assert store.is_owner_alive(
         "legacy", is_pid_alive_fn=is_pid_alive, process_start_time_fn=process_start_time
     ) is True
+
+
+# --- 7. Small refusals ---
+
+
+def _tool_data(raw: object) -> dict:
+    import json
+
+    if isinstance(raw, tuple) and len(raw) == 2 and isinstance(raw[1], dict):
+        return raw[1]
+    if isinstance(raw, dict):
+        return raw
+    content = raw.content if hasattr(raw, "content") else raw  # type: ignore[attr-defined]
+    return json.loads(content[0].text)
+
+
+def test_the_stored_job_cap_counts_only_finished_jobs(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from agent_bridge.storage import BridgeStore
+
+    store = BridgeStore(tmp_path / "state", max_stored_jobs=20)
+    store.register_owner("win", 1)
+    t0 = time.time() - 1000
+
+    def finish(job_id: str, created: float, finished: float) -> None:
+        rec = replace(_running_job(job_id, "win", tmp_path), created_at=created)
+        store.insert_job(rec)
+        store.finalize_job(replace(rec, status="completed", finished_at=finished, duration_seconds=1.0))
+
+    for i in range(20):
+        finish(f"codex-done{i:04d}", t0 + i, t0 + i + 0.5)
+    for j in range(5):
+        store.insert_job(replace(_running_job(f"codex-live{j:04d}", "win", tmp_path), created_at=t0 + 100 + j))
+    finish("codex-donelast", t0 + 200, t0 + 201)  # the 21st finished job: only the oldest goes
+
+    rows = store.list_jobs(limit=100)
+    finished = {r.job_id for r in rows if r.status == "completed"}
+    running = {r.job_id for r in rows if r.status == "running"}
+    assert len(finished) == 20
+    assert "codex-done0000" not in finished and "codex-donelast" in finished
+    assert len(running) == 5
+
+
+async def test_resume_from_a_job_id_that_is_not_found_is_refused_not_sent_as_a_session_id(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    mcp, manager = create_server(settings=settings, nesting=NOT_NESTED)
+    try:
+        with pytest.raises(ValueError, match=r"No job 'codex-deadbeef' was found to resume"):
+            manager.prepare_request(backend="codex", prompt="go on", resume_from="codex-deadbeef")
+        with pytest.raises(Exception, match=r"No job 'neon-0badc0de' was found to resume"):
+            await mcp.call_tool("start_agent", {"backend": "neon", "prompt": "go on", "resume_from": "neon-0badc0de"})
+        # Anything not shaped like a job id is still a session id.
+        session_id = "019a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8"
+        req = manager.prepare_request(backend="codex", prompt="go on", resume_from=session_id)
+        assert req.session_id == session_id
+        assert manager.store.list_jobs(limit=10) == []
+    finally:
+        await manager.shutdown()
+
+
+async def test_check_jobs_refuses_an_unknown_status_and_lists_the_valid_ones(tmp_path: Path) -> None:
+    mcp, manager = create_server(settings=_settings(tmp_path), nesting=NOT_NESTED)
+    try:
+        with pytest.raises(Exception) as excinfo:
+            await mcp.call_tool("check_jobs", {"status": "done"})
+        assert "Unknown status 'done'" in str(excinfo.value)
+        assert "queued, running, completed, failed, cancelled, timed_out" in str(excinfo.value)
+        assert _tool_data(await mcp.call_tool("check_jobs", {"status": "completed"}))["count"] == 0
+    finally:
+        await manager.shutdown()
+
+
+async def test_check_jobs_gives_an_unknown_id_a_not_found_entry_and_still_answers_for_the_rest(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _quick_codex(tmp_path)))
+    mcp, _ = create_server(settings=settings, manager=manager, nesting=NOT_NESTED)
+    try:
+        done = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
+        out = _tool_data(await mcp.call_tool(
+            "check_jobs", {"job_ids": ["codex-00000000", done.job_id], "wait_seconds": 30, "wait_mode": "all"},
+        ))
+        assert [j["job_id"] for j in out["jobs"]] == ["codex-00000000", done.job_id]
+        assert out["jobs"][0]["status"] == "not_found" and "No job 'codex-00000000'" in out["jobs"][0]["error"]
+        assert out["jobs"][1]["status"] == "completed"
+        assert (out["all_done"], out["any_done"]) == (True, True)
+        # Ids that are all unknown do not hold an "any" wait open.
+        started = time.monotonic()
+        out = _tool_data(await mcp.call_tool(
+            "check_jobs", {"job_ids": ["codex-00000000"], "wait_seconds": 30, "wait_mode": "any"},
+        ))
+        assert time.monotonic() - started < 5
+        assert [j["status"] for j in out["jobs"]] == ["not_found"]
+        assert out["any_done"] is False
+    finally:
+        await manager.shutdown()

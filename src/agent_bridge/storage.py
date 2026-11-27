@@ -1898,7 +1898,8 @@ class BridgeStore:
                 (now, record.owner_id),
             )
 
-            # Prune only oldest TERMINAL jobs beyond max_stored_jobs (never prune active jobs or self).
+            # Keep the newest max_stored_jobs FINISHED jobs. Queued and running jobs are never pruned, and do
+            # not count against the cap, so a burst of active jobs cannot push finished results out.
             cur.execute(
                 """
                 DELETE FROM jobs
@@ -1906,6 +1907,7 @@ class BridgeStore:
                   AND job_id != ?
                   AND job_id NOT IN (
                       SELECT job_id FROM jobs
+                      WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')
                       ORDER BY MAX(created_at, COALESCE(finished_at, 0)) DESC
                       LIMIT ?
                   )

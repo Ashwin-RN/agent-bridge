@@ -478,20 +478,35 @@ def create_server(
 
         - If `job_ids` is provided: waits up to `wait_seconds` (capped at 300s) for `'all'` or
           `'any'` of those jobs to reach a terminal state, then returns full details. A wait ending
-          with `'queued'` or `'running'` leaves the job active.
-        - If `job_ids` is omitted: returns a compact summary list of recent jobs.
+          with `'queued'` or `'running'` leaves the job active. An id with no job gets an entry with
+          `status: "not_found"`, and is left out of `all_done` and `any_done`.
+        - If `job_ids` is omitted: returns a compact summary list of recent jobs. An unknown `status`
+          is refused.
         """
         if job_ids:
             bounded_wait = max(0, min(int(wait_seconds), 300))
+            missing: list[str] = []
             records = await job_manager.wait_for(
                 job_ids,
                 wait_seconds=bounded_wait,
                 wait_mode=wait_mode,
+                missing=missing,
             )
+            details = {r.job_id: r.to_detail() for r in records}
             return {
                 "all_done": all(r.is_terminal for r in records),
                 "any_done": any(r.is_terminal for r in records),
-                "jobs": [r.to_detail() for r in records],
+                "jobs": [
+                    details[jid]
+                    if jid in details
+                    else {
+                        "job_id": jid,
+                        "status": "not_found",
+                        "error": f"No job {jid!r} was found. It may have been removed from the stored "
+                        "history, or the id is mistyped.",
+                    }
+                    for jid in job_ids
+                ],
                 "session_usage": await job_manager.session_compact_summary_async(),
             }
 
