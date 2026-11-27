@@ -217,3 +217,116 @@ async def test_host_cancel_of_a_waiting_call_stops_the_job_through_the_mcp_sdk(
                 await asyncio.sleep(0.05)
         assert not is_pid_alive(pid)
         assert manager.store.get_job(job.job_id).provider_state == "stopped"
+
+
+# --- 3. A broken stream is a failure ---
+
+CUT_SHORT = "the CLI's output ended without its final event"
+
+
+async def test_codex_clean_exit_without_turn_completed_is_a_failure_not_retried(tmp_path: Path) -> None:
+    calls = tmp_path / "calls.log"
+    script = tmp_path / "codex_cut.py"
+    script.write_text(
+        "import json, sys\n"
+        f"open({str(calls)!r}, 'a').write('CALL\\n')\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'thr-cut'}), flush=True)\n"
+        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'half an answer'}}), flush=True)\n"
+        # Prose that would read as a transient error, which the bridge would retry by itself.
+        "sys.stderr.write('upstream said 503 Service Unavailable\\n')\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
+    try:
+        rec = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
+        assert rec.status == "failed"
+        assert rec.failure_reason == "cli_error"
+        assert rec.error is not None and rec.error.startswith(CUT_SHORT) and "turn.completed" in rec.error
+        assert rec.response == "half an answer"
+        assert rec.session_id == "thr-cut"
+        assert calls.read_text().splitlines() == ["CALL"]
+    finally:
+        await manager.shutdown()
+
+
+async def test_codex_turn_failed_with_no_message_is_a_failure(tmp_path: Path) -> None:
+    script = tmp_path / "codex_turn_failed.py"
+    script.write_text(
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'thr-tf'}), flush=True)\n"
+        "print(json.dumps({'type': 'turn.failed'}), flush=True)\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
+    try:
+        rec = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
+        assert rec.status == "failed"
+        assert rec.error is not None and "turn failed" in rec.error
+    finally:
+        await manager.shutdown()
+
+
+async def test_codex_builtin_review_still_completes_without_turn_completed(tmp_path: Path) -> None:
+    """`codex exec review` reports no token counts and may print its review as plain text."""
+    script = tmp_path / "codex_review.py"
+    script.write_text(
+        "import sys\n"
+        "assert sys.argv[1:3] == ['exec', 'review'], sys.argv\n"
+        "print('Review: no issues found in the uncommitted changes.', flush=True)\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
+    try:
+        rec = await manager.run(manager.prepare_request(backend="codex", prompt="", review_scope="uncommitted"))
+        assert rec.status == "completed", rec.error
+        assert rec.response == "Review: no issues found in the uncommitted changes."
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "final_line",
+    [
+        None,  # the stream simply stops after its steps
+        {"event": "result", "result": {"conversation_id": "conv-cut", "response": "half"}},  # no status
+    ],
+)
+async def test_agy_clean_exit_without_a_result_carrying_a_status_is_a_failure(
+    tmp_path: Path, final_line: dict | None,
+) -> None:
+    import json
+
+    lines = [
+        {"event": "init", "conversation_id": "conv-cut", "init": {"model": "gemini-4-neon-high"}},
+        {"event": "step_update", "step_update": {
+            "conversation_id": "conv-cut", "step_index": 1, "state": "DONE", "step_type": "agent_response",
+            "text_delta": "half", "usage": {"input_tokens": 7, "output_tokens": 3},
+        }},
+    ]
+    if final_line is not None:
+        lines.append(final_line)
+    script = tmp_path / "agy_cut.py"
+    script.write_text(
+        "import sys\n"
+        "if 'models' in sys.argv:\n"
+        "    print('gemini-4-neon-high\\tGemini 4 Neon (High)')\n"
+        "    sys.exit(0)\n"
+        + "".join(f"print({json.dumps(json.dumps(line))}, flush=True)\n" for line in lines),
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, neon_runner=StubAgyRunner(settings, script))
+    try:
+        rec = await manager.run(manager.prepare_request(backend="neon", prompt="go"))
+        assert rec.status == "failed"
+        assert rec.failure_reason == "cli_error"
+        assert rec.error is not None and rec.error.startswith(CUT_SHORT)
+        assert rec.response == "half"
+        assert rec.usage_status == "partial"
+    finally:
+        await manager.shutdown()

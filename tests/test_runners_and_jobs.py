@@ -1058,17 +1058,20 @@ elif prompt == "PARTIAL_TIMEOUT":
     g2 = await mgr.run(mgr.prepare_request(backend="neon", model="neon-medium", prompt="GAP_T2", resume_from=g1.job_id, parent_run="gap"))
     g3 = await mgr.run(mgr.prepare_request(backend="neon", model="neon-medium", prompt="GAP_T3", resume_from=g2.job_id, parent_run="gap"))
     assert g1.usage_status == "exact" and g1.usage and g1.usage["total_tokens"] == 100
-    assert g2.usage_status == "exact" and g2.usage and g2.usage["total_tokens"] == 70
+    # T2's stream ends with no result envelope, so it was cut short: a failed job, its step count kept as partial.
+    assert g2.status == "failed" and g2.failure_reason == "cli_error"
+    assert g2.usage_status == "partial" and g2.usage and g2.usage["total_tokens"] == 70
     assert g3.usage_status == "partial"
     assert g3.usage is None  # Cumulative-only blob kept in provider_metrics, NOT counted as per-turn delta!
     assert g3.provider_metrics is not None and g3.provider_metrics.get("cumulative_only") is True
 
     gap_summary = await mgr.get_usage_summary(period="session", parent_run="gap", compact=True)
-    assert gap_summary["by_backend"]["neon"]["tokens"]["total_tokens"] == 170  # Never 280!
+    # Never 280. T2's partial count is listed apart, not added in.
+    assert gap_summary["by_backend"]["neon"]["tokens"]["total_tokens"] == 100
     assert gap_summary["by_backend"]["neon"]["usage_coverage"] == {
-        "exact": 2,
+        "exact": 1,
         "delta": 0,
-        "partial": 1,
+        "partial": 2,
         "missing": 0,
     }
 

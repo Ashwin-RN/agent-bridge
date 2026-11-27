@@ -50,6 +50,17 @@ AGY_READ_ONLY_GUARD = (
     "that changes anything. Put your whole answer in your final reply, and end it with one line saying "
     "whether you changed any file.\n\n"
 )
+# A run that exits 0 but whose output stops before the CLI's final event was cut short (a crash, a
+# killed pipe, or a CLI upgrade that changed the stream). It is a failure, as `claude` already treats it.
+CLI_OUTPUT_CUT_SHORT_ERROR = (
+    "the CLI's output ended without its final event ({event}), so the run may have been cut short; "
+    "any partial reply is kept"
+)
+CLI_OUTPUT_CUT_SHORT_GUIDANCE = (
+    "The CLI exited cleanly, but its output stopped before its final event. Read response and "
+    "stderr_tail, check the CLI's version with list_backends, and for edit tasks inspect git status/diff "
+    "before retrying."
+)
 STDERR_TAIL_MAX_CHARS = 4_000
 TRANSIENT_RETRY_BACKOFF_SECONDS = 2.0
 TRANSIENT_RETRY_MIN_REMAINING_SECONDS = 12.0
@@ -491,11 +502,16 @@ def parse_agy_json_output(stdout_text: str) -> dict[str, Any] | None:
 
 
 def parse_codex_jsonl_events(lines: list[str]) -> dict[str, Any]:
-    """Parse Codex `--json` JSONL events into session_id, response, usage, and errors."""
+    """Parse Codex `--json` JSONL events into session_id, response, usage, and errors.
+
+    `turn_completed` says whether the stream reached its final `turn.completed` event. A `turn.failed`
+    with no message is still an error.
+    """
     session_id: str | None = None
     messages: list[str] = []
     usage: dict[str, Any] | None = None
     errors: list[str] = []
+    turn_completed = False
 
     for raw in lines:
         line = raw.strip()
@@ -520,6 +536,7 @@ def parse_codex_jsonl_events(lines: list[str]) -> dict[str, Any]:
                 if isinstance(text, str) and text.strip():
                     messages.append(text.strip())
         elif etype == "turn.completed":
+            turn_completed = True
             raw_usage = event.get("usage")
             if isinstance(raw_usage, dict):
                 usage = raw_usage
@@ -529,12 +546,15 @@ def parse_codex_jsonl_events(lines: list[str]) -> dict[str, Any]:
                 msg = event["error"].get("message")
             if isinstance(msg, str) and msg.strip():
                 errors.append(msg.strip())
+            elif etype == "turn.failed":
+                errors.append("codex reported that the turn failed, and gave no message")
 
     return {
         "session_id": session_id,
         "response": "\n\n".join(messages).strip(),
         "usage": usage,
         "errors": errors,
+        "turn_completed": turn_completed,
     }
 
 
@@ -1274,11 +1294,16 @@ class NeonRunner:
         if envelope is None:
             envelope = parse_agy_json_output("".join(stdout_lines))
 
-        raw_status = str(envelope.get("status", "")).upper() if isinstance(envelope, dict) else ""
+        raw_status = str(envelope.get("status") or "").strip().upper() if isinstance(envelope, dict) else ""
+        # A run that ends well ends with a result envelope that carries its status. A clean exit with no
+        # envelope, or one with a blank status (the last JSON line taken as the envelope), was cut short.
+        final_event_missing = (
+            (not timed_out_locally) and (not cancelled) and proc.returncode == 0 and not raw_status
+        )
         turn_completed_cleanly = (
             (not timed_out_locally)
             and (
-                (not cancelled and proc.returncode == 0 and raw_status in {"", "SUCCESS", "OK"})
+                (not cancelled and proc.returncode == 0 and raw_status in {"SUCCESS", "OK"})
                 or (cancelled and raw_status in {"SUCCESS", "OK"})
             )
         )
@@ -1417,6 +1442,35 @@ class NeonRunner:
                 failure_reason=reason,
                 provider_state=pstate,
                 retry_guidance=guidance,
+                stderr_tail=stderr_tail,
+                provider_invoked=True,
+            )
+
+        if final_event_missing:
+            # Set directly, not through classify_failure, which would read the reply's own prose.
+            env_response = str(envelope.get("response") or "").strip() if isinstance(envelope, dict) else ""
+            return RunResult(
+                status="failed",
+                response=env_response or partial_text,
+                session_id=session_id,
+                model=actual_model,
+                effort=request.effort,
+                model_notice=combined_notice,
+                effective_cwd=request.cwd,
+                duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
+                usage=usage,
+                provider_metrics=provider_metrics,
+                usage_status=usage_status,
+                cumulative_usage=None,
+                num_turns=None,
+                observed_num_turns=num_turns,
+                observed_turn_progress=observed_progress,
+                exit_code=0,
+                error=CLI_OUTPUT_CUT_SHORT_ERROR.format(event="a result event with a status"),
+                failure_reason="cli_error",
+                provider_state="stopped" if process_stopped else "possibly_running",
+                retry_guidance=CLI_OUTPUT_CUT_SHORT_GUIDANCE,
                 stderr_tail=stderr_tail,
                 provider_invoked=True,
             )
@@ -2218,8 +2272,24 @@ class CodexRunner:
         session_id = parsed["session_id"] or request.session_id
         response = parsed["response"]
         errors = parsed["errors"]
+        # `codex exec review` is held to the old rule: its output is not known to end with turn.completed
+        # (it reports no token counts, and its reply may come as plain text), so a clean exit still counts.
+        builtin_review = request.review_scope is not None and not request.prompt.strip()
+        final_event_missing = (
+            (not timed_out_locally)
+            and (not cancelled)
+            and proc.returncode == 0
+            and (not errors)
+            and (not parsed["turn_completed"])
+            and (not builtin_review)
+        )
         # Codex emits the usage on turn.completed, so a count from that event is final.
-        turn_completed_cleanly = (not timed_out_locally) and (proc.returncode == 0 or cancelled) and (not errors)
+        turn_completed_cleanly = (
+            (not timed_out_locally)
+            and (proc.returncode == 0 or cancelled)
+            and (not errors)
+            and (not final_event_missing)
+        )
 
         usage, provider_metrics = normalize_usage("codex", parsed["usage"])
         if usage is not None:
@@ -2280,6 +2350,34 @@ class CodexRunner:
                 failure_reason=reason,
                 provider_state=pstate,
                 retry_guidance=guidance,
+                stderr_tail=stderr_tail,
+                provider_invoked=True,
+            )
+
+        if final_event_missing:
+            # Set directly, not through classify_failure: stderr prose must not turn this into a
+            # transient error that is retried by itself.
+            return RunResult(
+                status="failed",
+                response=response,
+                session_id=session_id,
+                model=reported_model,
+                effort=reported_effort,
+                model_notice=model_notice,
+                effective_cwd=effective_cwd,
+                worktree_path=wt_path,
+                worktree_branch=wt_branch,
+                worktree_commit=wt_commit,
+                duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
+                usage=usage,
+                provider_metrics=provider_metrics,
+                usage_status=usage_status,
+                exit_code=0,
+                error=CLI_OUTPUT_CUT_SHORT_ERROR.format(event="turn.completed"),
+                failure_reason="cli_error",
+                provider_state="stopped" if process_stopped else "possibly_running",
+                retry_guidance=CLI_OUTPUT_CUT_SHORT_GUIDANCE,
                 stderr_tail=stderr_tail,
                 provider_invoked=True,
             )
