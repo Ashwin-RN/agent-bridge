@@ -762,3 +762,95 @@ async def test_check_jobs_gives_an_unknown_id_a_not_found_entry_and_still_answer
         assert out["any_done"] is False
     finally:
         await manager.shutdown()
+
+
+# --- 8. Honest annotation and a trimmed child environment ---
+
+
+async def test_review_code_is_not_marked_read_only(tmp_path: Path) -> None:
+    mcp, manager = create_server(settings=_settings(tmp_path), nesting=NOT_NESTED)
+    try:
+        tools = {t.name: t for t in await mcp.list_tools()}
+        annotations = tools["review_code"].annotations
+        assert annotations is not None and annotations.read_only_hint is False
+    finally:
+        await manager.shutdown()
+
+
+def test_credential_like_names_are_picked_out_and_agent_sockets_kept() -> None:
+    from agent_bridge.nesting import credential_env_names
+
+    env = {
+        "PATH": "x", "HOME": "x", "OPENAI_API_KEY": "x", "gh_token": "x", "MY_SECRET": "x",
+        "DB_PASSWORD": "x", "SMTP_PASSWD": "x", "AWS_CREDENTIALS_FILE": "x",
+        "SSH_AUTH_SOCK": "x", "GNOME_KEYRING_CONTROL": "x", "AGENT_BRIDGE_PARENT_JOB": "x",
+    }
+    assert credential_env_names(env) == [
+        "AWS_CREDENTIALS_FILE", "DB_PASSWORD", "MY_SECRET", "OPENAI_API_KEY", "SMTP_PASSWD", "gh_token",
+    ]
+
+
+def test_an_unknown_child_env_setting_stops_the_bridge_from_starting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_BRIDGE_CHILD_ENV", raising=False)
+    assert Settings.from_env().child_env == "trim"
+    monkeypatch.setenv("AGENT_BRIDGE_CHILD_ENV", "Inherit")
+    assert Settings.from_env().child_env == "inherit"
+    monkeypatch.setenv("AGENT_BRIDGE_CHILD_ENV", "everything")
+    with pytest.raises(ValueError, match="Unknown AGENT_BRIDGE_CHILD_ENV 'everything'"):
+        Settings.from_env()
+
+
+_ENV_PROBE = (
+    "import os\n"
+    "seen = 'key=%s sock=%s marker=%s' % ('TEST_BRIDGE_API_KEY' in os.environ, os.environ.get('SSH_AUTH_SOCK'), "
+    "os.environ.get('AGENT_BRIDGE_PARENT_JOB', '')[:5])\n"
+)
+
+
+@pytest.mark.parametrize("backend", ["codex", "neon"])
+@pytest.mark.parametrize("child_env", ["trim", "inherit"])
+async def test_codex_and_agy_jobs_get_no_credential_variables_unless_inherit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, backend: str, child_env: str,
+) -> None:
+    import logging
+
+    monkeypatch.setenv("TEST_BRIDGE_API_KEY", "value-that-must-not-be-logged")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "agent.sock")
+    script = tmp_path / "env_probe.py"
+    if backend == "codex":
+        script.write_text(
+            "import json, sys\n" + _ENV_PROBE + "sys.stdin.read()\n"
+            "print(json.dumps({'type': 'thread.started', 'thread_id': 'thr-env'}), flush=True)\n"
+            "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': seen}}), flush=True)\n"
+            "print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 1, 'output_tokens': 1}}), flush=True)\n",
+            encoding="utf-8",
+        )
+    else:
+        script.write_text(
+            "import json, sys\n"
+            "if 'models' in sys.argv:\n"
+            "    print('gemini-4-neon-high\\tGemini 4 Neon (High)')\n"
+            "    sys.exit(0)\n"
+            + _ENV_PROBE
+            + "print(json.dumps({'event': 'result', 'result': {'conversation_id': 'conv-env', 'status': 'SUCCESS', "
+            "'response': seen}}), flush=True)\n",
+            encoding="utf-8",
+        )
+    settings = _settings(tmp_path, child_env=child_env)
+    manager = JobManager(
+        settings, codex_runner=StubCodexRunner(settings, script), neon_runner=StubAgyRunner(settings, script),
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="agent_bridge.runners"):
+            rec = await manager.run(manager.prepare_request(backend=backend, prompt="env"))
+        assert rec.status == "completed", rec.error
+        expected_key = "True" if child_env == "inherit" else "False"
+        # The nesting marker still travels: it carries the job id.
+        assert rec.response == f"key={expected_key} sock=agent.sock marker={rec.job_id[:5]}"
+        assert "value-that-must-not-be-logged" not in caplog.text
+        if child_env == "trim":
+            assert "TEST_BRIDGE_API_KEY" in caplog.text and rec.job_id in caplog.text
+        else:
+            assert "TEST_BRIDGE_API_KEY" not in caplog.text
+    finally:
+        await manager.shutdown()

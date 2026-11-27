@@ -27,7 +27,7 @@ from agent_bridge.model_resolver import (
     is_newer_codex_model_in_same_family,
 )
 from agent_bridge.models import JobStatus, ProviderState, RunCancelled, RunRequest, RunResult, UsageStatus
-from agent_bridge.nesting import subagent_env
+from agent_bridge.nesting import credential_env_names, subagent_env
 from agent_bridge.process_control import (
     ManagedProcess,
     ProcessContainmentError,
@@ -71,6 +71,24 @@ OnModelCallback = Callable[[str], None]
 OnProviderStartCallback = Callable[[], Awaitable[None] | None]
 OnAttemptCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 OnWorktreePlannedCallback = Callable[[dict[str, str | None]], None]
+
+
+def job_env(settings: Settings, request: RunRequest, *, cli: str) -> dict[str, str]:
+    """The environment for a Codex or `agy` job: the bridge's own, the nesting marker, and, unless
+    AGENT_BRIDGE_CHILD_ENV=inherit, without the variables whose names look like credentials.
+
+    The names left out are logged, never their values. Claude jobs build theirs in `ClaudeRunner`.
+    """
+    dropped = credential_env_names(os.environ) if settings.child_env != "inherit" else []
+    if dropped:
+        logger.info(
+            "Left out of %s job %s's environment, as their names look like credentials: %s. "
+            "AGENT_BRIDGE_CHILD_ENV=inherit passes them on.",
+            cli,
+            request.job_id,
+            ", ".join(dropped),
+        )
+    return subagent_env(job_id=request.job_id, owner_id=request.owner_id, drop=dropped)
 
 
 async def _maybe_await(cb: Callable[..., Any] | None, *args: Any) -> None:
@@ -1093,7 +1111,7 @@ class NeonRunner:
         # Commit launch intent in SQLite BEFORE spawning the provider subprocess!
         await _maybe_await(on_provider_start)
 
-        env = subagent_env(job_id=request.job_id, owner_id=request.owner_id)
+        env = job_env(self._settings, request, cli="agy")
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2113,7 +2131,7 @@ class CodexRunner:
         # Commit launch intent in SQLite BEFORE spawning the provider subprocess!
         await _maybe_await(on_provider_start)
 
-        env = subagent_env(job_id=request.job_id, owner_id=request.owner_id)
+        env = job_env(self._settings, request, cli="codex")
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

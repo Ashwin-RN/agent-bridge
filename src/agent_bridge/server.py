@@ -536,9 +536,10 @@ def create_server(
         record = await job_manager.cancel(job_id)
         return record.to_detail()
 
+    # Not marked read-only: a review on `agy` is read-only by an instruction in its prompt, not by a sandbox.
     @mcp.tool(
         annotations=ToolAnnotations(
-            readOnlyHint=True,
+            readOnlyHint=False,
             destructiveHint=False,
             openWorldHint=True,
         )

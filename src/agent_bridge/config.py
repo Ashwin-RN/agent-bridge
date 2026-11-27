@@ -250,6 +250,9 @@ class Settings:
     # "plan": leave API credentials out of a Claude job's environment, so it runs on the signed-in plan.
     # "inherit": pass the environment on as it is.
     claude_auth: str = "plan"
+    # "trim": leave variables whose names look like credentials out of a Codex or agy job's environment.
+    # "inherit": pass the environment on as it is.
+    child_env: str = "trim"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -295,6 +298,12 @@ class Settings:
                 f"Unknown AGENT_BRIDGE_CLAUDE_AUTH {raw_claude_auth!r}. Expected 'plan' or 'inherit'."
             )
 
+        raw_child_env = os.environ.get("AGENT_BRIDGE_CHILD_ENV", "").strip().lower() or "trim"
+        if raw_child_env not in {"trim", "inherit"}:
+            raise ValueError(
+                f"Unknown AGENT_BRIDGE_CHILD_ENV {raw_child_env!r}. Expected 'trim' or 'inherit'."
+            )
+
         default_timeout = int(os.environ.get("AGENT_BRIDGE_DEFAULT_TIMEOUT", "300"))
         max_concurrent = max(1, int(os.environ.get("AGENT_BRIDGE_MAX_CONCURRENT", "8")))
         max_stored = max(20, int(os.environ.get("AGENT_BRIDGE_MAX_STORED_JOBS", "500")))
@@ -335,4 +344,5 @@ class Settings:
             default_claude_effort=default_claude_effort,
             claude_bin=claude_bin,
             claude_auth=raw_claude_auth,
+            child_env=raw_child_env,
         )

@@ -94,6 +94,30 @@ NOT_NESTED = Nesting(nested=False)
 UNKNOWN_NESTING = Nesting(nested=None)
 
 
+# A Codex or agy job is not given variables whose names look like credentials (AGENT_BRIDGE_CHILD_ENV=trim).
+CREDENTIAL_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", re.IGNORECASE)
+# Handles a subagent's own tools need to work, such as git over SSH or a keyring-backed credential
+# helper. They point at an agent or a keyring; they are not the secret itself.
+CHILD_ENV_KEEP: frozenset[str] = frozenset({
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "GPG_AGENT_INFO",
+    "GNOME_KEYRING_CONTROL",
+    "GNOME_KEYRING_PID",
+})
+
+
+def credential_env_names(env: Mapping[str, str]) -> list[str]:
+    """The names in `env` that a trimmed job environment leaves out, sorted."""
+    return sorted(
+        name
+        for name in env
+        if CREDENTIAL_NAME_RE.search(name)
+        and name.upper() not in CHILD_ENV_KEEP
+        and name not in (ENV_PARENT_JOB, ENV_PARENT_OWNER)
+    )
+
+
 def subagent_env(
     *,
     job_id: str | None,
