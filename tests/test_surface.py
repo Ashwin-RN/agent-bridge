@@ -275,6 +275,13 @@ async def test_usage_with_quota_adds_the_one_quota_shape_for_every_pool(tmp_path
         await manager.shutdown()
 
 
+def test_the_usage_skill_asks_for_the_dashboard_view_and_says_when_the_bridge_is_out_of_date() -> None:
+    skill = (Path(__file__).parents[1] / "skills" / "bridge-usage" / "SKILL.md").read_text(encoding="utf-8")
+    assert 'Call the `usage` tool of the MCP server named `agent-bridge` with `view="dashboard"`' in skill
+    assert "`text` field" in skill
+    assert "neither a `usage` tool nor a `usage_dashboard` tool" in skill and "out of date" in skill
+
+
 async def test_backends_reports_the_clis_and_no_quota_or_window_totals(tmp_path: Path) -> None:
     mcp, manager = _bridge(tmp_path)
     try:
