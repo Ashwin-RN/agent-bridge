@@ -426,11 +426,47 @@ def test_a_host_whose_file_is_unverified_gets_a_snippet_not_a_write(run: Run, ho
 def test_the_skill_is_copied_and_a_changed_one_is_replaced_only_on_yes(run: Run, home: Path) -> None:
     target = home / ".claude" / "skills" / "bridge-usage" / "SKILL.md"
     assert run.install("--host", "claude-code", "--yes", "--no-status-line") == 0
-    assert target.read_bytes() == install_cmd.packaged_skill()
+    assert target.read_bytes() == install_cmd.packaged_skill("bridge-usage")
     target.write_text("my own edit\n", encoding="utf-8")
     assert run.install("--host", "claude-code", "--no-status-line", answers=["n"]) == 0
     assert target.read_text(encoding="utf-8") == "my own edit\n"
     assert "-my own edit" in run.text
+
+
+def test_install_writes_every_skill_and_a_second_run_changes_nothing(run: Run, home: Path) -> None:
+    skills = home / ".claude" / "skills"
+    assert run.install("--host", "claude-code", "--no-status-line", "--print") == 0
+    assert not skills.exists()
+    for name in install_cmd.SKILL_NAMES:
+        assert f"(the packaged {name}/SKILL.md," in run.text
+    assert run.install("--host", "claude-code", "--yes", "--no-status-line") == 0
+    for name in install_cmd.SKILL_NAMES:
+        assert (skills / name / "SKILL.md").read_bytes() == install_cmd.packaged_skill(name)
+    before = _snapshot(home)
+    assert run.install("--host", "claude-code", "--yes", "--no-status-line") == 0
+    assert _snapshot(home) == before
+    assert not [line for line in run.lines if line.startswith(">> ")]
+
+
+def test_install_offers_each_skill_as_its_own_confirmed_write(home: Path, python: Path) -> None:
+    lines: list[str] = []
+    asked: list[str] = []
+
+    def ask(prompt: str) -> str:
+        header = next(line for line in reversed(lines) if line.startswith(">> "))
+        asked.append(header)
+        return "y" if "bridge-routing" in header else "n"
+
+    code = install_cmd.run_install(
+        ["--home", str(home), "--command", f"{python} -m agent_bridge", "--host", "claude-code", "--no-status-line"],
+        env={}, path_lookup=lambda name: None, runner=None, ask=ask, out=lines.append,
+    )
+    assert code == 0
+    skills = home / ".claude" / "skills"
+    assert (skills / "bridge-routing" / "SKILL.md").read_bytes() == install_cmd.packaged_skill("bridge-routing")
+    assert not (skills / "bridge-usage" / "SKILL.md").exists()
+    for name in install_cmd.SKILL_NAMES:
+        assert len([h for h in asked if str(skills / name / "SKILL.md") in h]) == 1, name
 
 
 # ------------------------------------------------------------------ the host's own command
@@ -535,8 +571,8 @@ def _good_home(home: Path, python: Path) -> None:
         f"\n[mcp_servers.agent-bridge]\ncommand = '{python}'\nargs = [\"-m\", \"agent_bridge\"]\n"
         "tool_timeout_sec = 600\ndefault_tools_approval_mode = \"approve\"\n"
     ))
-    skill = install_cmd.packaged_skill()
-    _write(home / ".agents" / "skills" / "bridge-usage" / "SKILL.md", skill)
+    for name in install_cmd.SKILL_NAMES:
+        _write(home / ".agents" / "skills" / name / "SKILL.md", install_cmd.packaged_skill(name))
     state = home / ".agent-bridge"
     state.mkdir()
     conn = sqlite3.connect(state / "bridge.db")
@@ -552,11 +588,31 @@ def test_doctor_passes_a_good_setup_and_opens_the_database_read_only(home: Path,
     before = db.read_bytes()
     code, checks = _doctor(home)
     assert code == 0
-    for name in ("Codex: registered", "Codex: command", "Codex: tool-call limit", "Codex: approval", "Codex: skill", "database", "nesting"):
+    for name in (
+        "Codex: registered", "Codex: command", "Codex: tool-call limit", "Codex: approval",
+        "Codex: skill bridge-usage", "Codex: skill bridge-routing", "database", "nesting",
+    ):
         assert checks[name]["status"] == "ok", (name, checks[name])
     assert checks["backend agy"]["detail"].startswith("1.5.18")
     # SQLite can create WAL sidecars for a lock-aware read-only connection.
     assert db.read_bytes() == before, "doctor changed the database"
+
+
+@pytest.mark.parametrize("copy", [None, b"an older copy\n"])
+def test_doctor_warns_on_a_missing_or_out_of_date_routing_skill(home: Path, python: Path, copy: bytes | None) -> None:
+    _good_home(home, python)
+    target = home / ".agents" / "skills" / "bridge-routing" / "SKILL.md"
+    if copy is None:
+        target.unlink()
+    else:
+        target.write_bytes(copy)
+    code, checks = _doctor(home)
+    check = checks["Codex: skill bridge-routing"]
+    assert check["status"] == "warn"
+    assert check["detail"] == f"{'missing' if copy is None else 'out of date'} at {target}"
+    assert check["fix"] == "agent-bridge install --host codex"
+    assert checks["Codex: skill bridge-usage"]["status"] == "ok"
+    assert code == 0
 
 
 def test_doctor_warns_on_a_missing_timeout_and_names_the_default(home: Path, python: Path) -> None:

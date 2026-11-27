@@ -28,6 +28,7 @@ packages = ["src/agent_bridge"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "skills/bridge-usage/SKILL.md" = "agent_bridge/skills/bridge-usage/SKILL.md"
+"skills/bridge-routing/SKILL.md" = "agent_bridge/skills/bridge-routing/SKILL.md"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
