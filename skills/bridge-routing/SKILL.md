@@ -19,6 +19,7 @@ The tools are those of the MCP server named `agent-bridge`. Its own instructions
 | `claude` | `claude`. Never in `order`: it is the user's own plan, shared with their own sessions |
 
 - A `pools` entry with `priority` `use_before_reset` loses its unused weekly quota soon. Give it every job it can do, even where another backend fits a little better.
+- `fast=True` on a `codex` job is quicker at about twice the quota. Pass it only when the `codex` entry is `use_before_reset`.
 
 ## Backend and model
 
