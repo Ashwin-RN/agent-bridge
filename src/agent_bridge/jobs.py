@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -158,6 +159,13 @@ def _preview(prompt: str, max_chars: int = 120) -> str:
     if len(flat) <= max_chars:
         return flat
     return flat[: max_chars - 1] + "…"
+
+
+def _resume_model(backend: str, requested_model: str | None, model: str | None) -> str | None:
+    placeholder = f"{backend}-default"
+    if requested_model and requested_model != placeholder:
+        return requested_model
+    return model if model != placeholder else None
 
 
 class JobManager:
@@ -386,7 +394,7 @@ class JobManager:
                 inferred_worktree_path = prior.worktree_path
                 inferred_worktree_branch = prior.worktree_branch
                 inferred_worktree_commit = prior.worktree_commit
-                inferred_model = prior.requested_model or prior.model
+                inferred_model = _resume_model(prior.backend, prior.requested_model, prior.model)
                 inferred_effort = prior.effort
                 inferred_parent_run = prior.parent_run
                 prior_model_label = prior.model or prior.requested_model
@@ -434,7 +442,9 @@ class JobManager:
                 if not inferred_cwd:
                     inferred_cwd = latest_ctx.get("effective_cwd") or latest_ctx.get("cwd")
                 if not inferred_model:
-                    inferred_model = latest_ctx.get("requested_model") or latest_ctx.get("model")
+                    inferred_model = _resume_model(
+                        resolved_backend, latest_ctx.get("requested_model"), latest_ctx.get("model"),
+                    )
                 if not inferred_effort:
                     inferred_effort = latest_ctx.get("effort")
                 if not inferred_parent_run:
@@ -853,7 +863,7 @@ class JobManager:
                 record.effective_cwd = resolved
 
         if not request.model:
-            prior_m = ctx.get("requested_model") or ctx.get("model")
+            prior_m = _resume_model(request.backend, ctx.get("requested_model"), ctx.get("model"))
             if prior_m:
                 request.model = str(prior_m)
                 record.requested_model = request.model
@@ -1184,9 +1194,9 @@ class JobManager:
             )
 
         def on_model(model: str | None, source: ModelSource) -> None:
-            if (model is not None and record.model != model) or record.model_source != source:
-                if model is not None:
-                    record.model = model
+            model = model if model is not None else f"{record.backend}-default"
+            if record.model != model or record.model_source != source:
+                record.model = model
                 record.model_source = source
                 record.quota_pool = classify_quota_pool(record.backend, record.model)
                 _schedule_progress(
@@ -1814,10 +1824,10 @@ class JobManager:
         return None
 
     def peek(self, job_id: str) -> JobRecord | None:
-        """Read a local live record or the stored row without running recovery."""
+        """Read a detached job snapshot without running recovery."""
         local = self.peek_local(job_id)
         if local is not None:
-            return local
+            return deepcopy(local)
         return self.store.peek_job(job_id)
 
     def get(self, job_id: str) -> JobRecord:

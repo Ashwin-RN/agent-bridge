@@ -8,6 +8,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -312,6 +313,7 @@ def _insert_usage_event_row_cur(
     usage_status: str,
     usage: dict[str, Any] | None,
     provider_metrics: dict[str, Any] | None,
+    keep_existing: bool = False,
 ) -> None:
     u = usage if isinstance(usage, dict) else {}
     iso_time = datetime.fromtimestamp(now_ts).astimezone().isoformat(timespec="seconds")
@@ -320,14 +322,16 @@ def _insert_usage_event_row_cur(
         v = u.get(key)
         return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
+    conflict = "ON CONFLICT(job_id, attempt_number) DO NOTHING" if keep_existing else ""
     cur.execute(
-        """
+        f"""
         INSERT OR REPLACE INTO usage_events (
             job_id, attempt_number, is_final_attempt, owner_id, ts, iso_time, backend, quota_pool,
             model, effort, mode, status, duration_seconds, cwd, parent_run, label, session_id,
             usage_status, input_tokens, output_tokens, cached_tokens, cache_write_tokens,
             reasoning_tokens, total_tokens, provider_metrics_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        {conflict}
         """,
         (
             job_id,
@@ -364,15 +368,22 @@ def _insert_usage_event_cur(
     record: JobRecord,
     *,
     attempts: list[dict[str, Any]] | None = None,
+    keep_existing: bool = False,
 ) -> None:
+    if keep_existing and cur.execute(
+        "SELECT 1 FROM usage_events WHERE job_id = ? AND is_final_attempt = 1", (record.job_id,),
+    ).fetchone():
+        return  # This pruned job already has its final ledger.
+
     now_ts = record.finished_at or time.time()
     att_list = attempts if attempts and len(attempts) >= 1 else None
     if att_list is None and record.attempts and len(record.attempts) >= 1:
         att_list = record.attempts
 
     if att_list is not None and len(att_list) > 1:
-        # Clear any stale attempt rows beyond len(att_list) and replace cleanly with real job_id + attempt_number!
-        cur.execute("DELETE FROM usage_events WHERE job_id = ?", (record.job_id,))
+        if not keep_existing:
+            # Clear any stale attempt rows beyond len(att_list) before writing the final ledger.
+            cur.execute("DELETE FROM usage_events WHERE job_id = ?", (record.job_id,))
         total_att = len(att_list)
         for idx, att in enumerate(att_list, start=1):
             is_last = idx == total_att
@@ -404,6 +415,7 @@ def _insert_usage_event_cur(
                 usage_status=att_ustatus,
                 usage=att_usage,
                 provider_metrics=att_pm,
+                keep_existing=keep_existing,
             )
         return
 
@@ -448,6 +460,7 @@ def _insert_usage_event_cur(
         usage_status=final_ustatus,
         usage=final_usage,
         provider_metrics=record.provider_metrics,
+        keep_existing=keep_existing,
     )
 
 
@@ -1783,6 +1796,8 @@ class BridgeStore:
         is no row (pruned), in which case the run's usage is recorded and its own claim released, and
         no session state is touched.
         """
+        shared_record = record
+        record = replace(record)
         now = time.time()
         pool = record.quota_pool or classify_quota_pool(
             record.backend,
@@ -1826,10 +1841,9 @@ class BridgeStore:
                 logger.warning(
                     "Job %s has no row to store its result in; only its usage is recorded.", record.job_id
                 )
-                _insert_usage_event_cur(cur, record, attempts=att_list)
+                _insert_usage_event_cur(cur, record, attempts=att_list, keep_existing=True)
                 cur.execute("DELETE FROM session_claims WHERE job_id = ?", (record.job_id,))
                 return "missing"
-            outcome: FinalizeOutcome = "written"
 
             # A session the CLI revealed (not the one this turn asked for and was let into) that another live
             # job holds: two turns ran on one session, which is a failure, whatever the run said. The row
@@ -1865,6 +1879,7 @@ class BridgeStore:
                     ).fetchone()
                     record.session_id = row_sid["session_id"] if row_sid is not None else None
 
+            record.last_activity = record.status
             cur.execute(
                 """
                 UPDATE jobs SET
@@ -2003,7 +2018,18 @@ class BridgeStore:
                 """,
                 (record.job_id, self.max_stored_jobs),
             )
-            return outcome
+
+        shared_record.quota_pool = record.quota_pool
+        shared_record.provider_invoked = record.provider_invoked
+        shared_record.attempts = record.attempts
+        shared_record.provider_metrics = record.provider_metrics
+        shared_record.status = record.status
+        shared_record.failure_reason = record.failure_reason
+        shared_record.error = record.error
+        shared_record.retry_guidance = record.retry_guidance
+        shared_record.session_id = record.session_id
+        shared_record.last_activity = record.last_activity
+        return "written"
 
     def delete_aborted_queued_job(self, job_id: str, *, lock_timeout: float = 2.0) -> bool:
         """Remove a queued job row whose submission was cancelled before execution started."""
