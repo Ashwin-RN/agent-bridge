@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -76,6 +77,14 @@ class SessionResumeBlockedError(RuntimeError):
             f"(and inspect git diff/worktree for edits), then retry with confirm_prior_job_id={prior_job_id!r} "
             "(or confirm_prior_stopped=True)."
         )
+
+
+class BatchStartError(RuntimeError):
+    """Raised when a batch could not start all of its jobs. The jobs it had started are cancelled."""
+
+    def __init__(self, message: str, *, job_ids: list[str]) -> None:
+        self.job_ids = job_ids
+        super().__init__(message)
 
 
 class WorktreeMissingError(RuntimeError):
@@ -167,6 +176,9 @@ class JobManager:
         self._session_waiters: dict[tuple[str, str], set[asyncio.Event]] = {}
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
         self._finalize_retry_seconds: float = 15.0
+        # Tasks the manager owns rather than the request that started them, such as a cancel that must
+        # finish after its caller has gone. Kept here until they end; shutdown waits for them.
+        self._owned_tasks: set[asyncio.Task[Any]] = set()
 
         self.store.register_owner(self.owner_id, self._pid)
         self.store.recover_dead_owner_jobs(
@@ -213,6 +225,33 @@ class JobManager:
             return
         for ev in list(waiters):
             ev.set()
+
+    def _own_task(self, coro: Any, *, name: str) -> asyncio.Task[Any]:
+        """Start `coro` as a task the manager owns: kept until it ends, its failure logged, drained at shutdown."""
+        task = asyncio.create_task(coro, name=name)
+        self._owned_tasks.add(task)
+        task.add_done_callback(self._owned_task_done)
+        return task
+
+    def _owned_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._owned_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("Background task %s failed: %r", task.get_name(), task.exception())
+
+    async def _cancel_jobs_owned(self, job_ids: list[str]) -> list[JobRecord | BaseException]:
+        """Cancel `job_ids` in a task the manager owns, and wait for it while the caller may.
+
+        The cancel runs to its end even when the caller is itself being cancelled: a request the MCP
+        client has cancelled sits in a cancel scope that interrupts every await it makes, so a cancel
+        awaited there directly would stop at its first await, before any subprocess is told to stop.
+        If the caller's wait is interrupted, this raises `CancelledError` and the cancel carries on.
+        """
+
+        async def _cancel_all() -> list[JobRecord | BaseException]:
+            return await asyncio.gather(*(self.cancel(jid) for jid in job_ids), return_exceptions=True)
+
+        task = self._own_task(_cancel_all(), name=f"cancel-{'-'.join(job_ids)[:200]}")
+        return await asyncio.shield(task)
 
     def _validate_cwd(self, cwd: str | None) -> str:
         path = (
@@ -1584,7 +1623,40 @@ class JobManager:
         wait: bool = True,
         wait_seconds: int | None = None,
     ) -> list[JobRecord]:
-        records = [await self.start_async(req) for req in requests]
+        # The whole submission is under one handler: if starting job k fails, or the caller is cancelled
+        # meanwhile, the jobs already started are cancelled, so no job is left running without a receipt.
+        records: list[JobRecord] = []
+        try:
+            for req in requests:
+                records.append(await self.start_async(req))
+        except asyncio.CancelledError:
+            if records:
+                started = [r.job_id for r in records]
+                # A cancelled MCP request is never answered, so the log is the only place these ids can go.
+                logger.warning(
+                    "A batch was cancelled while its jobs were being started; cancelling the %d already "
+                    "started: %s",
+                    len(started),
+                    ", ".join(started),
+                )
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._cancel_jobs_owned(started)
+            raise
+        except Exception as exc:
+            if not records:
+                raise
+            started = [r.job_id for r in records]
+            outcomes = await self._cancel_jobs_owned(started)
+            described = ", ".join(
+                f"{jid} ({out.status})" if isinstance(out, JobRecord) else f"{jid} (cancel failed: {out!r})"
+                for jid, out in zip(started, outcomes)
+            )
+            message = (
+                f"Starting task {len(records) + 1} of {len(requests)} failed ({type(exc).__name__}: {exc}). "
+                f"The {len(started)} job(s) this batch had already started were cancelled: {described}."
+            )
+            logger.warning("%s", message)
+            raise BatchStartError(message, job_ids=started) from exc
         if not wait:
             return records
         job_ids = [r.job_id for r in records]
@@ -2128,7 +2200,7 @@ class JobManager:
         while True:
             wait_tasks = [
                 t
-                for t in (*self._tasks.values(), *self._pending_finalizations.values())
+                for t in (*self._tasks.values(), *self._pending_finalizations.values(), *self._owned_tasks)
                 if not t.done()
             ]
             if not wait_tasks:
