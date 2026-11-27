@@ -1772,6 +1772,8 @@ class JobManager:
         """
         record = await self.start_async(request)
         ev = self._events.get(record.job_id)
+        # Until the caller holds the job's record, the job has no receipt: a cancel anywhere up to then,
+        # the last lookup included, cancels the job.
         try:
             if ev is not None:
                 if wait_seconds is None:
@@ -1781,11 +1783,21 @@ class JobManager:
                         await asyncio.wait_for(ev.wait(), timeout=wait_seconds)
                     except asyncio.TimeoutError:
                         pass
+            try:
+                return await self.get_async(record.job_id)
+            except Exception as exc:
+                # The job id is the receipt; a failed lookup must not cost the caller it.
+                logger.warning("Could not read job %s back; answering from memory: %s", record.job_id, exc)
+                local = self._terminal_uncommitted.get(record.job_id) or self._local_jobs.get(record.job_id)
+                return self._visible_record(local or record)
         except asyncio.CancelledError:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._cancel_jobs_owned([record.job_id])
             raise
-        return await self.get_async(record.job_id)
+
+    async def cancel_without_receipt(self, job_ids: list[str]) -> None:
+        """Cancel jobs whose caller was cancelled before it got their ids; the cancel runs to its end."""
+        await self._cancel_jobs_owned(job_ids)
 
     async def run_parallel(
         self,

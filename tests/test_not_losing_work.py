@@ -219,6 +219,99 @@ async def test_host_cancel_of_a_waiting_call_stops_the_job_through_the_mcp_sdk(
         assert manager.store.get_job(job.job_id).provider_state == "stopped"
 
 
+# --- Receipts kept under the cancel handler until the reply is assembled ---
+
+
+async def test_run_cancelled_during_its_last_lookup_cancels_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _holding_codex(tmp_path)))
+    real_get = manager.get_async
+    entered = asyncio.Event()
+    first_call = True
+
+    async def get_async(job_id: str) -> JobRecord:
+        nonlocal first_call
+        if first_call:
+            first_call = False
+            entered.set()
+            await asyncio.Event().wait()  # the caller is cancelled while this lookup waits
+        return await real_get(job_id)
+
+    monkeypatch.setattr(manager, "get_async", get_async)
+    try:
+        call = asyncio.create_task(manager.run(manager.prepare_request(backend="codex", prompt="one"), wait_seconds=0))
+        await _wait_for_file(tmp_path / "pid-one")
+        async with asyncio.timeout(10):
+            await entered.wait()
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        job = _row_for_prompt(manager, "one")
+        async with asyncio.timeout(10):
+            while manager.store.get_job(job.job_id).status != "cancelled":
+                await asyncio.sleep(0.05)
+        assert not is_pid_alive(int((tmp_path / "pid-one").read_text()))
+    finally:
+        await manager.shutdown()
+
+
+async def test_host_cancel_during_the_reply_s_usage_lookup_cancels_the_job_through_the_mcp_sdk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`mode="legacy"`: JSON-RPC over memory streams, so the cancel is a real notifications/cancelled."""
+    settings = _settings(tmp_path, default_timeout_seconds=120)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _holding_codex(tmp_path)))
+    mcp, _ = create_server(settings=settings, manager=manager, nesting=NOT_NESTED)
+    entered = asyncio.Event()
+
+    async def slow_usage() -> dict:
+        entered.set()
+        await asyncio.Event().wait()
+        return {}
+
+    monkeypatch.setattr(manager, "session_compact_summary_async", slow_usage)
+    async with Client(mcp, mode="legacy") as client:
+        # The wait ends with the job still running; the reply then waits on its usage lookup.
+        call = asyncio.create_task(client.call_tool(
+            "run_agent", {"backend": "codex", "prompt": "one", "cwd": str(tmp_path), "wait_seconds": 1},
+        ))
+        async with asyncio.timeout(15):
+            await entered.wait()
+        job = _row_for_prompt(manager, "one")
+        assert job.status == "running"
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        async with asyncio.timeout(10):
+            while manager.store.get_job(job.job_id).status != "cancelled":
+                await asyncio.sleep(0.05)
+        assert not is_pid_alive(int((tmp_path / "pid-one").read_text()))
+
+
+async def test_a_failing_usage_lookup_does_not_cost_the_caller_the_job_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _holding_codex(tmp_path)))
+    mcp, _ = create_server(settings=settings, manager=manager, nesting=NOT_NESTED)
+
+    async def broken_usage() -> dict:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(manager, "session_compact_summary_async", broken_usage)
+    try:
+        out = _tool_data(await mcp.call_tool(
+            "run_parallel", {"tasks": [{"backend": "codex", "prompt": "one"}], "cwd": str(tmp_path), "wait": False},
+        ))
+        [result] = out["results"]
+        assert result["job_id"] == _row_for_prompt(manager, "one").job_id
+        assert "disk I/O error" in out["session_usage"]["error"]
+    finally:
+        await manager.shutdown()
+
+
 # --- 3. A broken stream is a failure ---
 
 CUT_SHORT = "the CLI's output ended without its final event"

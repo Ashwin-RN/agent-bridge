@@ -6,6 +6,7 @@ Any MCP client can be the host: Claude Code, Codex, Antigravity or another. Noth
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 import sys
@@ -243,6 +244,24 @@ def create_server(
         if nest.nested:
             raise NestedBridgeError(nest.refusal(tool))
 
+    async def _session_usage() -> dict[str, Any]:
+        """This window's usage summary, at best effort: a failure here never costs a reply about jobs."""
+        try:
+            return await job_manager.session_compact_summary_async()
+        except Exception as exc:
+            logging.getLogger("agent_bridge.server").warning("Could not read the session usage summary: %s", exc)
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    async def _receipt(job_ids: list[str], build: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
+        """Assemble the reply for jobs this call has started. A caller cancelled before it has the reply
+        never got their ids, so they are cancelled rather than left running without a receipt."""
+        try:
+            return await build()
+        except asyncio.CancelledError:
+            with contextlib.suppress(asyncio.CancelledError):
+                await job_manager.cancel_without_receipt(job_ids)
+            raise
+
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
         try:
@@ -322,9 +341,13 @@ def create_server(
             allow_cross_pool_fallback=allow_cross_pool_fallback,
         )
         record = await job_manager.run(req, wait_seconds=wait_seconds)
-        detail = record.to_detail()
-        detail["session_usage"] = await job_manager.session_compact_summary_async()
-        return detail
+
+        async def _reply() -> dict[str, Any]:
+            detail = record.to_detail()
+            detail["session_usage"] = await _session_usage()
+            return detail
+
+        return await _receipt([record.job_id], _reply)
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -449,12 +472,16 @@ def create_server(
             wait=wait,
             wait_seconds=effective_wait,
         )
-        return {
-            "count": len(records),
-            "all_done": all(r.is_terminal for r in records),
-            "results": [r.to_detail() if wait else r.to_summary() for r in records],
-            "session_usage": await job_manager.session_compact_summary_async(),
-        }
+
+        async def _reply() -> dict[str, Any]:
+            return {
+                "count": len(records),
+                "all_done": all(r.is_terminal for r in records),
+                "results": [r.to_detail() if wait else r.to_summary() for r in records],
+                "session_usage": await _session_usage(),
+            }
+
+        return await _receipt([r.job_id for r in records], _reply)
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -507,7 +534,7 @@ def create_server(
                     }
                     for jid in job_ids
                 ],
-                "session_usage": await job_manager.session_compact_summary_async(),
+                "session_usage": await _session_usage(),
             }
 
         summaries = await job_manager.list_jobs_async(
@@ -520,7 +547,7 @@ def create_server(
         return {
             "count": len(summaries),
             "jobs": summaries,
-            "session_usage": await job_manager.session_compact_summary_async(),
+            "session_usage": await _session_usage(),
         }
 
     @mcp.tool(
@@ -621,14 +648,18 @@ def create_server(
             wait=wait,
             wait_seconds=effective_wait,
         )
-        return {
-            "scope": scope,
-            "base": base,
-            "commit": commit,
-            "all_done": all(r.is_terminal for r in records),
-            "reviews": [r.to_detail() if wait else r.to_summary() for r in records],
-            "session_usage": await job_manager.session_compact_summary_async(),
-        }
+
+        async def _reply() -> dict[str, Any]:
+            return {
+                "scope": scope,
+                "base": base,
+                "commit": commit,
+                "all_done": all(r.is_terminal for r in records),
+                "reviews": [r.to_detail() if wait else r.to_summary() for r in records],
+                "session_usage": await _session_usage(),
+            }
+
+        return await _receipt([r.job_id for r in records], _reply)
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -815,7 +846,7 @@ def create_server(
             "default_timeout_seconds": cfg.default_timeout_seconds,
             "max_concurrent_jobs_per_process": cfg.max_concurrent_jobs,
             "db_path": str(job_manager.store.db_path),
-            "session_usage": await job_manager.session_compact_summary_async(),
+            "session_usage": await _session_usage(),
             "nesting": job_manager.nesting.to_dict(),
             "backends": {
                 "neon": neon_info,
