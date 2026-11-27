@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-agent-bridge = "agent_bridge.server:main"
+agent-bridge = "agent_bridge.cli:main"
 
 [dependency-groups]
 dev = [
