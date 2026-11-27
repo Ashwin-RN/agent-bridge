@@ -784,6 +784,9 @@ def test_credential_like_names_are_picked_out_and_agent_sockets_kept() -> None:
         "PATH": "x", "HOME": "x", "OPENAI_API_KEY": "x", "gh_token": "x", "MY_SECRET": "x",
         "DB_PASSWORD": "x", "SMTP_PASSWD": "x", "AWS_CREDENTIALS_FILE": "x",
         "SSH_AUTH_SOCK": "x", "GNOME_KEYRING_CONTROL": "x", "AGENT_BRIDGE_PARENT_JOB": "x",
+        # Git reads config from these three; dropping the key alone makes every git command fail.
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.pager", "GIT_CONFIG_VALUE_0": "cat",
+        "GCM_CREDENTIAL_STORE": "secretservice",
     }
     assert credential_env_names(env) == [
         "AWS_CREDENTIALS_FILE", "DB_PASSWORD", "MY_SECRET", "OPENAI_API_KEY", "SMTP_PASSWD", "gh_token",

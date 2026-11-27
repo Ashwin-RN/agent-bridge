@@ -96,15 +96,18 @@ UNKNOWN_NESTING = Nesting(nested=None)
 
 # A Codex or agy job is not given variables whose names look like credentials (AGENT_BRIDGE_CHILD_ENV=trim).
 CREDENTIAL_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", re.IGNORECASE)
-# Handles a subagent's own tools need to work, such as git over SSH or a keyring-backed credential
-# helper. They point at an agent or a keyring; they are not the secret itself.
+# What a subagent's own tools need to work, though the name matches: handles that point at an agent or a
+# keyring (git over SSH, a keyring-backed credential helper), and settings that hold no secret. Git's
+# GIT_CONFIG_KEY_<n> names a config key; without it, while GIT_CONFIG_COUNT is set, every git command fails.
 CHILD_ENV_KEEP: frozenset[str] = frozenset({
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
     "GPG_AGENT_INFO",
     "GNOME_KEYRING_CONTROL",
     "GNOME_KEYRING_PID",
+    "GCM_CREDENTIAL_STORE",
 })
+_CHILD_ENV_KEEP_RE = re.compile(r"GIT_CONFIG_KEY_\d+", re.IGNORECASE)
 
 
 def credential_env_names(env: Mapping[str, str]) -> list[str]:
@@ -114,6 +117,7 @@ def credential_env_names(env: Mapping[str, str]) -> list[str]:
         for name in env
         if CREDENTIAL_NAME_RE.search(name)
         and name.upper() not in CHILD_ENV_KEEP
+        and not _CHILD_ENV_KEEP_RE.fullmatch(name)
         and name not in (ENV_PARENT_JOB, ENV_PARENT_OWNER)
     )
 
