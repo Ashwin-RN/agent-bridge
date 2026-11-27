@@ -348,9 +348,13 @@ HOSTS: tuple[Host, ...] = (
         markers=("{home}/.copilot/mcp-config.json",),
         format="json-mcpServers",
         user_config="{home}/.copilot/mcp-config.json",
-        project_config="{project}/.mcp.json",
+        project_config="{project}/.github/mcp.json",
         entry={"type": "local", "command": "{command}", "args": "{args}", "tools": ["*"]},
-        config_source=docs(COPILOT_ADD, "type, command, args and tools are required"),
+        config_source=docs(
+            COPILOT_ADD,
+            'the example entry has "type": "local" and "tools": ["*"]; .github/mcp.json is the project file '
+            "that Claude Code's .mcp.json does not share",
+        ),
         timeout=Timeout(
             key="timeout",
             default_seconds=30,
@@ -432,7 +436,7 @@ HOSTS: tuple[Host, ...] = (
         register=Register(
             argv=("gemini", "mcp", "add", "-s", "{scope}", SERVER_NAME, "{cmd}"),
             scopes=("user", "project"),
-            source=docs(GEMINI_DOCS, "the default scope is project"),
+            source=Source("unverified", GEMINI_DOCS, "no documented way to pass a command argument that starts with a dash"),
         ),
         skills_user="{home}/.gemini/skills",
         skills_project="{project}/.gemini/skills",
@@ -544,7 +548,7 @@ HOSTS: tuple[Host, ...] = (
         register=Register(
             argv=("qwen", "mcp", "add", "-s", "{scope}", SERVER_NAME, "{cmd}"),
             scopes=("user", "project"),
-            source=docs(QWEN_DOCS),
+            source=Source("unverified", QWEN_DOCS, "no documented way to pass a command argument that starts with a dash"),
         ),
         skills_user="{home}/.qwen/skills",
         skills_project="{project}/.qwen/skills",
@@ -562,10 +566,9 @@ HOSTS: tuple[Host, ...] = (
         entry=_STDIO,
         config_source=docs(KIRO_DOCS),
         timeout=Timeout(
-            key="timeout",
+            key=None,
             default_seconds=None,
-            scale=1000,
-            source=docs(KIRO_DOCS, "milliseconds, Kiro CLI only; the default is not documented"),
+            source=docs(KIRO_DOCS, "its timeout key is the connection timeout, not a tool-call limit"),
         ),
         approval=Approval(
             kind="entry",

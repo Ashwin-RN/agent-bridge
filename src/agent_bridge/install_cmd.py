@@ -229,6 +229,19 @@ def toml_value(value: Any) -> str:
     raise TypeError(f"cannot write {type(value).__name__} as TOML")
 
 
+def _trailing_comment(value_text: str) -> str:
+    """The `# ...` after a one-line TOML value, found where the text before it parses alone."""
+    for i, char in enumerate(value_text):
+        if char != "#":
+            continue
+        try:
+            tomllib.loads("v =" + value_text[:i])
+        except tomllib.TOMLDecodeError:
+            continue
+        return value_text[i:].strip()
+    return ""
+
+
 def _header_pattern(table: Sequence[str]) -> re.Pattern[str]:
     parts = [rf"(?:{re.escape(p)}|\"{re.escape(p)}\"|'{re.escape(p)}')" for p in table]
     return re.compile(r"^\s*\[\s*" + r"\s*\.\s*".join(parts) + r"\s*\]\s*(#.*)?$")
@@ -294,7 +307,8 @@ def plan_toml(text: str | None, table: Sequence[str], values: Mapping[str, Any])
             except tomllib.TOMLDecodeError:
                 raise Unsafe(f"{key} spans several lines") from None
             if current.get(key) != value:
-                lines[hit] = f"{match.group(1)}{_toml_key(key)} = {toml_value(value)}"
+                comment = _trailing_comment(match.group(2))
+                lines[hit] = f"{match.group(1)}{_toml_key(key)} = {toml_value(value)}" + (f"  {comment}" if comment else "")
         lines[last + 1 : last + 1] = missing
         new_text = "\n".join(lines)
 
@@ -746,6 +760,8 @@ class Session:
         reg = host.register
         if reg is None or not usable(reg.source) or self.opts.scope not in reg.scopes or path is None:
             return
+        if self.opts.scope != "user":
+            return  # a project-scope `mcp add` writes into the current folder, not --project: edit the file
         try:
             if registered_entry(host, path) is not None:
                 return

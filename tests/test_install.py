@@ -226,6 +226,48 @@ def test_vscode_project_file_uses_servers_and_opencode_uses_one_command_array(
     assert install_cmd.DOCS_WARNING in run.text
 
 
+def test_opencode_merge_keeps_other_servers_and_keys(run: Run, home: Path, python: Path) -> None:
+    path = _write(home / ".config" / "opencode" / "opencode.json", {
+        "theme": "dark",
+        "mcp": {"timeout": {"startup": 30000}, "servers": {"context7": {"type": "remote", "url": "https://x"}}},
+    })
+    assert run.install("--host", "opencode", "--yes", "--no-skill") == 0
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["theme"] == "dark"
+    assert data["mcp"]["timeout"] == {"startup": 30000}
+    assert data["mcp"]["servers"]["context7"] == {"type": "remote", "url": "https://x"}
+    assert data["mcp"]["servers"]["agent-bridge"]["command"] == [str(python), "-m", "agent_bridge"]
+
+
+def test_zed_project_merge_keeps_other_context_servers_and_keys(run: Run, python: Path, tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    path = _write(project / ".zed" / "settings.json", {
+        "tab_size": 2,
+        "context_servers": {"postgres": {"command": "pg-mcp", "args": [], "env": {"PGHOST": "localhost"}}},
+    })
+    assert run.install("--host", "zed", "--scope", "project", "--project", str(project), "--yes") == 0
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["tab_size"] == 2
+    assert data["context_servers"]["postgres"] == {"command": "pg-mcp", "args": [], "env": {"PGHOST": "localhost"}}
+    assert data["context_servers"]["agent-bridge"] == {"command": str(python), "args": ["-m", "agent_bridge"], "env": {}}
+
+
+def test_project_scope_edits_the_project_file_and_never_runs_the_hosts_command(
+    run: Run, python: Path, tmp_path: Path
+) -> None:
+    def must_not_run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"ran {argv}: a project-scope mcp add writes into the current folder")
+
+    project = tmp_path / "repo"
+    lookup = {"claude": "C:/tools/claude.exe"}.get
+    assert run.install(
+        "--host", "claude-code", "--scope", "project", "--project", str(project), "--yes", "--no-skill",
+        runner=must_not_run, path_lookup=lookup,
+    ) == 0
+    entry = json.loads((project / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["agent-bridge"]
+    assert entry["command"] == str(python)
+
+
 # ------------------------------------------------------------------ TOML
 
 
@@ -263,6 +305,7 @@ def test_codex_toml_edits_keys_inside_the_existing_table_and_keeps_its_subtable(
     assert table["tool_timeout_sec"] == 600
     assert table["default_tools_approval_mode"] == "approve"
     assert table["env"] == {"AGENT_BRIDGE_DEFAULT_TIMEOUT": "900"}
+    assert "tool_timeout_sec = 600  # too short" in config.read_text(encoding="utf-8"), "a trailing comment is kept"
 
 
 def test_toml_edit_that_would_change_another_table_is_refused() -> None:
