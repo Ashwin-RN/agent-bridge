@@ -17,21 +17,26 @@ which call the hooks in `AUDIT` first; the tests use them to fail on any path un
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import difflib
 import json
+import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agent_bridge import hosts as hosts_mod
 from agent_bridge.hosts import HOSTS, SERVER_NAME, WANTED_TIMEOUT_SECONDS, Host, Roots, Source
@@ -81,10 +86,94 @@ def _read_bytes(path: Path) -> bytes | None:
         return None
 
 
-def _write_bytes(path: Path, data: bytes) -> None:
+class Unsafe(Exception):
+    """The file cannot be edited without risk: print the snippet instead."""
+
+
+def _edit_mode(path: Path) -> int | None:
+    _audit(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        raise Unsafe(f"refusing symlink {path} -> {path.readlink()}")
+    if not stat.S_ISREG(info.st_mode):
+        raise Unsafe(f"{path} is not a regular file")
+    return stat.S_IMODE(info.st_mode)
+
+
+def _read_edit_bytes(path: Path) -> bytes | None:
+    return None if _edit_mode(path) is None else _read_bytes(path)
+
+
+def _copy_windows_dacl(source: Path, target: Path) -> None:
+    # Windows chmod only handles the read-only flag. Copy the access rules before
+    # writing any config data to a new file that would otherwise inherit them.
+    import ctypes
+    from ctypes import wintypes as win
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    get = advapi.GetNamedSecurityInfoW
+    set_ = advapi.SetNamedSecurityInfoW
+    get_control = advapi.GetSecurityDescriptorControl
+    free = ctypes.WinDLL("kernel32").LocalFree
+    pointer = ctypes.c_void_p
+    get.argtypes = (win.LPCWSTR, win.DWORD, win.DWORD, pointer, pointer, pointer, pointer, pointer)
+    set_.argtypes = (win.LPWSTR, win.DWORD, win.DWORD, pointer, pointer, pointer, pointer)
+    get_control.argtypes = (pointer, ctypes.POINTER(win.WORD), ctypes.POINTER(win.DWORD))
+    get_control.restype = win.BOOL
+    get.restype = set_.restype = win.DWORD
+    free.argtypes = (pointer,)
+    free.restype = pointer
+    file_object = 1
+    dacl_information = 0x00000004
+    protected_dacl_information = 0x80000000
+    dacl_protected = 0x1000
+    acl = pointer()
+    descriptor = pointer()
+    error = get(str(source), file_object, dacl_information, None, None, ctypes.byref(acl), None, ctypes.byref(descriptor))
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        control, revision = win.WORD(), win.DWORD()
+        if not get_control(descriptor, ctypes.byref(control), ctypes.byref(revision)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if control.value & dacl_protected:
+            dacl_information |= protected_dacl_information
+        error = set_(str(target), file_object, dacl_information, None, None, acl, None)
+        if error:
+            raise ctypes.WinError(error)
+    finally:
+        free(descriptor)
+
+
+def _write_fd(fd: int, data: bytes, path: Path, original: Path | None) -> None:
+    with os.fdopen(fd, "wb") as stream:
+        if os.name == "nt" and original is not None:
+            _copy_windows_dacl(original, path)
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _write_bytes(path: Path, data: bytes, old: bytes | None, mode: int | None) -> None:
     _audit(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(name)
+    try:
+        _write_fd(fd, data, temp, path if mode is not None else None)
+        if mode is not None:
+            temp.chmod(mode)
+        if _edit_mode(path) != mode or _read_bytes(path) != old:
+            raise Unsafe(f"{path} changed while the edit was prepared; run install again")
+        os.replace(temp, path)
+    except BaseException:
+        if os.name == "nt" and mode is not None and not mode & stat.S_IWRITE:
+            temp.chmod(stat.S_IWRITE)
+        temp.unlink(missing_ok=True)
+        raise
 
 
 @dataclass(frozen=True)
@@ -101,7 +190,10 @@ class Text:
         if raw is None:
             return None
         bom = raw.startswith(b"\xef\xbb\xbf")
-        text = raw[3:].decode("utf-8") if bom else raw.decode("utf-8")
+        try:
+            text = raw.decode("utf-8-sig") if bom else raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise Unsafe(f"cannot decode as UTF-8 ({exc.reason} at byte {exc.start})") from None
         newline = "\r\n" if "\r\n" in text else "\n"
         text = text.replace("\r\n", "\n")
         return cls(text, newline, bom, text.endswith("\n") or not text)
@@ -111,23 +203,38 @@ class Text:
         return b"\xef\xbb\xbf" + data if self.bom else data
 
 
-def backup_path(path: Path, now: datetime | None = None) -> Path:
-    stamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
-    return path.with_name(f"{path.name}.bak-{stamp}")
+def _backup(path: Path, data: bytes, mode: int) -> Path:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    base = f"{path.name}.bak-{stamp}"
+    private_mode = mode & 0o600
+    suffix = 0
+    while True:
+        backup = path.with_name(f"{base}-{suffix}" if suffix else base)
+        _audit(backup)
+        try:
+            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), private_mode)
+        except FileExistsError:
+            suffix += 1
+            continue
+        try:
+            _write_fd(fd, data, backup, path)
+        except BaseException:
+            if os.name == "nt" and not private_mode & stat.S_IWRITE:
+                backup.chmod(stat.S_IWRITE)
+            backup.unlink()
+            raise
+        return backup
 
 
 # --------------------------------------------------------------------------------------------
 # JSON: merge by setting keys, never by replacing the document.
 
 
-class Unsafe(Exception):
-    """The file cannot be edited without risk: print the snippet instead."""
-
-
 @dataclass(frozen=True)
 class SetKey:
     path: tuple[str, ...]
     value: Any
+    mode: Literal["set", "default", "minimum"] = "set"
 
 
 @dataclass(frozen=True)
@@ -145,7 +252,32 @@ def _json_indent(text: str) -> str | None:
 
 
 def _dump_json(data: Any, indent: str | None) -> str:
-    return json.dumps(data, indent=indent, ensure_ascii=False)
+    return json.dumps(data, indent=indent, ensure_ascii=False, allow_nan=False)
+
+
+def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise Unsafe(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _nonfinite_json_number(token: str) -> Any:
+    raise Unsafe(f"non-finite JSON number {token}")
+
+
+def _json_number(token: str, parse: type[int] | type[float]) -> int | float:
+    try:
+        value = parse(token)
+    except ValueError:
+        raise Unsafe("JSON number is too large to round trip") from None
+    if isinstance(value, float) and not math.isfinite(value):
+        _nonfinite_json_number(token)
+    if json.dumps(value) != token:
+        raise Unsafe(f"JSON number {token} would change on round trip")
+    return value
 
 
 def load_json(text: str | None) -> tuple[dict[str, Any], str | None, bool]:
@@ -157,7 +289,13 @@ def load_json(text: str | None) -> tuple[dict[str, Any], str | None, bool]:
     if text is None or not text.strip():
         return {}, "  ", False
     try:
-        data = json.loads(text)
+        data = json.loads(
+            text,
+            parse_int=lambda token: _json_number(token, int),
+            parse_float=lambda token: _json_number(token, float),
+            parse_constant=_nonfinite_json_number,
+            object_pairs_hook=_json_object,
+        )
     except json.JSONDecodeError as exc:
         raise Unsafe(f"not plain JSON ({exc.msg} at line {exc.lineno}; comments are not edited)") from None
     if not isinstance(data, dict):
@@ -174,6 +312,14 @@ def get_path(data: Any, path: Sequence[str]) -> Any:
     return data
 
 
+def _above_timeout(current: Any, target: int | str) -> bool:
+    try:
+        seconds = float(current) if isinstance(current, str) else current
+        return isinstance(seconds, (int, float)) and seconds > int(target)
+    except ValueError:
+        return False
+
+
 def apply_json_ops(data: dict[str, Any], ops: Iterable[JsonOp]) -> dict[str, Any]:
     new = copy.deepcopy(data)
     for op in ops:
@@ -185,6 +331,10 @@ def apply_json_ops(data: dict[str, Any], ops: Iterable[JsonOp]) -> dict[str, Any
             node = child
         last = op.path[-1]
         if isinstance(op, SetKey):
+            if op.mode == "default" and last in node:
+                continue
+            if op.mode == "minimum" and _above_timeout(node.get(last), op.value):
+                continue
             node[last] = copy.deepcopy(op.value)
         else:
             current = node.setdefault(last, [])
@@ -264,16 +414,24 @@ def toml_table_snippet(table: Sequence[str], values: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def plan_toml(text: str | None, table: Sequence[str], values: Mapping[str, Any]) -> str | None:
+def plan_toml(
+    text: str | None, table: Sequence[str], values: Mapping[str, Any], *, minimum_key: str | None = None
+) -> str | None:
     """Set ``values`` inside the table, adding it at the end if absent. None if all set. Raises Unsafe."""
     text = text or ""
     try:
         old = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise Unsafe(f"not valid TOML ({exc})") from None
+    for end in range(1, len(table)):
+        parent = get_path(old, table[:end])
+        if parent is not None and not isinstance(parent, dict):
+            raise Unsafe(f"{'.'.join(table[:end])} is not a table")
     current = get_path(old, table)
     if current is not None and not isinstance(current, dict):
         raise Unsafe(f"{'.'.join(table)} is not a table")
+    if current is not None and minimum_key in values and _above_timeout(current.get(minimum_key), values[minimum_key]):
+        values = {key: value for key, value in values.items() if key != minimum_key}
     if current is not None and all(current.get(k) == v for k, v in values.items()):
         return None
 
@@ -402,21 +560,51 @@ def entry_snippet(host: Host, values: Mapping[str, Any]) -> str:
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
-def status_command(command: str, args: Sequence[str]) -> str:
-    argv = [command, *args]
-    if argv and argv[-1] == "serve":
-        argv = argv[:-1]
-    argv += ["status", "--line"]
-    if os.name == "nt":
-        argv[0] = argv[0].replace("\\", "/")
-    return " ".join(f'"{part}"' if re.search(r"[\s\\'\"]", part) or part == argv[0] else part for part in argv)
+def _powershell_literal(word: str) -> str:
+    return "'" + word.replace("'", "''") + "'"
 
 
-def user_script_line(existing_command: str, status_cmd: str) -> str:
-    """The line to add to the user's own status-line script."""
-    if ".ps1" in existing_command.lower():
-        return f"& {status_cmd}"
-    return status_cmd
+def _powershell_word(word: str) -> str:
+    return word if re.fullmatch(r"[\w./:=+@-]+", word) else _powershell_literal(word)
+
+
+def _manual_command(argv: Sequence[str]) -> str:
+    if os.name != "nt":
+        return shlex.join(argv)
+    parts = [_powershell_word(part) for part in argv]
+    return ("& " if parts[0].startswith("'") else "") + " ".join(parts)
+
+
+def _windows_status_command(argv: Sequence[str]) -> str:
+    # A simple command works in cmd, Git Bash and PowerShell. For other arguments,
+    # use an encoded PowerShell script so the host shell only sees literal words.
+    if all(re.fullmatch(r"[a-zA-Z0-9_./:=+@-]+", part) for part in argv):
+        return " ".join(argv)
+    script = (
+        "$start = New-Object System.Diagnostics.ProcessStartInfo\n"
+        f"$start.FileName = {_powershell_literal(argv[0])}\n"
+        f"$start.Arguments = {_powershell_literal(subprocess.list2cmdline(argv[1:]))}\n"
+        "$start.UseShellExecute = $false\n"
+        "$child = [System.Diagnostics.Process]::Start($start)\n"
+        "$child.WaitForExit()\n"
+        "exit $child.ExitCode\n"
+    )
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
+
+
+def status_command(command: str, args: Sequence[str], *, script: str = "") -> str:
+    launch_args = args[:-1] if args and args[-1] == "serve" else args
+    argv = [command, *launch_args, "status", "--line"]
+    script = script.lower()
+    if ".ps1" in script:
+        if os.name == "nt" and any(not arg or '"' in arg for arg in argv[1:]):
+            return _windows_status_command(argv)
+        return "& " + " ".join([_powershell_literal(command), *map(_powershell_word, argv[1:])])
+    if os.name != "nt" or ".sh" in script or "bash " in script:
+        return shlex.join(argv)
+    argv[0] = argv[0].replace("\\", "/")
+    return _windows_status_command(argv)
 
 
 def packaged_skill() -> bytes:
@@ -483,7 +671,7 @@ class Planner:
         self.roots = roots
         self.opts = opts
         self.json_ops: dict[Path, list[tuple[str, JsonOp]]] = {}
-        self.toml_ops: dict[Path, list[tuple[str, tuple[str, ...], dict[str, Any]]]] = {}
+        self.toml_ops: dict[Path, tuple[str, tuple[str, ...], dict[str, Any], str | None]] = {}
         self.raw_files: dict[Path, tuple[str, bytes]] = {}
         self.snippets: list[Snippet] = []
         self.already: list[str] = []
@@ -491,59 +679,52 @@ class Planner:
     def add_json(self, path: Path, label: str, op: JsonOp) -> None:
         self.json_ops.setdefault(path, []).append((label, op))
 
-    def add_toml(self, path: Path, label: str, table: tuple[str, ...], values: dict[str, Any]) -> None:
-        self.toml_ops.setdefault(path, []).append((label, table, values))
+    def add_toml(self, path: Path, label: str, table: tuple[str, ...], values: dict[str, Any], minimum_key: str | None) -> None:
+        self.toml_ops[path] = (label, table, values, minimum_key)
 
     def edits(self) -> list[FileEdit]:
         edits: list[FileEdit] = []
         for path, items in self.json_ops.items():
-            raw = _read_bytes(path)
-            text = Text.decode(raw)
-            old = text.text if text else None
             labels = list(dict.fromkeys(label for label, _ in items))
             try:
-                new = plan_json(old, [op for _, op in items])
-            except Unsafe as exc:
+                raw = _read_edit_bytes(path)
+                text = Text.decode(raw) or Text("")
+                new = plan_json(text.text, [op for _, op in items])
+                if new is None:
+                    self.already += [f"{label} ({path})" for label in labels]
+                    continue
+                if not text.final_newline:
+                    new = new.rstrip("\n")
+                new_bytes = text.encode(new)
+                reformats = load_json(text.text)[2]
+            except (Unsafe, OSError, UnicodeEncodeError, RecursionError) as exc:
                 self.snippets.append(
                     Snippet(str(path), _json_snippet_for(items), f"{path.name} not edited: {exc}")
                 )
                 continue
-            if new is None:
-                self.already += [f"{label} ({path})" for label in labels]
-                continue
-            if text is not None and text.text and not text.text.endswith("\n"):
-                new = new.rstrip("\n")
-            enc = text or Text("")
-            if load_json(old)[2]:
+            if reformats:
                 labels.append("re-indents lines it does not change: read the whole diff")
-            edits.append(FileEdit(path, labels, raw, enc.encode(new), old or "", new))
-        for path, items in self.toml_ops.items():
-            raw = _read_bytes(path)
-            text = Text.decode(raw)
-            current = text.text if text else None
-            labels = []
-            failed = False
-            for label, table, values in items:
-                try:
-                    new = plan_toml(current, table, values)
-                except Unsafe as exc:
-                    self.snippets.append(
-                        Snippet(str(path), toml_table_snippet(table, values), f"{path.name} not edited: {exc}")
-                    )
-                    failed = True
-                    break
-                if new is None:
-                    self.already.append(f"{label} ({path})")
-                else:
-                    current = new
-                    labels.append(label)
-            if failed or not labels:
+            edits.append(FileEdit(path, labels, raw, new_bytes, text.text, new))
+        for path, (label, table, values, minimum_key) in self.toml_ops.items():
+            try:
+                raw = _read_edit_bytes(path)
+                text = Text.decode(raw) or Text("")
+                new = plan_toml(text.text, table, values, minimum_key=minimum_key)
+            except (Unsafe, OSError) as exc:
+                self.snippets.append(
+                    Snippet(str(path), toml_table_snippet(table, values), f"{path.name} not edited: {exc}")
+                )
                 continue
-            enc = text or Text("")
-            assert current is not None
-            edits.append(FileEdit(path, labels, raw, enc.encode(current), text.text if text else "", current))
+            if new is None:
+                self.already.append(f"{label} ({path})")
+                continue
+            edits.append(FileEdit(path, [label], raw, text.encode(new), text.text, new))
         for path, (label, data) in self.raw_files.items():
-            raw = _read_bytes(path)
+            try:
+                raw = _read_edit_bytes(path)
+            except (Unsafe, OSError) as exc:
+                self.snippets.append(Snippet(str(path), data.decode("utf-8"), f"{path.name} not edited: {exc}"))
+                continue
             if raw is not None and raw.replace(b"\r\n", b"\n") == data.replace(b"\r\n", b"\n"):
                 self.already.append(f"{label} ({path})")
                 continue
@@ -581,18 +762,20 @@ def plan_registration(host: Host, roots: Roots, opts: Options, planner: Planner)
         planner.snippets.append(Snippet(where, entry_snippet(host, values), why_not))
         return None
     assert path is not None
+    timeout_key = host.timeout.key if host.timeout.file is None else None
     if is_toml(host):
-        planner.add_toml(path, "registration", entry_path(host), values)
+        planner.add_toml(path, "registration", entry_path(host), values, timeout_key)
     else:
         for key, value in values.items():
-            planner.add_json(path, "registration", SetKey(entry_path(host) + tuple(key.split(".")), value))
+            mode = "minimum" if key == timeout_key else "default" if value == {} else "set"
+            planner.add_json(path, "registration", SetKey(entry_path(host) + tuple(key.split(".")), value, mode))
     return path
 
 
 def plan_side_files(host: Host, roots: Roots, opts: Options, planner: Planner) -> None:
     timeout = host.timeout
     if timeout.key and timeout.file and timeout.needs_raising() and usable(timeout.source):
-        planner.add_json(roots.path(timeout.file), "tool-call limit", SetKey(tuple(timeout.key.split(".")), timeout.wanted_value()))
+        planner.add_json(roots.path(timeout.file), "tool-call limit", SetKey(tuple(timeout.key.split(".")), timeout.wanted_value(), "minimum"))
     approval = host.approval
     if approval and approval.kind == "list" and (approval.by_default or opts.approve):
         if approval.writable and approval.file and usable(approval.source):
@@ -603,35 +786,70 @@ def plan_side_files(host: Host, roots: Roots, opts: Options, planner: Planner) -
             )
 
 
-def plan_status_line(host: Host, roots: Roots, opts: Options, planner: Planner) -> None:
+def plan_status_line(host: Host, roots: Roots, opts: Options, planner: Planner, registration: Path | None) -> None:
     spec = host.status_line
     if spec is None or not opts.status_line or opts.scope != "user":
         return
     status_cmd = status_command(opts.command, opts.args)
     path = roots.path(spec.file)
-    if not spec.writable or not usable(spec.source):
-        planner.snippets.append(
-            Snippet(str(path), spec.snippet.replace("<status command>", status_cmd.replace('"', '\\"')), "the status line is not written by the installer")
-        )
-        return
-    text = Text.decode(_read_bytes(path))
+    key = tuple(spec.key.split("."))
+    writable = spec.writable and usable(spec.source)
+    manual = spec.snippet.replace("<status command>", json.dumps(status_cmd)[1:-1])
     try:
-        data, _, _ = load_json(text.text if text else None)
-    except Unsafe as exc:
-        planner.snippets.append(Snippet(str(path), json.dumps({spec.key: _status_value(spec, status_cmd)}, indent=2), f"{path.name} not edited: {exc}"))
+        text = Text.decode(_read_edit_bytes(path)) or Text("")
+        data = tomllib.loads(text.text) if path.suffix == ".toml" else load_json(text.text)[0]
+    except (Unsafe, OSError, tomllib.TOMLDecodeError) as exc:
+        snippet = manual or json.dumps({spec.key: _status_value(spec, status_cmd)}, indent=2)
+        planner.snippets.append(Snippet(str(path), snippet, f"{path.name} not edited: {exc}"))
         return
-    existing = get_path(data, spec.key.split("."))
+    existing = get_path(data, key)
     if existing is None:
-        planner.add_json(path, "status line", SetKey(tuple(spec.key.split(".")), _status_value(spec, status_cmd)))
+        if writable:
+            planner.add_json(path, "status line", SetKey(key, _status_value(spec, status_cmd)))
+        else:
+            planner.snippets.append(Snippet(str(path), manual, "the status line is not written by the installer"))
         return
-    existing_cmd = existing.get("command", "") if isinstance(existing, dict) else str(existing)
-    if "agent_bridge" in existing_cmd and "status" in existing_cmd or "agent-bridge status" in existing_cmd:
+    existing_cmd = existing.get("command", "") if isinstance(existing, dict) else existing
+    if not isinstance(existing_cmd, str):
+        existing_cmd = ""
+    if existing_cmd == status_cmd:
         planner.already.append(f"status line ({path})")
+        return
+    previous = None
+    if registration is not None:
+        try:
+            if _edit_mode(registration) is not None:
+                previous = registered_entry(host, registration)
+        except (Unsafe, OSError):
+            pass
+    old_command = _entry_command(host, previous)
+    old_args = get_path(previous, ("args",))
+    if isinstance(get_path(previous, ("command",)), list):
+        old_args = previous["command"][1:]
+    generated = old_command and isinstance(old_args, list) and all(isinstance(arg, str) for arg in old_args)
+    try:
+        argv = _split_command(existing_cmd)
+    except (OSError, ValueError):
+        argv = []
+    direct = argv[-2:] == ["status", "--line"] and (
+        argv[1:3] == ["-m", "agent_bridge"] or Path(argv[0]).stem == "agent-bridge"
+    )
+    if direct or (generated and existing_cmd == status_command(old_command, old_args)):
+        old_path = Path(old_command) if old_command else None
+        if old_path is not None and old_path != Path(opts.command) and (
+            not direct or Path(argv[0]) == old_path
+        ):
+            planner.snippets.append(Snippet(
+                str(path), status_cmd,
+                f"the existing status line still uses the old command `{existing_cmd}`; replace its command with this line",
+            ))
+        else:
+            planner.already.append(f"status line ({path})")
         return
     planner.snippets.append(
         Snippet(
             existing_cmd or str(path),
-            user_script_line(existing_cmd, status_cmd) + "\n",
+            status_command(opts.command, opts.args, script=existing_cmd) + "\n",
             "a status line is already set and is kept: add this line to your own script so it prints the bridge's line too",
         )
     )
@@ -683,6 +901,8 @@ def registered_entry(host: Host, path: Path) -> Any:
             data = json.loads(text.text) if text.text.strip() else {}
         except json.JSONDecodeError as exc:
             raise Unsafe(f"not plain JSON ({exc.msg} at line {exc.lineno})") from None
+        except (ValueError, RecursionError) as exc:
+            raise Unsafe(f"cannot read JSON ({exc})") from None
     return get_path(data, entry_path(host))
 
 
@@ -697,17 +917,14 @@ class Session:
         roots: Roots,
         out: Out,
         ask: Ask,
-        runner: Runner | None,
         path_lookup: PathLookup,
     ) -> None:
         self.opts = opts
         self.roots = roots
         self.out = out
         self.ask = ask
-        self.runner = runner
         self.path_lookup = path_lookup
         self.skill_paths: set[Path] = set()
-        self.written: set[Path] = set()
 
     def confirm(self, prompt: str) -> bool:
         if self.opts.print_only:
@@ -744,58 +961,17 @@ class Session:
         if not self.confirm("Apply?"):
             report.declined.append(f"{label} ({edit.path})")
             return
-        if _read_bytes(edit.path) != edit.raw_old:
-            report.failed.append(f"{label}: {edit.path} changed while the diff was shown; run install again")
+        try:
+            mode = _edit_mode(edit.path)
+            if _read_bytes(edit.path) != edit.raw_old or (mode is None) != (edit.raw_old is None):
+                raise Unsafe(f"{edit.path} changed while the diff was shown; run install again")
+            if edit.raw_old is not None and mode is not None:
+                self.out(f"backup: {_backup(edit.path, edit.raw_old, mode)}")
+            _write_bytes(edit.path, edit.new_bytes, edit.raw_old, mode)
+        except (Unsafe, OSError) as exc:
+            report.failed.append(f"{label}: {exc}")
             return
-        if edit.raw_old is not None:
-            backup = backup_path(edit.path)
-            _write_bytes(backup, edit.raw_old)
-            self.out(f"backup: {backup}")
-        _write_bytes(edit.path, edit.new_bytes)
-        self.written.add(edit.path)
         report.done.append(f"{label} ({edit.path})")
-
-    def official_command(self, host: Host, path: Path | None, report: HostReport) -> None:
-        """Run the host's own `mcp add` when the bridge is not registered yet and running is allowed."""
-        reg = host.register
-        if reg is None or not usable(reg.source) or self.opts.scope not in reg.scopes or path is None:
-            return
-        if self.opts.scope != "user":
-            return  # a project-scope `mcp add` writes into the current folder, not --project: edit the file
-        try:
-            if registered_entry(host, path) is not None:
-                return
-        except Unsafe:
-            return
-        binary = self.path_lookup(reg.argv[0])
-        if not binary or hosts_mod.is_shim(binary):
-            return
-        argv = [binary, *expand_register(reg.argv, self.opts)[1:]]
-        shown = " ".join(expand_register(reg.argv, self.opts))
-        if self.runner is None:
-            return  # --home without an injected runner: the host's command would write the real home
-        if self.opts.print_only:
-            self.out(f"would run: {shown}")
-            self.out("(the diff below shows the file as it would be after that command and the edits that follow it)")
-            return
-        self.out(f"run: {shown}")
-        if not self.confirm("Run it?"):
-            report.declined.append(f"registration command ({shown})")
-            return
-        try:
-            result = self.runner(argv)
-        except (OSError, subprocess.SubprocessError) as exc:
-            report.failed.append(f"registration command failed to start: {exc}; editing the file instead")
-            return
-        if result.returncode != 0:
-            first = (result.stderr or result.stdout or "").strip().splitlines()[:1]
-            report.failed.append(
-                f"registration command exited {result.returncode}"
-                + (f": {first[0]}" if first else "")
-                + "; editing the file instead"
-            )
-            return
-        report.done.append(f"registration via `{shown}`")
 
     def install_host(self, host: Host) -> HostReport:
         report = HostReport(host)
@@ -816,14 +992,10 @@ class Session:
         elif host.timeout.key is None and host.timeout.needs_raising():
             self.out(f"note: no verified key raises {host.label}'s tool-call limit; set it to {WANTED_TIMEOUT_SECONDS} s in its settings if it has one")
 
-        path, why_not = config_path(host, self.roots, opts.scope)
-        if why_not is None:  # an unverified file cannot be checked for an existing registration first
-            self.official_command(host, path, report)
-
         planner = Planner(self.roots, opts)
-        plan_registration(host, self.roots, opts, planner)
+        registration = plan_registration(host, self.roots, opts, planner)
         plan_side_files(host, self.roots, opts, planner)
-        plan_status_line(host, self.roots, opts, planner)
+        plan_status_line(host, self.roots, opts, planner, registration)
         plan_skill(host, self.roots, opts, planner, self.skill_paths)
         for edit in planner.edits():
             self.apply(edit, report)
@@ -832,23 +1004,85 @@ class Session:
             self.out(f">> paste by hand into {snippet.where}: {snippet.reason}")
             self.out(snippet.text.rstrip("\n"))
             report.printed.append(f"snippet for {snippet.where}")
-        if host.register and host.name == "vscode-copilot" and opts.scope == "user":
-            self.out("or run: " + " ".join(expand_register(host.register.argv, opts)))
+        reg = host.register
+        if reg and usable(reg.source) and opts.scope in reg.scopes:
+            binary = self.path_lookup(reg.argv[0])
+            batch = binary and hosts_mod.is_batch_launcher(binary)
+            if batch:
+                self.out(f"note: {binary} is a Windows batch launcher")
+            if registration is None or batch:
+                self.out("or run manually: " + _manual_command(expand_register(reg.argv, opts)))
         return report
 
 
 def _split_command(raw: str) -> list[str]:
-    import shlex
+    if os.name != "nt":
+        return shlex.split(raw)
 
-    if os.name == "nt":
-        parts = shlex.split(raw, posix=False)
-        return [p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'" else p for p in parts]
-    return shlex.split(raw)
+    import ctypes
+    from ctypes import wintypes
+
+    parse = ctypes.WinDLL("shell32", use_last_error=True).CommandLineToArgvW
+    parse.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int))
+    parse.restype = ctypes.POINTER(wintypes.LPWSTR)
+    free = ctypes.WinDLL("kernel32").LocalFree
+    free.argtypes = (ctypes.c_void_p,)
+    free.restype = ctypes.c_void_p
+    count = ctypes.c_int()
+    # CommandLineToArgvW gives argv[0] special rules. Parse user arguments after it.
+    argv = parse("agent-bridge " + raw, ctypes.byref(count))
+    if not argv:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return argv[1:count.value]
+    finally:
+        free(argv)
 
 
 def default_command() -> tuple[str, list[str]]:
     """The command that starts this bridge: the running interpreter with `-m agent_bridge`."""
     return os.path.abspath(sys.executable), ["-m", "agent_bridge"]
+
+
+def _linked_worktree(path: Path) -> bool:
+    for parent in path.parents:
+        marker = parent / ".git"
+        if marker.is_dir():
+            return False
+        if marker.is_file():
+            line = marker.read_text(encoding="utf-8").strip()
+            if line.startswith("gitdir: ") and (parent / line.removeprefix("gitdir: ") / "commondir").is_file():
+                return True
+    return False
+
+
+def _transient_command(command: str, roots: Roots, env: Mapping[str, str]) -> str | None:
+    path = Path(command).expanduser()
+    if not path.is_absolute() and not path.is_file():
+        return None
+    path = path.absolute()
+    try:
+        paths = (path, path.resolve())
+    except (OSError, RuntimeError):
+        paths = (path,)
+    if any(
+        part.lower() == "uvx" or re.fullmatch(r"(?:archive|environments)-v\d+", part.lower())
+        for candidate in paths for part in candidate.parent.parts
+    ):
+        return "a uvx cache"
+    try:
+        if any(_linked_worktree(candidate) for candidate in dict.fromkeys(paths)):
+            return "a linked Git worktree"
+    except (OSError, UnicodeError):
+        pass
+    temp_dirs = [Path(env[name]).absolute() for name in ("TMPDIR", "TMP", "TEMP") if env.get(name)]
+    if os.name == "nt":
+        temp_dirs.append(roots.home / "AppData" / "Local" / "Temp")
+    else:
+        temp_dirs.extend(map(Path, ("/tmp", "/var/tmp", "/private/tmp")))
+    if any(candidate.is_relative_to(directory) for candidate in paths for directory in temp_dirs):
+        return "a temporary folder"
+    return None
 
 
 def _install_parser() -> argparse.ArgumentParser:
@@ -879,12 +1113,19 @@ def run_install(
     ask: Ask = input,
     out: Out = print,
 ) -> int:
-    """`agent-bridge install`. The host's own `mcp add` runs only without --home and --print, or with an injected runner."""
+    """`agent-bridge install`. Registration uses file edits or manual instructions.
+
+    The optional runner is retained for callers of this entry point. Install never invokes it.
+    """
     args = _install_parser().parse_args(argv)
     env = dict(os.environ) if env is None else dict(env)
     if args.command:
-        parts = _split_command(args.command)
-        if not parts:
+        try:
+            parts = _split_command(args.command)
+        except (OSError, ValueError) as exc:
+            out(f"agent-bridge install: cannot parse --command ({exc})")
+            return 2
+        if not parts or not parts[0]:
             out("agent-bridge install: --command is empty")
             return 2
         command, cmd_args = parts[0], parts[1:]
@@ -894,8 +1135,6 @@ def run_install(
         roots = Roots.for_home(args.home, project=args.project)
     else:
         roots = Roots.from_env(env, project=args.project)
-        if runner is None:
-            runner = _real_runner
     opts = Options(
         command=command,
         args=cmd_args,
@@ -906,8 +1145,14 @@ def run_install(
         print_only=args.print_only,
         yes=args.yes,
     )
-    session = Session(opts, roots, out, ask, runner, path_lookup)
+    session = Session(opts, roots, out, ask, path_lookup)
     out(f"command: {' '.join([command, *cmd_args])}")
+    executable = command
+    if not re.search(r"[/\\]", command):
+        executable = path_lookup(command) or command
+    location = _transient_command(executable, roots, env)
+    if location:
+        out(f"warning: {command} is in {location}; use --command with a stable path if it may be removed")
     if args.print_only:
         out("--print: nothing will be written and no command will be run")
 
@@ -944,10 +1189,6 @@ def run_install(
     return 1 if any(r.failed for r in reports) else 0
 
 
-def _real_runner(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(list(argv), capture_output=True, text=True, timeout=120, check=False)
-
-
 # --------------------------------------------------------------------------------------------
 # doctor
 
@@ -980,6 +1221,9 @@ def check_backends(env: Mapping[str, str], path_lookup: PathLookup, runner: Runn
             checks.append(Check(label, "warn", "not found on PATH", f"install {name}, or set AGENT_BRIDGE_{name.upper()}_BIN"))
             continue
         found_any = True
+        if hosts_mod.is_batch_launcher(binary):
+            checks.append(Check(label, "warn", f"{binary} is a Windows batch launcher", "run manually: " + _manual_command([binary, "--version"])))
+            continue
         try:
             result = runner([binary, "--version"])
             version = parse_version((result.stdout or "") + (result.stderr or ""))
@@ -1051,8 +1295,8 @@ def _entry_command(host: Host, entry: Any) -> str | None:
     if not isinstance(entry, dict):
         return None
     command = entry.get("command")
-    if isinstance(command, list):
-        return command[0] if command else None
+    if isinstance(command, list) and command:
+        command = command[0]
     return command if isinstance(command, str) else None
 
 
@@ -1123,6 +1367,7 @@ def check_host(host: Host, roots: Roots, path_lookup: PathLookup, skill: bytes) 
 
 
 def check_state(state_dir: Path) -> list[Check]:
+    state_dir = state_dir.resolve()
     checks: list[Check] = []
     if not _is_dir(state_dir):
         return [Check("state folder", "warn", f"{state_dir} does not exist yet", "it is made on the bridge's first start")]
@@ -1133,9 +1378,9 @@ def check_state(state_dir: Path) -> list[Check]:
         return checks
     _audit(db)
     try:
-        # immutable=1 with mode=ro: no lock, no -wal or -shm file is made beside the database.
-        conn = sqlite3.connect(f"{db.as_uri()}?mode=ro&immutable=1", uri=True)
+        conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
         try:
+            conn.execute("PRAGMA query_only = ON")
             tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'").fetchone()[0]
         finally:
             conn.close()
@@ -1158,6 +1403,7 @@ def run_doctor(
     parser = argparse.ArgumentParser(prog="agent-bridge doctor", description="Check the backends, the host registrations and the state folder. Changes nothing.")
     parser.add_argument("--json", action="store_true", help="print the checks as JSON")
     parser.add_argument("--home", type=Path, help="(for tests) treat DIR as the home folder")
+    parser.add_argument("--state-dir", type=Path, help="check this state folder")
     args = parser.parse_args(argv)
     env = dict(os.environ) if env is None else dict(env)
     if args.home is not None:
@@ -1174,7 +1420,7 @@ def run_doctor(
         checks.append(Check("hosts", "warn", "no host found on this machine", "agent-bridge install --host NAME"))
     for host in detected:
         checks += check_host(host, roots, path_lookup, skill)
-    checks += check_state(state_dir)
+    checks += check_state(args.state_dir.expanduser() if args.state_dir is not None else state_dir)
     if (env.get(ENV_PARENT_JOB) or "").strip():
         checks.append(Check("nesting", "fail", f"{ENV_PARENT_JOB} is set: a bridge started here refuses to start jobs", f"unset {ENV_PARENT_JOB} (it is meant only for a bridge's own subagents)"))
     else:

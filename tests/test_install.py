@@ -11,9 +11,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import subprocess
+import sys
 import tomllib
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -45,7 +48,6 @@ def _never_the_real_home(
     def no_real_runner(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
         raise AssertionError(f"a real host command was started: {argv}")
 
-    monkeypatch.setattr(install_cmd, "_real_runner", no_real_runner)
     monkeypatch.setattr(install_cmd, "_version_runner", no_real_runner)
 
 
@@ -148,7 +150,7 @@ class Run:
     def text(self) -> str:
         return "\n".join(self.lines)
 
-    def install(self, *args: str, answers: Sequence[str] = (), runner=None, path_lookup=lambda name: None) -> int:
+    def install(self, *args: str, answers: Sequence[str] = (), runner=None, path_lookup=lambda name: None, env=None) -> int:
         self.lines.clear()
         queue = list(answers)
 
@@ -160,7 +162,7 @@ class Run:
 
         return install_cmd.run_install(
             ["--home", str(self.home), "--command", f"{self.python} -m agent_bridge", *args],
-            env={},
+            env=env or {},
             path_lookup=path_lookup,
             runner=runner,
             ask=ask,
@@ -349,7 +351,14 @@ def test_print_shows_diffs_and_writes_nothing(run: Run, home: Path) -> None:
     _write(home / ".gemini" / "config" / "mcp_config.json", AGY_MCP)
     _write(home / ".gemini" / "antigravity-cli" / "settings.json", AGY_SETTINGS)
     before = _snapshot(home)
-    assert run.install("--host", "codex", "--host", "antigravity", "--print", "--yes") == 0
+
+    def must_not_run(argv):
+        pytest.fail(f"--print started {argv}")
+
+    assert run.install(
+        "--host", "codex", "--host", "antigravity", "--print", "--yes",
+        runner=must_not_run, path_lookup={"codex": "C:/tools/codex.exe", "agy": "C:/tools/agy.exe"}.get,
+    ) == 0
     assert _snapshot(home) == before
     assert "+[mcp_servers.agent-bridge]" in run.text
     assert '+      "mcp(agent-bridge/*)"' in run.text
@@ -427,27 +436,35 @@ def test_the_skill_is_copied_and_a_changed_one_is_replaced_only_on_yes(run: Run,
 # ------------------------------------------------------------------ the host's own command
 
 
-def test_the_hosts_own_command_registers_then_the_file_gets_the_rest(run: Run, home: Path, python: Path) -> None:
-    config = _write(home / ".codex" / "config.toml", CODEX_TOML)
+@pytest.mark.parametrize("original", [CODEX_TOML, "mcp_servers = []\n"])
+def test_user_registration_uses_confirmed_file_editor(run: Run, home: Path, python: Path, original: str) -> None:
+    config = _write(home / ".codex" / "config.toml", original)
     calls: list[list[str]] = []
 
     def fake(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(argv))
-        with config.open("a", encoding="utf-8") as fh:
-            fh.write(f"\n[mcp_servers.agent-bridge]\ncommand = '{python}'\nargs = [\"-m\", \"agent_bridge\"]\n")
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "unsupported config")
 
     lookup = {"codex": "C:/tools/codex.exe"}.get
-    assert run.install("--host", "codex", "--yes", "--no-skill", runner=fake, path_lookup=lookup) == 0
-    assert calls == [["C:/tools/codex.exe", "mcp", "add", "agent-bridge", "--", str(python), "-m", "agent_bridge"]]
+    code = run.install("--host", "codex", "--no-skill", answers=["y"], runner=fake, path_lookup=lookup)
+    assert not calls
+    assert code == 0
+    if original != CODEX_TOML:
+        assert config.read_bytes() == original.encode()
+        assert "paste by hand" in run.text
+        assert not list(config.parent.glob("*.bak-*"))
+        return
+    assert run.text.index("+[mcp_servers.agent-bridge]") < run.text.index("Apply?") < run.text.index("backup:")
+    backup, = config.parent.glob("*.bak-*")
+    assert backup.read_bytes() == original.encode()
     table = tomllib.loads(config.read_text(encoding="utf-8"))["mcp_servers"]["agent-bridge"]
+    assert table["command"] == str(python)
     assert table["tool_timeout_sec"] == 600 and table["default_tools_approval_mode"] == "approve"
 
 
 def test_with_home_and_no_runner_no_host_command_runs(run: Run, home: Path) -> None:
     _write(home / ".codex" / "config.toml", CODEX_TOML)
     lookup = {"codex": "C:/tools/codex.exe"}.get
-    # _real_runner raises in this module; a run that reached it would fail here.
     assert run.install("--host", "codex", "--yes", "--no-skill", path_lookup=lookup) == 0
     assert "agent-bridge" in tomllib.loads((home / ".codex" / "config.toml").read_text(encoding="utf-8"))["mcp_servers"]
 
@@ -531,13 +548,15 @@ def _good_home(home: Path, python: Path) -> None:
 
 def test_doctor_passes_a_good_setup_and_opens_the_database_read_only(home: Path, python: Path) -> None:
     _good_home(home, python)
-    before = _snapshot(home / ".agent-bridge")
+    db = home / ".agent-bridge" / "bridge.db"
+    before = db.read_bytes()
     code, checks = _doctor(home)
     assert code == 0
     for name in ("Codex: registered", "Codex: command", "Codex: tool-call limit", "Codex: approval", "Codex: skill", "database", "nesting"):
         assert checks[name]["status"] == "ok", (name, checks[name])
     assert checks["backend agy"]["detail"].startswith("1.5.18")
-    assert _snapshot(home / ".agent-bridge") == before, "doctor changed the state folder"
+    # SQLite can create WAL sidecars for a lock-aware read-only connection.
+    assert db.read_bytes() == before, "doctor changed the database"
 
 
 def test_doctor_warns_on_a_missing_timeout_and_names_the_default(home: Path, python: Path) -> None:
@@ -568,3 +587,261 @@ def test_doctor_fails_an_old_backend_and_the_nesting_marker(home: Path) -> None:
     assert checks["backend claude"]["status"] == "ok"
     assert checks["nesting"]["status"] == "fail"
     assert code == 1
+
+
+def test_same_second_backups_are_exclusive_and_preserve_mode(
+    run: Run, home: Path, python: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FrozenTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 27, tzinfo=UTC)
+
+    monkeypatch.setattr(install_cmd, "datetime", FrozenTime)
+    config = _write(home / ".codex" / "config.toml", CODEX_TOML)
+    config.chmod(0o600)
+    mode = stat.S_IMODE(config.stat().st_mode)
+    base = ["--host", "codex", "--yes", "--no-skill"]
+    assert run.install(*base) == 0
+    first_edit = config.read_bytes()
+    assert run.install(*base, "--command", f'"{python}" --second') == 0
+    backups = list(config.parent.glob("*.bak-*"))
+    assert len(backups) == 2
+    assert {p.read_bytes() for p in backups} == {CODEX_TOML.encode(), first_edit}
+    assert all(stat.S_IMODE(p.stat().st_mode) & 0o444 & ~mode == 0 for p in backups)
+    assert stat.S_IMODE(config.stat().st_mode) == mode
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="uses Windows ACLs")
+def test_windows_backup_keeps_restricted_acl(run: Run, home: Path) -> None:
+    config = _write(home / ".codex" / "config.toml", CODEX_TOML)
+    subprocess.run(["icacls.exe", str(config), "/inheritance:d"], check=True, capture_output=True)
+    assert run.install("--host", "codex", "--yes", "--no-skill") == 0
+    backup, = config.parent.glob("*.bak-*")
+    for path in (backup, config):
+        acl = subprocess.check_output(["icacls.exe", str(path)])
+        assert b"(I)" not in acl
+
+
+def test_replacement_failure_leaves_original_and_cleans_up_temp(
+    run: Run, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _write(home / ".codex" / "config.toml", CODEX_TOML)
+    replace = os.replace
+    attempted: list[Path] = []
+
+    def fail_replacing_config(src, dst):
+        if Path(dst) != config:
+            return replace(src, dst)
+        source = Path(src)
+        attempted.append(source)
+        assert source.parent == config.parent
+        assert config.read_bytes() == CODEX_TOML.encode()
+        raise OSError("simulated replacement failure")
+
+    monkeypatch.setattr(os, "replace", fail_replacing_config)
+    assert run.install("--host", "codex", "--yes", "--no-skill") == 1
+    assert len(attempted) == 1 and not attempted[0].exists()
+    assert config.read_bytes() == CODEX_TOML.encode()
+    assert "simulated replacement failure" in run.text
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_symlink_config_is_refused(run: Run, home: Path, dangling: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = home / ".cursor" / "mcp.json"
+    config.parent.mkdir()
+    target = home / "target.json"
+    if not dangling:
+        _write(target, '{"mcpServers": {}}')
+    try:
+        config.symlink_to(target)
+    except OSError as exc:
+        # Windows can require a privilege unavailable to the test process.
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        real_lstat, real_readlink = Path.lstat, Path.readlink
+        link_stat = os.stat_result((stat.S_IFLNK, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        monkeypatch.setattr(Path, "lstat", lambda p: link_stat if p == config else real_lstat(p))
+        monkeypatch.setattr(Path, "readlink", lambda p: target if p == config else real_readlink(p))
+    before = _snapshot(home)
+    assert run.install("--host", "cursor", "--yes", "--no-skill") == 0
+    assert _snapshot(home) == before
+    assert "symlink" in run.text and str(config) in run.text and str(target) in run.text
+    assert "paste by hand" in run.text
+
+
+@pytest.mark.parametrize("host,relative_path,root,scope", [
+    ("claude-code", ".claude.json", "mcpServers", "user"),
+    ("zed", ".zed/settings.json", "context_servers", "project"),
+])
+def test_reinstall_preserves_server_env(
+    run: Run, home: Path, python: Path, tmp_path: Path, host: str, relative_path: str, root: str, scope: str
+) -> None:
+    project = tmp_path / "project"
+    env = {"AGENT_BRIDGE_DEFAULT_TIMEOUT": "900", "EXTRA": "keep"}
+    config = _write((home if scope == "user" else project) / relative_path, {
+        root: {"agent-bridge": {"command": "old", "env": env}},
+    })
+    assert run.install("--host", host, "--scope", scope, "--project", str(project), "--yes", "--no-status-line", "--no-skill") == 0
+    entry = json.loads(config.read_bytes())[root]["agent-bridge"]
+    assert entry["command"] == str(python) and entry["env"] == env
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="uses the Windows argument parser")
+def test_windows_command_parses_quotes_inside_arguments(run: Run, home: Path) -> None:
+    raw = r'"C:\A&B dir\python.exe" -m agent_bridge --tag="two words" "" "a\"b"'
+    assert run.install("--host", "cursor", "--yes", "--no-skill", "--command", raw) == 0
+    entry = json.loads((home / ".cursor" / "mcp.json").read_bytes())["mcpServers"]["agent-bridge"]
+    assert entry["command"] == r"C:\A&B dir\python.exe"
+    assert entry["args"] == ["-m", "agent_bridge", "--tag=two words", "", 'a"b']
+
+
+def test_batch_launcher_is_only_shown(run: Run, home: Path) -> None:
+    calls = []
+
+    def fake(argv):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    _write(home / ".gemini" / "config" / "mcp_config.json", '{"mcpServers": {}}')
+    assert run.install(
+        "--host", "antigravity", "--yes", "--no-skill", "--no-status-line",
+        runner=fake, path_lookup={"agy": "C:/tools/agy.CMD"}.get,
+    ) == 0
+    assert not calls
+    assert "agy.CMD" in run.text and "mcp add" in run.text
+
+
+def test_doctor_shows_batch_version_command_without_running_it(home: Path) -> None:
+    lines = []
+    calls = []
+
+    def fake(argv):
+        calls.append(argv)
+        return _versions(VERSIONS)(argv)
+
+    assert install_cmd.run_doctor(
+        ["--home", str(home), "--json"], env={"AGENT_BRIDGE_AGY_BIN": "C:/tools/agy.bat"},
+        runner=fake, path_lookup=BACKENDS.get, out=lines.append,
+    ) == 0
+    assert all(not argv[0].endswith(".bat") for argv in calls)
+    check = next(row for row in json.loads("\n".join(lines))["checks"] if row["name"] == "backend agy")
+    assert check["status"] == "warn"
+    assert "agy.bat" in check["fix"] and "--version" in check["fix"]
+
+
+def test_status_line_quotes_for_the_script_shell(run: Run, home: Path, python: Path) -> None:
+    _write(home / ".claude" / "settings.json", CLAUDE_SETTINGS)
+    raw = f'"{python}" -m agent_bridge "--tag=$x & two words"'
+    assert run.install("--host", "claude-code", "--yes", "--no-skill", "--command", raw) == 0
+    line = next(line for line in run.lines if line.startswith("& "))
+    assert "'--tag=$x & two words'" in line
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="executes the hook under native Windows shells")
+@pytest.mark.parametrize("host,settings_path,shell", [
+    ("antigravity", ".gemini/antigravity-cli/settings.json", ["cmd.exe", "/d", "/s", "/c"]),
+    ("claude-code", ".claude/settings.json", ["powershell.exe", "-NoProfile", "-Command"]),
+])
+def test_generated_windows_hook_passes_literal_arguments(
+    run: Run, home: Path, tmp_path: Path, host: str, settings_path: str, shell: list[str]
+) -> None:
+    probe = _write(tmp_path / "probe & args.py", "import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+    tags = ["--tag=$x&%PATH%!two words", 'a"b', ""]
+    command = subprocess.list2cmdline([sys.executable, str(probe), *tags])
+    assert run.install("--host", host, "--yes", "--no-skill", "--command", command) == 0
+    hook = json.loads((home / settings_path).read_bytes())["statusLine"]["command"]
+    output = subprocess.check_output([*shell, hook], text=True, timeout=15)
+    assert json.loads(output) == [*tags, "status", "--line"]
+
+
+@pytest.mark.parametrize("raw,reason", [
+    (b'{"value":1e400}', "non-finite"),
+    (b'{"value":NaN}', "non-finite"),
+    (b'{"value":0.123456789123456789}', "round trip"),
+    (b'{"value":1e2}', "round trip"),
+    (b'{"value":-0}', "round trip"),
+    (b'{"nested":{"value":1,"value":2}}', "duplicate"),
+    ('{"mcpServers": {}}'.encode("utf-16"), "UTF-8"),
+])
+def test_unsafe_json_gets_a_snippet_and_other_files_are_edited(
+    run: Run, home: Path, raw: bytes, reason: str
+) -> None:
+    path = _write(home / ".cursor" / "mcp.json", raw)
+    assert run.install("--host", "cursor", "--host", "codex", "--yes", "--no-skill") == 0
+    assert path.read_bytes() == raw
+    assert not list(path.parent.glob("*.bak-*"))
+    assert reason in run.text and "paste by hand" in run.text and '"agent-bridge"' in run.text
+    assert (home / ".codex" / "config.toml").exists()
+
+
+@pytest.mark.parametrize("host,relative_path,key,value", [
+    ("codex", ".codex/config.toml", "tool_timeout_sec", 900),
+    ("antigravity", ".gemini/config/mcp_config.json", "timeoutSeconds", 900),
+    ("copilot-cli", ".copilot/mcp-config.json", "timeout", 900_000),
+])
+def test_repoint_preserves_higher_timeout(run: Run, home: Path, python: Path, host, relative_path, key, value) -> None:
+    raw = (
+        f'[mcp_servers.agent-bridge]\ncommand = "old"\n{key} = {value}\n'
+        if host == "codex" else {"mcpServers": {"agent-bridge": {"command": "old", key: value}}}
+    )
+    config = _write(home / relative_path, raw)
+    assert run.install("--host", host, "--yes", "--no-status-line", "--no-skill") == 0
+    original = config.read_text(encoding="utf-8")
+    data = tomllib.loads(original) if host == "codex" else json.loads(original)
+    entry = data["mcp_servers" if host == "codex" else "mcpServers"]["agent-bridge"]
+    assert entry[key] == value and entry["command"] == str(python)
+
+
+@pytest.mark.parametrize("location,warning", [
+    ("uv/cache/archive-v0/abc", "uvx"),
+    ("scratch", "temp"),
+    ("linked", "worktree"),
+])
+def test_install_warns_about_transient_interpreter_before_prompt(
+    run: Run, home: Path, tmp_path: Path, location: str, warning: str
+) -> None:
+    if location == "linked":
+        gitdir = tmp_path / "main" / ".git" / "worktrees" / "linked"
+        _write(tmp_path / location / ".git", f"gitdir: {gitdir.as_posix()}\n")
+        _write(gitdir / "commondir", "../..\n")
+    exe = _write(tmp_path / location / ".venv" / "python.exe", b"")
+    assert run.install(
+        "--host", "codex", "--no-skill", "--command", f'"{exe}"', answers=["n"], env={"TMPDIR": str(tmp_path)},
+    ) == 0
+    warnings = [line for line in run.lines if line.startswith("warning:") and warning in line]
+    assert warnings and run.lines.index(warnings[0]) < next(i for i, line in enumerate(run.lines) if "Apply?" in line)
+    assert not (home / ".codex" / "config.toml").exists()
+
+
+def test_repoint_offers_replacement_for_recognized_stale_hook(run: Run, home: Path, python: Path) -> None:
+    _write(home / ".claude.json", {"mcpServers": {"agent-bridge": {"command": "C:/old/python.exe"}}})
+    old = '"C:/old/python.exe" -m agent_bridge status --line'
+    settings = _write(home / ".claude" / "settings.json", {"statusLine": {"command": old}})
+    assert run.install("--host", "claude-code", "--yes", "--no-skill") == 0
+    assert json.loads(settings.read_bytes())["statusLine"]["command"] == old
+    assert old in run.text and "still uses" in run.text
+    assert str(python).replace("\\", "/") in run.text and "status --line" in run.text
+
+
+def test_doctor_relative_state_dir_uses_read_only_query_guard(
+    home: Path, python: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _good_home(home, python)
+    monkeypatch.chdir(tmp_path)
+    db = home / ".agent-bridge" / "bridge.db"
+    connect = sqlite3.connect
+    queries: list[str] = []
+
+    def observe(database, *, uri):
+        assert uri and database == db.resolve().as_uri() + "?mode=ro"
+        conn = connect(database, uri=uri)
+        conn.set_trace_callback(queries.append)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", observe)
+    assert install_cmd.run_doctor(
+        ["--home", str(home), "--state-dir", str(db.parent.relative_to(tmp_path))],
+        env={}, path_lookup=BACKENDS.get, runner=_versions(VERSIONS), out=lambda line: None,
+    ) == 0
+    assert queries[0].lower().replace(" ", "") == "pragmaquery_only=on"
