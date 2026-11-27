@@ -11,17 +11,32 @@ import json
 import os
 import sqlite3
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from agent_bridge import dashboard as dashboard_module
+from agent_bridge import jobs as jobs_module
 from agent_bridge.config import Settings
-from agent_bridge.dashboard import BACKENDS, QUOTA_POOLS, render_text
+from agent_bridge.dashboard import (
+    BACKENDS,
+    QUOTA_POOLS,
+    build_dashboard,
+    build_quota_section,
+    render_text,
+    resolve_window,
+)
 from agent_bridge.jobs import JobManager
 from agent_bridge.models import JobRecord
 from agent_bridge.nesting import Nesting
+from agent_bridge.quota import (
+    claude_quota_from_rate_limit,
+    enrich_quota_reading,
+    parse_codex_rate_limits,
+    parse_neon_usage_envelope,
+)
 from agent_bridge.server import create_server
 
 ME = "owner-me"
@@ -154,7 +169,7 @@ async def test_totals_hold_only_finished_runs_with_exact_or_delta_counts(tmp_pat
     assert d["not_in_totals"]["cli_started_no_count"]["job_ids"] == ["codex-lost"]
     # Claude Code's cost estimate is not a figure the dashboard shows or adds.
     assert "0.75" not in json.dumps(d) and "cost_usd" not in json.dumps(d)
-    assert any("quota" in line for line in d["left_out"])
+    assert len(d["left_out"]) == 1 and "cost estimate" in d["left_out"][0]
     await manager.shutdown()
 
 
@@ -410,10 +425,10 @@ async def test_the_text_view_is_rendered_from_the_same_figures(tmp_path: Path) -
     d = await manager.usage_dashboard(period="all")
     text = d["text"]
 
-    assert "tokens 12,345  (input" in text
+    assert _line(text, "  total").split() == ["total", "2", "12,345", "4s"]
     assert "CLI started, no count" in text and "codex-b" in text
-    for heading in ("TOTAL", "SESSIONS", "BY BACKEND", "BY QUOTA POOL", "BY MODEL", "NOT IN THE TOTALS", "LEFT OUT"):
-        assert heading in text
+    headings = ("QUOTA LEFT", "USED THROUGH THE BRIDGE", "NOT IN THE TOTALS")
+    assert [line.split("  ")[0] for line in text.splitlines() if line.startswith(headings)] == list(headings)
     assert render_text({k: v for k, v in d.items() if k != "text"}) == text
     await manager.shutdown()
 
@@ -428,3 +443,442 @@ async def test_the_tool_answers_inside_a_nested_bridge(tmp_path: Path) -> None:
     data = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
     assert _total(data["totals"]) == 7 and data["text"].startswith("agent-bridge usage, all")
     await manager.shutdown()
+
+
+# --- The quota section ---
+
+
+def _from_now(hours: float) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=hours)
+
+
+def _codex_reading(
+    *, five_used: float = 44, week_used: float = 64, five_resets: float = 3, week_resets: float = 20
+) -> dict[str, Any]:
+    """A reading as `codex app-server` gives it, through the bridge's own parser."""
+    return parse_codex_rate_limits(
+        {
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": five_used,
+                    "windowDurationMins": 300,
+                    "resetsAt": _from_now(five_resets).timestamp(),
+                },
+                "secondary": {
+                    "usedPercent": week_used,
+                    "windowDurationMins": 10080,
+                    "resetsAt": _from_now(week_resets).timestamp(),
+                },
+            }
+        }
+    )
+
+
+def _agy_reading(*, gemini_week_resets: float = 140) -> dict[str, Any]:
+    """A reading as `agy --print=/usage` gives it: two pools, the second with a 5h window not yet started."""
+
+    def bucket(bucket_id: str, window: str, left: float, reset: str) -> dict[str, Any]:
+        return {"id": bucket_id, "window": window, "remaining_fraction": left, "reset_time": reset}
+
+    def iso(hours: float) -> str:
+        return _from_now(hours).isoformat(timespec="seconds")
+
+    return parse_neon_usage_envelope(
+        {
+            "command": {
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                bucket("gemini-weekly", "weekly", 0.793, iso(gemini_week_resets)),
+                                bucket("gemini-5h", "5h", 1.0, iso(5)),
+                            ],
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                bucket("3p-weekly", "weekly", 0.5, iso(120)),
+                                bucket("3p-5h", "5h", 1.0, "1970-01-01T00:00:00Z"),
+                            ],
+                        },
+                    ]
+                }
+            }
+        }
+    )
+
+
+def _stand_in_clis(
+    manager: JobManager,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    codex: dict[str, Any] | None = None,
+    agy: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    """Answer the two quota probes from here, and count them. No CLI is started."""
+    calls = {"codex": 0, "agy": 0}
+
+    async def fetch_codex(_cmd: list[str]) -> dict[str, Any]:
+        calls["codex"] += 1
+        return codex if codex is not None else _codex_reading()
+
+    async def fetch_agy(_cmd: list[str]) -> dict[str, Any]:
+        calls["agy"] += 1
+        return agy if agy is not None else _agy_reading()
+
+    monkeypatch.setattr(jobs_module, "fetch_codex_quota", fetch_codex)
+    monkeypatch.setattr(jobs_module, "fetch_neon_quota", fetch_agy)
+    monkeypatch.setattr(manager.codex_runner, "resolve_command", lambda: ["codex"])
+    monkeypatch.setattr(manager.neon_runner, "resolve_command", lambda: ["agy"])
+    return calls
+
+
+def _pools(d: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {p["pool"]: p for p in d["quota"]["pools"]}
+
+
+def _line(text: str, start: str) -> str:
+    return next(line for line in text.splitlines() if line.startswith(start))
+
+
+async def test_the_view_opens_with_what_is_left_of_each_subscription(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path)
+    _stand_in_clis(manager, monkeypatch)
+    _finish(manager, "codex-a", tokens=1000)
+
+    d = await manager.usage_dashboard(period="all")
+
+    # Every pool, in the same order each time, whether or not it could be read.
+    assert [p["pool"] for p in d["quota"]["pools"]] == ["codex", "agy_gemini", "agy_claude_gpt", "claude"]
+    pools = _pools(d)
+    assert (pools["codex"]["five_hour"]["remaining_percent"], pools["codex"]["weekly"]["remaining_percent"]) == (56, 36)
+    assert pools["agy_gemini"]["weekly"]["remaining_percent"] == 79.3
+    assert pools["codex"]["source"] == "live" and pools["codex"]["as_of"]
+
+    text = d["text"]
+    lines = text.splitlines()
+    assert lines[2].startswith("QUOTA LEFT") and lines[2:] == render_text(
+        {k: v for k, v in d.items() if k != "text"}
+    ).splitlines()[2:]
+    assert text.index("QUOTA LEFT") < text.index("USED THROUGH THE BRIDGE")
+    codex_line = _line(text, "  Codex")
+    assert "\u2588" * 6 + "\u2591" * 4 + "  56%" in codex_line  # the 5h window first
+    assert "\u2588" * 4 + "\u2591" * 6 + "  36%" in codex_line  # then the week
+    assert codex_line.index("56%") < codex_line.index("36%")
+    assert "\u2588" * 8 + "\u2591" * 2 + "  79%" in _line(text, "  Antigravity Gemini")
+    # A week about to reset with quota unused is the one line worth acting on.
+    assert any(
+        note.startswith("Codex: 36% of the week is unused and resets in ") and note.endswith("Use it first.")
+        for note in d["quota"]["notes"]
+    )
+    assert "  * Codex: 36% of the week is unused" in text
+    await manager.shutdown()
+
+
+async def test_a_window_not_started_spent_out_of_date_or_missing_is_shown_as_what_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path)
+    spent = _codex_reading(five_used=100, week_used=10, five_resets=2, week_resets=100)
+    # A reading the CLI gave with a weekly reset that has already passed.
+    _stand_in_clis(manager, monkeypatch, codex=spent, agy=_agy_reading(gemini_week_resets=-1))
+    # The Claude plan is known only from its last job, which reported one window, yesterday.
+    reported = claude_quota_from_rate_limit(
+        {"unifiedWindows": {"seven_day": {"utilization": 0.25, "resetsAt": _from_now(90).timestamp()}}},
+        fetched_at=(datetime.now().astimezone() - timedelta(days=1)).isoformat(timespec="seconds"),
+    )
+    assert reported is not None
+    manager.store.set_cached_quota("claude", reported)
+
+    d = await manager.usage_dashboard(period="all")
+
+    pools, text = _pools(d), d["text"]
+    assert pools["codex"]["five_hour"]["state"] == "exhausted" and pools["codex"]["priority"] == "avoid"
+    assert any(n.startswith("Codex: out of quota until it resets in ") for n in d["quota"]["notes"])
+    assert "\u2591" * 10 + "   0%" in _line(text, "  Codex")
+
+    assert pools["agy_claude_gpt"]["five_hour"]["state"] == "not_started"
+    assert "100%  not started" in _line(text, "  Antigravity Claude+GPT")
+
+    assert pools["agy_gemini"]["weekly"]["state"] == "reset_passed"
+    assert "reset passed" in _line(text, "  Antigravity Gemini")
+    assert "Antigravity Gemini: a reset time in this reading has passed, so it is out of date." in d["quota"]["notes"]
+
+    claude = pools["claude"]
+    assert claude["five_hour"] is None and claude["weekly"]["remaining_percent"] == 75.0
+    assert claude["source"] == "last_claude_job" and len(claude["as_of"]) == len("11-26 21:14")  # dated: not today
+    claude_line = _line(text, "  Claude plan")
+    assert "no reading" in claude_line and "75%" in claude_line and claude["as_of"] in claude_line
+    assert any("Your own Claude Code and claude.ai use draw on it too" in n for n in d["quota"]["notes"])
+    await manager.shutdown()
+
+
+async def test_a_pool_that_cannot_be_read_is_still_listed_and_says_why(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)  # no CLI at any of its paths
+
+    d = await manager.usage_dashboard(period="all")
+
+    pools = _pools(d)
+    assert list(pools) == list(QUOTA_POOLS)
+    assert all(p["status"] == "unknown" and p["reason"] for p in pools.values())
+    assert "AGENT_BRIDGE_CODEX_BIN does not exist" in pools["codex"]["reason"]
+    assert "AGENT_BRIDGE_AGY_BIN does not exist" in pools["agy_claude_gpt"]["reason"]
+    assert "after a Claude job runs through the bridge" in pools["claude"]["reason"]
+    for label in ("Codex", "Antigravity Gemini", "Antigravity Claude+GPT", "Claude plan"):
+        assert "no reading: " in _line(d["text"], f"  {label}")
+    assert all(len(p["reason"]) <= 80 for p in pools.values())
+    await manager.shutdown()
+
+
+async def test_a_quota_reading_taken_for_the_view_is_not_stored_and_a_fresh_cached_one_is_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path)
+    calls = _stand_in_clis(manager, monkeypatch)
+    _finish(manager, "codex-a", tokens=7)
+    mcp, _ = create_server(settings=manager.settings, manager=manager)
+    before = _dump(manager.store.db_path)
+
+    raw = await mcp.call_tool("usage_dashboard", {"period": "all"})
+    d = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
+
+    assert calls == {"codex": 1, "agy": 1} and _pools(d)["codex"]["status"] == "ok"
+    assert _dump(manager.store.db_path) == before  # the reading was shown, and nothing was written
+
+    # A reading `get_usage` has stored is used while it is fresh, with no second probe.
+    await manager.get_quota(["codex"])
+    assert calls["codex"] == 2
+    again = await manager.usage_dashboard(period="all")
+    assert calls == {"codex": 2, "agy": 2}
+    assert _pools(again)["codex"]["source"] == "cached" and _pools(again)["agy_gemini"]["source"] == "live"
+    await manager.shutdown()
+
+
+async def test_quota_false_starts_no_cli_and_gives_the_records_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path)
+    calls = _stand_in_clis(manager, monkeypatch)
+    _finish(manager, "codex-a", tokens=7)
+    mcp, _ = create_server(settings=manager.settings, manager=manager)
+
+    raw = await mcp.call_tool("usage_dashboard", {"period": "all", "quota": False})
+    d = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
+
+    assert calls == {"codex": 0, "agy": 0}
+    assert d["quota"] is None and "QUOTA LEFT" not in d["text"]
+    assert _total(d["totals"]) == 7 and d["text"].splitlines()[2].startswith("USED THROUGH THE BRIDGE")
+    await manager.shutdown()
+
+
+async def test_the_text_lists_models_under_their_pool_and_only_the_caveats_that_hold_something(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path)
+    first = time.time() - 3600
+    _finish(manager, "codex-a", tokens=1000, finished_at=first)
+    _finish(manager, "neon-a", backend="neon", model="gemini-4-neon-high", tokens=70)
+    _finish(manager, "neon-b", backend="neon", model="claude-sonnet-5-5-high", tokens=200)
+
+    d = await manager.usage_dashboard(period="all")
+
+    assert d["by_model"]["neon:gemini-4-neon-high"]["quota_pool"] == "agy_gemini"
+    assert d["by_model"]["neon:claude-sonnet-5-5-high"]["quota_pool"] == "agy_claude_gpt"
+    lines = d["text"].splitlines()
+    used = lines[lines.index(_line(d["text"], "USED THROUGH THE BRIDGE")) :]
+    names = [line.split("  ")[1 if not line.startswith("    ") else 2] for line in used[2:9]]
+    assert names == [
+        "Codex", "gpt-6.2-sol", "Antigravity Gemini", "gemini-4-neon-high",
+        "Antigravity Claude+GPT", "claude-sonnet-5-5-high", "Claude plan",
+    ]
+    assert used[9].split() == ["total", "3", "1,270", "6s"]
+    assert "  outcomes: 3 completed" in lines
+
+    # Nothing is under any caveat but the stretch before the first record, which is not a zero.
+    assert d["not_in_totals"]["partial_counts"]["count"] == 0
+    caveats = lines[lines.index("NOT IN THE TOTALS") + 1 : lines.index("", lines.index("NOT IN THE TOTALS"))]
+    assert len(caveats) == 1 and caveats[0].split("  ")[1] == "before records begin"
+    assert "nothing on record before" in caveats[0]
+
+    later = datetime.fromtimestamp(first + 600).isoformat(timespec="seconds")
+    after_first = await manager.usage_dashboard(since=later)
+    assert "NOT IN THE TOTALS: nothing" in after_first["text"].splitlines()
+    assert "before records begin" not in after_first["text"]
+    await manager.shutdown()
+
+
+def _empty_view() -> dict[str, Any]:
+    """The dict of a period in which nothing ran, as `build_dashboard` gives it, with no quota section."""
+    records = {"usage_rows": [], "running_jobs": [], "first_record_ts": None, "session_started_at": None}
+    now = time.time()
+    view = build_dashboard(records, window=resolve_window("session", None, None, now_ts=now), owner_id=ME, now_ts=now)
+    return {k: v for k, v in view.items() if k != "text"}
+
+
+EMPTY_VIEW = _empty_view()
+
+
+# --- After review: odd readings, and what the quota section must not touch ---
+
+
+def _weekly(left: float, *, resets: float | None = 50, kind: str = "weekly", **extra: Any) -> dict[str, Any]:
+    reset = _from_now(resets).isoformat(timespec="seconds") if resets is not None else None
+    return {"window": kind, "used_percent": 100 - left, "remaining_percent": left, "reset_time": reset, **extra}
+
+
+def _section(readings: dict[str, Any]) -> dict[str, Any]:
+    enriched = {name: enrich_quota_reading(reading) for name, reading in readings.items()}
+    return build_quota_section(enriched, now_ts=time.time())
+
+
+def _cells(section: dict[str, Any], label: str) -> str:
+    text = render_text({**EMPTY_VIEW, "quota": section})
+    return _line(text, f"  {label}")
+
+
+async def test_quota_readings_change_no_total_and_a_bad_period_or_one_failing_cli_does_not_spoil_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path)
+    calls = _stand_in_clis(manager, monkeypatch)
+    _finish(manager, "codex-a", tokens=1000)
+    _finish(manager, "codex-b", status="cancelled", tokens=None, usage_status="missing")
+
+    with_quota = await manager.usage_dashboard(period="all")
+    without = await manager.usage_dashboard(period="all", quota=False)
+
+    # The readings are shown beside the records and added to nothing.
+    for key in ("totals", "by_backend", "by_quota_pool", "by_model", "not_in_totals", "counted_as_nothing_spent"):
+        assert with_quota[key] == without[key], key
+    assert _total(with_quota["totals"]) == 1000
+
+    # A period that is refused is refused before any CLI is asked.
+    asked = dict(calls)
+    with pytest.raises(ValueError, match="Unknown period"):
+        await manager.usage_dashboard(period="fortnight")
+    assert calls == asked
+
+    # Nor is one asked when the records cannot be read.
+    def unreadable(**_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("records unreadable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(manager.store, "dashboard_records", unreadable)
+        with pytest.raises(RuntimeError, match="records unreadable"):
+            await manager.usage_dashboard(period="all")
+    assert calls == asked
+
+    # One CLI that fails says so on its own row; the other pools are still read.
+    async def broken(_cmd: list[str]) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(jobs_module, "fetch_codex_quota", broken)
+    d = await manager.usage_dashboard(period="all")
+    pools = _pools(d)
+    assert pools["codex"]["status"] == "unknown" and "boom" in pools["codex"]["reason"]
+    assert pools["agy_gemini"]["status"] == "ok" and pools["agy_claude_gpt"]["status"] == "ok"
+    await manager.shutdown()
+
+
+def test_an_odd_reading_is_shown_for_what_it_says() -> None:
+    section = _section(
+        {
+            # 1.5% is nearly out, not out: nothing in the reading says the limit was reached.
+            "codex": {"backend": "codex", "status": "ok", "fetched_at": _from_now(0).isoformat(),
+                      "windows": [_weekly(1.5)]},
+            "neon": {
+                "backend": "neon", "status": "ok", "fetched_at": _from_now(0).isoformat(),
+                "groups": [
+                    # One pool reported as two groups: neither drops the other.
+                    {"name": "Gemini 5h", "pool": "agy_gemini", "windows": [_weekly(90, resets=3, kind="5h")]},
+                    {"name": "Gemini weekly", "pool": "agy_gemini", "windows": [_weekly(60)]},
+                    # A group that names another backend's pool is not taken for it.
+                    {"name": "stray", "pool": "codex", "windows": [_weekly(11, resets=3, kind="5h")]},
+                    # 99.5% with no reset time is not a window that never started.
+                    {"name": "Claude and GPT models", "pool": "agy_claude_gpt",
+                     "windows": [_weekly(99.5, resets=None, kind="5h")]},
+                ],
+            },
+            # A limit on one model only is not the plan's week.
+            "claude": {"backend": "claude", "status": "ok", "fetched_at": _from_now(0).isoformat(),
+                       "windows": [_weekly(40, kind="seven_day_sonnet")]},
+        }
+    )
+    pools = {p["pool"]: p for p in section["pools"]}
+    assert [p["pool"] for p in section["pools"]] == ["codex", "agy_gemini", "agy_claude_gpt", "claude"]
+
+    assert pools["codex"]["weekly"]["remaining_percent"] == 1.5 and pools["codex"]["weekly"]["state"] == "ok"
+    assert pools["codex"]["five_hour"] is None
+    assert any(n.startswith("Codex: nearly out of quota, 2% left until it resets in ") for n in section["notes"])
+    assert not any("Codex: out of quota" in n for n in section["notes"])
+
+    gemini = pools["agy_gemini"]
+    assert (gemini["five_hour"]["remaining_percent"], gemini["weekly"]["remaining_percent"]) == (90, 60)
+
+    third_party = pools["agy_claude_gpt"]["five_hour"]
+    assert third_party["state"] == "ok" and third_party["resets_in"] is None
+    assert "100%  reset unknown" in _cells(section, "Antigravity Claude+GPT")
+    assert "not started" not in _cells(section, "Antigravity Claude+GPT")
+
+    assert pools["claude"]["status"] == "unknown"
+    assert pools["claude"]["reason"] == "the reading holds no 5h or weekly window"
+    assert "None" not in render_text({**EMPTY_VIEW, "quota": section})
+
+
+async def test_the_text_is_rendered_without_the_clock_and_shows_each_caveat_that_holds_something(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path)
+    _stand_in_clis(manager, monkeypatch)
+    _finish(manager, "codex-a", tokens=1000)
+    _finish(manager, "claude-partial", backend="claude", model="claude-sonnet-5-5", status="failed", tokens=50,
+            usage_status="partial", metrics={"provider": "claude", "native_subagents": 0})
+    _finish(manager, "claude-sub", backend="claude", model="claude-sonnet-5-5", tokens=300,
+            metrics={"provider": "claude", "native_subagents": 2})
+    _finish(manager, "codex-never", status="cancelled", tokens=None, usage_status="missing", invoked=False)
+    running = _record("codex-running", owner=ME, backend="codex", model="gpt-6.2-sol", status="running")
+    running.started_at = time.time() - 30
+    manager.store.insert_job(running)
+
+    d = await manager.usage_dashboard(period="all")
+    text = d["text"]
+
+
+    def row(label: str) -> str:
+        return " ".join(_line(text, f"  {label}").split())
+
+    assert row("partial count") == "partial count 1 50 tokens reported, not added: claude-partial"
+    assert row("Claude subagents") == "Claude subagents 1 2 subagents, tokens not reported: claude-sub"
+    assert row("still queued or running").startswith("still queued or running 1 codex-running (running ")
+    assert "  CLI never started, counted as nothing spent: 1  codex-never" in text
+    for absent in ("cannot tell", "CLI started, no count", "subagents not on record"):
+        assert absent not in text
+
+    # Rendering reads no clock: every time and countdown in the text is already in the dict.
+    class NoClock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            raise AssertionError("render_text read the clock")
+
+        @classmethod
+        def fromtimestamp(cls, *args: Any, **kwargs: Any) -> datetime:
+            raise AssertionError("render_text read the clock")
+
+    monkeypatch.setattr(dashboard_module, "datetime", NoClock)
+    monkeypatch.setattr(time, "time", lambda: (_ for _ in ()).throw(AssertionError("render_text read the clock")))
+    assert render_text({k: v for k, v in d.items() if k != "text"}) == text
+    monkeypatch.undo()
+    await manager.shutdown()
+
+
+def test_a_period_with_time_but_no_finished_run_is_not_called_empty() -> None:
+    view = json.loads(json.dumps(EMPTY_VIEW))
+    assert "  no runs in this period" in render_text(view).splitlines()
+    view["totals"]["duration_seconds"] = 5.0  # a failed first attempt, whose retry ended after the period
+    view["by_quota_pool"]["codex"]["duration_seconds"] = 5.0
+    text = render_text(view)
+    assert "no runs in this period" not in text
+    assert _line(text, "  total").split() == ["total", "0", "0", "5s"]

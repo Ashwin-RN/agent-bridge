@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+from agent_bridge.quota import claude_quota_from_rate_limit
+from agent_bridge.storage import BridgeStore
 
 
 async def test_stdio_mcp_handshake_tools_and_default_timeout(
@@ -23,6 +27,13 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(
     # This test is about a bridge that a host started, wherever the test run itself was started from.
     env.pop("AGENT_BRIDGE_PARENT_JOB", None)
     env.pop("AGENT_BRIDGE_PARENT_OWNER", None)
+
+    # The one quota reading that needs no CLI: what an earlier Claude job reported, kept in the database.
+    reading = claude_quota_from_rate_limit(
+        {"unifiedWindows": {"five_hour": {"utilization": 0.25, "resetsAt": time.time() + 3600}}}
+    )
+    assert reading is not None
+    BridgeStore(tmp_path / "state").set_cached_quota("claude", reading)
 
     server_params = StdioServerParameters(
         command=sys.executable,
@@ -54,6 +65,11 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(
             dashboard_tool = next(t for t in tools_result.tools if t.name == "usage_dashboard")
             assert dashboard_tool.annotations is not None
             assert dashboard_tool.annotations.read_only_hint is True
+            # It asks each CLI for its quota, as get_usage does, and is marked the same way.
+            usage_tool = next(t for t in tools_result.tools if t.name == "get_usage")
+            assert dashboard_tool.annotations.open_world_hint is True
+            assert usage_tool.annotations is not None
+            assert (usage_tool.annotations.read_only_hint, usage_tool.annotations.open_world_hint) == (True, True)
 
             dash_res = await session.call_tool("usage_dashboard", {"period": "session"})
             assert not dash_res.is_error
@@ -63,6 +79,10 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(
             assert dash_res.structured_content == dash_payload
             assert dash_payload["text"].startswith("agent-bridge usage, session")
             assert dash_payload["totals"]["runs"] == 0
+            # The quota bars are not ASCII, and reach the host whole.
+            claude_pool = dash_payload["quota"]["pools"][-1]
+            assert (claude_pool["pool"], claude_pool["five_hour"]["remaining_percent"]) == ("claude", 75.0)
+            assert "  Claude plan             " + "\u2588" * 8 + "\u2591" * 2 + "  75%" in dash_payload["text"]
 
             usage_res = await session.call_tool(
                 "get_usage",

@@ -67,7 +67,8 @@ Smart Quota & Weekly-Reset Routing:
   `parent_run` are inherited automatically unless overridden).
 - Treat `status="completed"` as a lifecycle status and still verify that `response` contains the
   requested deliverable.
-- For an account of what the bridge has run, call `usage_dashboard` and show its `text` unchanged.
+- To show the user what is left of each subscription and what the bridge has run, call
+  `usage_dashboard` and show its `text` unchanged.
 - A subagent started by the bridge may not start bridge jobs itself: there the job-starting tools
   fail with `nested_bridge`.
 """.strip()
@@ -657,7 +658,7 @@ def create_server(
         annotations=ToolAnnotations(
             readOnlyHint=True,
             destructiveHint=False,
-            openWorldHint=False,
+            openWorldHint=True,
         )
     )
     @_reported
@@ -665,19 +666,27 @@ def create_server(
         period: DashboardPeriod | None = None,
         since: str | None = None,
         until: str | None = None,
+        quota: bool = True,
     ) -> dict[str, Any]:
-        """A readable account of everything the bridge has run in a period, from its own records only.
+        """What is left of each subscription, then what the bridge has run in a period.
 
         - `period`: `'today'` (the default), `'7d'`, `'30d'`, `'all'`, or `'session'` (this window only).
         - `since` / `until`: instead of `period`, a local date (`2026-11-25`) or an ISO time. A date alone as
           `until` takes in that whole day.
+        - `quota`: `False` leaves the quota section out and starts no CLI.
 
-        Totals hold only finished runs with exact or delta counts. Everything the records cannot vouch for
-        (running jobs, partial counts, runs that left no count, Claude subagents, time before the first
-        record) is listed apart under `not_in_totals` and never added in. Show `text` to the user as it is:
-        every figure in it is already worked out.
+        `quota` lists every pool with the 5h and weekly windows its reading holds: percent left, the
+        reset, and when it was read.
+        The readings come from each CLI, as `get_usage(include_quota=True)` reads them, and take about
+        10 seconds; a pool that could not be read says why. The period does not change them.
+
+        The rest is from the bridge's own records. Totals hold only finished runs with exact or delta
+        counts. Everything the records cannot vouch for (running jobs, partial counts, runs that left no
+        count, Claude subagents, time before the first record) is listed apart under `not_in_totals` and
+        never added in. The tool writes nothing. Show `text` to the user as it is: every figure in it is
+        already worked out.
         """
-        return await job_manager.usage_dashboard(period=period, since=since, until=until)
+        return await job_manager.usage_dashboard(period=period, since=since, until=until, quota=quota)
 
     @mcp.tool(
         annotations=ToolAnnotations(

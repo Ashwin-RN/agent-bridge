@@ -410,20 +410,26 @@ What the bridge has run, and optionally how much quota is left.
 
 ### usage_dashboard
 
-A readable account of everything the bridge has run in a period, across every backend, quota pool and model, read from the bridge's own records and nothing else. It only reads: it writes nothing to the database. It also answers in a bridge that runs inside a bridge job. The [usage dashboard skill](#the-usage-dashboard-skill) is the easy way to call it.
+What is left of each subscription, then what the bridge has run in a period.
+
+The view opens with the quota left in every pool: Codex, Antigravity's two pools and the Claude plan, each with the 5h and weekly windows its reading holds, as a bar with the percent left, its reset and the time it was read. A window the reading does not hold says `no reading`; a Claude job can report one window only. Those readings come from each CLI, as [`get_usage`](#get_usage) with `include_quota` reads them, and take about 10 seconds. Below it is everything the bridge has run in the period, by quota pool and model, read from the bridge's own records and nothing else.
+
+It only reads: it writes nothing to the database, and a quota reading it takes is not put in the cache. It also answers in a bridge that runs inside a bridge job. The [usage dashboard skill](#the-usage-dashboard-skill) is the easy way to call it.
 
 | Argument | Default | What it does |
 |---|---|---|
 | `period` | `today` | `today` (since local midnight), `7d`, `30d`, `all`, or `session` (this window only) |
 | `since`, `until` | none | Instead of `period`: a local date such as `2026-11-25`, or an ISO time such as `2026-11-25T14:30`. A date alone as `until` takes in that whole day. Giving both `period` and one of these is refused |
+| `quota` | `True` | `False` leaves the quota section out and starts no CLI: the records alone |
 
 What the reply holds:
 
-- `text`: the whole view as fixed-width text, ready to show as it is. It is rendered from the same figures as the rest of the reply.
-- `covers` and `not_covered`: it covers jobs run through the bridge only. Not in it: the host session's own tokens, a host's own subagents, and CLI runs made outside the bridge. The view says so in its third line.
+- `text`: the whole view as fixed-width text, ready to show as it is. It is rendered from the same figures as the rest of the reply. A caveat is shown only when there is something under it; the rest of the reply always holds every entry.
+- `quota`: what is left in every pool, in a fixed order: `codex`, `agy_gemini`, `agy_claude_gpt`, `claude`. A pool that was read has `five_hour` and `weekly` (each with `remaining_percent`, `resets_in`, `reset_time` and a `state` of `ok`, `not_started`, `exhausted` or `reset_passed`; `None` when the CLI reported no such window), `as_of` and `read_at` (when it was read), `source` (`live`, `cached`, or `last_claude_job`) and `priority`. A pool that could not be read, or whose reading holds neither window, has status `unknown` and a `reason`; one backend failing does not hide the others. `notes` holds the lines worth acting on, such as a week about to reset with quota unused. The period does not change this section. With `quota=False` it is `None`.
+- `covers` and `not_covered`: it covers jobs run through the bridge only. Not in it: the host session's own tokens, a host's own subagents, and CLI runs made outside the bridge. The view says so in its footer.
 - `totals`: runs, their outcomes, time and tokens.
 - `this_session` and `other_sessions`: the same figures split between the calling window and every other window. The two add up to `totals`.
-- `by_backend`, `by_quota_pool`, `by_model`: each adds up to `totals`. Every backend and pool is listed, with zeros where nothing ran.
+- `by_backend`, `by_quota_pool`, `by_model`: each adds up to `totals`. Every backend and pool is listed, with zeros where nothing ran. Each model carries its `quota_pool`.
 - `not_in_totals`: what the records cannot vouch for, by job id. None of it is added in.
 - `counted_as_nothing_spent`: runs whose CLI was never started.
 
@@ -444,7 +450,8 @@ Rules the figures follow:
   | `before_records_begin` | Set when the period reaches back before the bridge's first record. That stretch is not covered, which is not the same as zero |
 
 - A job whose row still says queued or running, but whose window has closed, is found by reading the owners table. Unlike `get_usage`, the dashboard does not mark it failed; it lists it under `cannot_tell` as `window_closed`.
-- Left out on purpose: live quota readings, which come from each CLI (`get_usage` with `include_quota` shows them), and Claude Code's cost estimate, which is not a bill and repeats earlier turns on a resume.
+- The quota readings are not bridge records, and no figure from them is added to a total. The Claude plan has no live read-out: its reading is what the last Claude job run through the bridge reported, and it says `no reading` until one has run since the last reset.
+- Left out on purpose: Claude Code's cost estimate, which is not a bill and repeats earlier turns on a resume.
 
 ### list_backends
 
@@ -698,7 +705,7 @@ With no period it shows today. `session` shows only the window you are typing in
 
 ### What was checked
 
-On 2026-11-26 the skill was run headless in each host, against a bridge started from a test folder: Claude Code 2.1.332 (`claude -p "/bridge-usage 7d"`), Codex 0.172.0 (`codex exec '$bridge-usage 7d'`) and `agy` 1.5.18 (`agy -p "/bridge-usage 7d"`). Each loaded the skill from the project folder in the table, called the tool with `period="7d"`, and printed the view exactly as the tool returned it, with nothing added. `codex exec` called it with no approval setting, because the tool is marked read-only. The same tests found that the hosts hand a tool result to their model differently: Claude Code passes only the structured part, and Codex and Antigravity pass the text. That is why `usage_dashboard` returns one object, which the bridge sends as both.
+On 2026-11-26 the skill was run headless in each host, against a bridge started from a test folder: Claude Code 2.1.332 (`claude -p "/bridge-usage 7d"`), Codex 0.172.0 (`codex exec '$bridge-usage 7d'`) and `agy` 1.5.18 (`agy -p "/bridge-usage 7d"`). Each loaded the skill from the project folder in the table, called the tool with `period="7d"`, and printed the view exactly as the tool returned it, with nothing added. `codex exec` called it with no approval setting, because the tool is marked read-only. Those runs were of the view before it read live quota: the tool is now also marked open-world, as `get_usage` is, and the headless runs have not been repeated since. The same tests found that the hosts hand a tool result to their model differently: Claude Code passes only the structured part, and Codex and Antigravity pass the text. That is why `usage_dashboard` returns one object, which the bridge sends as both.
 
 ## A bridge inside a bridge
 

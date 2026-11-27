@@ -1980,14 +1980,19 @@ class JobManager:
         period: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        quota: bool = True,
     ) -> dict[str, Any]:
-        """Everything the bridge has run in a period, from its records only; see `dashboard.py`.
+        """What is left of each subscription, then what the bridge has run in a period; see `dashboard.py`.
 
-        It reads and never writes. A job left running by a window that has closed is not recovered here,
-        as `get_usage` would: the dashboard lists it under "cannot tell" instead.
+        It writes nothing. A job left running by a window that has closed is not recovered here, as
+        `get_usage` would: the dashboard lists it under "cannot tell" instead. The quota readings are a
+        recent cached one where there is one, and otherwise read from each CLI and not stored.
+        `quota=False` starts no CLI and gives the records alone.
         """
         now_ts = time.time()
         window = resolve_window(period, since, until, now_ts=now_ts)
+
+        # The records come first: if they cannot be read, no CLI is started.
         records = await self._db(
             self.store.dashboard_records,
             since_ts=window.since_ts,
@@ -1996,7 +2001,27 @@ class JobManager:
             only_session=window.only_session,
             is_pid_alive_fn=self._is_pid_alive,
         )
-        return build_dashboard(records, window=window, owner_id=self.owner_id, now_ts=now_ts)
+        readings: dict[str, Any] | None = None
+        if quota:
+            # Each backend on its own, so that one reading that fails does not take the others with it.
+            results = await asyncio.gather(
+                *(self.get_quota([name], store=False) for name in ALL_BACKENDS),
+                return_exceptions=True,
+            )
+            readings = {}
+            for name, result in zip(ALL_BACKENDS, results):
+                if isinstance(result, Exception):
+                    logger.debug("Could not read %s quota for the dashboard: %s", name, result)
+                    readings[name] = {
+                        "backend": name,
+                        "status": "unknown",
+                        "error": f"{type(result).__name__}: {result}",
+                    }
+                elif isinstance(result, BaseException):
+                    raise result
+                else:
+                    readings.update(result)
+        return build_dashboard(records, window=window, owner_id=self.owner_id, now_ts=now_ts, quota=readings)
 
     def _build_quota_advisory(self, quota: dict[str, Any]) -> dict[str, Any]:
         local_defaults = read_codex_local_defaults()
@@ -2035,7 +2060,10 @@ class JobManager:
         backends: list[str],
         *,
         refresh: bool = False,
+        store: bool = True,
     ) -> dict[str, Any]:
+        """Each backend's quota reading. `store=False` keeps a fresh reading out of the cache."""
+
         async def _probe_one(bname: str) -> tuple[str, dict[str, Any]]:
             if bname == "claude":
                 # Claude Code has no command that prints the plan limits. The reading is whatever the
@@ -2075,7 +2103,7 @@ class JobManager:
 
             res = enrich_quota_reading(res)
             res["cached"] = False
-            if res.get("status") == "ok":
+            if store and res.get("status") == "ok":
                 try:
                     await self._db(self.store.set_cached_quota, bname, res)
                 except Exception:

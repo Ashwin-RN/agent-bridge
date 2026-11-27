@@ -1,6 +1,6 @@
 ---
 name: bridge-usage
-description: Shows the agent-bridge usage dashboard, a readable account of everything the bridge has run across every backend, quota pool and model for a period, taken from the bridge's own records. Use when the user invokes bridge-usage, or asks what the bridge or its subagents have spent.
+description: Quota left on each subscription (the 5h and weekly windows that Codex, Antigravity and the Claude plan report), then what the bridge has run in a period. Use when the user invokes bridge-usage, or asks how much quota is left or what the bridge has spent.
 ---
 
 # Bridge usage

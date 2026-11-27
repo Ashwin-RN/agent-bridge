@@ -1,7 +1,13 @@
-"""The usage dashboard: what the bridge has run, read from its own records only.
+"""The usage dashboard: what is left of each subscription, then what the bridge has run.
 
-A total holds only what the records can vouch for: finished runs whose CLI gave an exact count, or a
-per-turn (delta) count. Everything else is listed apart by job id and never added in:
+The view opens with the quota left in every pool, since that is what the reader came for: the 5h and
+weekly windows of Codex, of Antigravity's two pools and of the Claude plan, each with its reset and the
+time it was read. Those readings come from each CLI, not from the bridge's records, and no figure from
+them is added to a total. Every pool is always listed; one that could not be read says why.
+
+Below it is what the bridge ran in the period, from its own records only. A total holds only what the
+records can vouch for: finished runs whose CLI gave an exact count, or a per-turn (delta) count.
+Everything else is listed apart by job id and never added in:
 
 - jobs still queued or running in a window that is still open, with any tokens already recorded for
   their earlier attempts;
@@ -14,23 +20,28 @@ per-turn (delta) count. Everything else is listed apart by job id and never adde
   started subagents;
 - any part of the period from before the bridge's first record.
 
-A run whose CLI was never started is counted, as a run that spent nothing. Live quota readings and Claude
-Code's cost estimate are left out: neither is a record the bridge can add up.
+A run whose CLI was never started is counted, as a run that spent nothing. Claude Code's cost estimate is
+left out: it is not a record the bridge can add up.
 
 It covers jobs run through the bridge only, and says so in the view.
 
 It reads and never writes: a job left running by a closed window is found by reading the owners table,
-not by marking the job, which `get_usage` still does.
+not by marking the job, which `get_usage` still does, and a quota reading taken for the view is not put
+in the cache.
 
-The text view is rendered from the same dict that is returned, so the two cannot disagree.
+The text view is rendered from the same dict that is returned, so the two cannot disagree. It shows a
+caveat only when there is something under it; the dict always holds every entry.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
+
+from agent_bridge.quota import build_quota_advisory
 
 BACKENDS: tuple[str, ...] = ("codex", "neon", "claude")
 QUOTA_POOLS: tuple[str, ...] = ("codex", "agy_gemini", "agy_claude_gpt", "claude")
@@ -68,8 +79,6 @@ _REASON_LABELS: dict[str, str] = {
     "end_not_confirmed": "end not confirmed",
 }
 LEFT_OUT: tuple[str, ...] = (
-    "Live quota readings: they come from each CLI, not from the bridge's records. get_usage with "
-    "include_quota shows them.",
     "Claude Code's cost estimate: it is not a bill, and on a resumed session it repeats the earlier turns.",
 )
 TOKEN_NOTE = (
@@ -77,6 +86,33 @@ TOKEN_NOTE = (
     "includes cache reads and writes; for codex, cached_tokens is part of input_tokens; for agy, "
     "cached_tokens can exceed total_tokens."
 )
+
+POOL_LABELS: dict[str, str] = {
+    "codex": "Codex",
+    "agy_gemini": "Antigravity Gemini",
+    "agy_claude_gpt": "Antigravity Claude+GPT",
+    "claude": "Claude plan",
+}
+# Which backend's reading holds each pool.
+_POOL_BACKEND: dict[str, str] = {
+    "codex": "codex",
+    "agy_gemini": "neon",
+    "agy_claude_gpt": "neon",
+    "claude": "claude",
+}
+QUOTA_SOURCE = (
+    "Read from each CLI, not from the bridge's records. Each pool carries the time it was read. The "
+    "Claude plan has no live read-out: its reading is what the last Claude job run through the bridge "
+    "reported."
+)
+CLAUDE_NO_READING = "Claude Code prints none; it shows after a Claude job runs through the bridge"
+NO_PLAN_WINDOW = "the reading holds no 5h or weekly window"
+_AGY_POOLS: frozenset[str] = frozenset({"agy_gemini", "agy_claude_gpt"})
+CLAUDE_SHARED_NOTE = (
+    "Claude plan: as of its last bridge job. Your own Claude Code and claude.ai use draw on it too."
+)
+BAR_WIDTH = 10
+REASON_LIMIT = 70
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,14 +210,160 @@ def _id_list(ids: list[str]) -> dict[str, Any]:
     return out
 
 
+def _quota_window(win: dict[str, Any] | None) -> dict[str, Any] | None:
+    """One limit window, cut down to what the view shows. None when the reading has no such window."""
+    left = win.get("remaining_percent") if isinstance(win, dict) else None
+    if isinstance(left, bool) or not isinstance(left, (int, float)) or not math.isfinite(left):
+        return None
+    # The states say what the reading says. The pacing signals are thresholds (2% left reads as
+    # "exhausted", 99% as "idle"), so they are not taken as fact here.
+    if win.get("stale_reset"):
+        state = "reset_passed"
+    elif win.get("signal") == "idle_full" and left >= 100:
+        state = "not_started"
+    elif left <= 0:
+        state = "exhausted"
+    else:
+        state = "ok"
+    seconds = win.get("resets_in_seconds")
+    counting = state in ("ok", "exhausted") and isinstance(seconds, int) and seconds > 0
+    countdown = win.get("resets_in") if counting else None
+    return {
+        "remaining_percent": left,
+        "used_percent": win.get("used_percent"),
+        "reset_time": win.get("reset_time"),
+        "resets_in": countdown,
+        "state": state,
+    }
+
+
+def _first_window(windows: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:
+    """The first usable window of a kind: one the view cannot show does not hide one it can."""
+    for win in windows:
+        if win.get("window_kind") == kind and (shown := _quota_window(win)) is not None:
+            return shown
+    return None
+
+
+def _as_of(fetched_at: Any, *, now_ts: float) -> str | None:
+    """The time a reading was taken, as local clock time; with its date when that is not today."""
+    try:
+        taken = datetime.fromisoformat(str(fetched_at)).astimezone()
+    except (TypeError, ValueError):
+        return None
+    today = datetime.fromtimestamp(now_ts).astimezone().date()
+    return taken.strftime("%H:%M") if taken.date() == today else taken.strftime("%m-%d %H:%M")
+
+
+def _short_reason(text: Any) -> str:
+    line = " ".join(str(text or "").split())
+    return line if len(line) <= REASON_LIMIT else line[: REASON_LIMIT - 3].rstrip() + "..."
+
+
+def build_quota_section(readings: dict[str, Any], *, now_ts: float) -> dict[str, Any]:
+    """What is left in every pool, from the readings `JobManager.get_quota` returns.
+
+    Every pool is listed in a fixed order. One with no usable reading has status `unknown` and a reason.
+    """
+    windows_by_pool: dict[str, list[dict[str, Any]]] = {}
+    for backend in ("codex", "claude"):
+        reading = readings.get(backend)
+        if isinstance(reading, dict) and reading.get("status") == "ok":
+            windows_by_pool[backend] = [w for w in reading.get("windows") or [] if isinstance(w, dict)]
+    neon = readings.get("neon")
+    if isinstance(neon, dict) and neon.get("status") == "ok":
+        for group in neon.get("groups") or []:
+            # Only Antigravity's own pools, and every group of a pool: one group cannot drop another.
+            if isinstance(group, dict) and group.get("pool") in _AGY_POOLS:
+                windows_by_pool.setdefault(str(group["pool"]), []).extend(
+                    w for w in group.get("windows") or [] if isinstance(w, dict)
+                )
+
+    try:
+        priorities = {p["pool"]: p["priority"] for p in build_quota_advisory(readings)["pools"]}
+    except (AttributeError, KeyError, TypeError, ValueError):
+        priorities = {}  # the windows are still shown; only the notes that rest on a priority are lost
+
+    pools: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for pool in QUOTA_POOLS:
+        label = POOL_LABELS[pool]
+        backend = _POOL_BACKEND[pool]
+        reading = readings.get(backend)
+        reading = reading if isinstance(reading, dict) else {}
+        entry: dict[str, Any] = {"pool": pool, "label": label}
+
+        wins = windows_by_pool.get(pool)
+        five = _first_window(wins, "5h") if wins else None
+        week = _first_window(wins, "weekly") if wins else None
+        if five is None and week is None:
+            if wins is not None:
+                reason = NO_PLAN_WINDOW  # such as a limit on one model only
+            elif reading.get("error"):
+                reason = _short_reason(reading["error"])
+            elif backend == "claude":
+                reason = CLAUDE_NO_READING
+            elif reading.get("status") == "ok":
+                reason = "the CLI reported no window for this pool"
+            else:
+                reason = "could not be read"
+            pools.append({**entry, "status": "unknown", "reason": reason})
+            continue
+
+        priority = priorities.get(pool)
+        entry.update(
+            status="ok",
+            as_of=_as_of(reading.get("fetched_at"), now_ts=now_ts),
+            read_at=reading.get("fetched_at"),
+            source="last_claude_job" if backend == "claude" else ("cached" if reading.get("cached") else "live"),
+            five_hour=five,
+            weekly=week,
+            priority=priority,
+        )
+        pools.append(entry)
+
+        shown = [w for w in (week, five) if w is not None]
+        tight = min(shown, key=lambda w: w["remaining_percent"])
+        if priority == "stale" or any(w["state"] == "reset_passed" for w in shown):
+            notes.append(f"{label}: a reset time in this reading has passed, so it is out of date.")
+        elif priority == "use_before_reset" and week is not None and week["resets_in"]:
+            notes.append(
+                f"{label}: {_percent(week['remaining_percent'])} of the week is unused and resets in "
+                f"{week['resets_in']}. Use it first."
+            )
+        elif priority == "avoid":
+            until = f" until it resets in {tight['resets_in']}" if tight["resets_in"] else ""
+            if tight["state"] == "exhausted":
+                notes.append(f"{label}: out of quota{until}.")
+            elif reading.get("rate_limit_reached"):
+                notes.append(f"{label}: the CLI reports its limit reached.")
+            else:
+                notes.append(f"{label}: nearly out of quota, {_percent(tight['remaining_percent'])} left{until}.")
+        elif priority == "conserve":
+            left = ", ".join(
+                f"{name} {_percent(w['remaining_percent'])}"
+                for name, w in (("week", week), ("5h", five))
+                if w is not None
+            )
+            notes.append(f"{label}: running low ({left} left).")
+        if backend == "claude":
+            notes.append(CLAUDE_SHARED_NOTE)
+
+    return {"source": QUOTA_SOURCE, "pools": pools, "notes": notes}
+
+
 def build_dashboard(
     records: dict[str, Any],
     *,
     window: Window,
     owner_id: str,
     now_ts: float,
+    quota: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Turn the rows from `BridgeStore.dashboard_records` into the dashboard, text view included."""
+    """Turn the rows from `BridgeStore.dashboard_records` into the dashboard, text view included.
+
+    `quota` is the readings from `JobManager.get_quota`; None leaves the quota section out.
+    """
     total = _bucket()
     by_backend: dict[str, dict[str, Any]] = {name: _bucket() for name in BACKENDS}
     by_pool: dict[str, dict[str, Any]] = {name: _bucket() for name in QUOTA_POOLS}
@@ -211,11 +393,13 @@ def build_dashboard(
 
         backend = str(row["backend"])
         model_key = f"{backend}:{row['model']}"
+        model_bucket = by_model.setdefault(model_key, _bucket())
+        model_bucket.setdefault("quota_pool", str(row["quota_pool"]))
         groups = (
             total,
             by_backend.setdefault(backend, _bucket()),
             by_pool.setdefault(str(row["quota_pool"]), _bucket()),
-            by_model.setdefault(model_key, _bucket()),
+            model_bucket,
             this_session if row["owner_id"] == owner_id else other_sessions,
         )
         is_final_run = bool(row["is_final_attempt"]) and job_id not in final_seen
@@ -328,6 +512,7 @@ def build_dashboard(
         "covers": COVERS,
         "not_covered": list(NOT_COVERED),
         "records_begin": _iso(first_ts),
+        "quota": build_quota_section(quota, now_ts=now_ts) if quota is not None else None,
         "totals": total,
         "this_session": {"owner_id": owner_id, "started_at": _iso(session_started), **this_session},
         "other_sessions": other_sessions,
@@ -393,6 +578,10 @@ def _num(n: int) -> str:
     return f"{n:,}"
 
 
+def _runs(n: int) -> str:
+    return f"{_num(n)} run" if n == 1 else f"{_num(n)} runs"
+
+
 def _duration(seconds: float) -> str:
     s = int(round(seconds))
     if s < 60:
@@ -427,168 +616,193 @@ def _ids(listing: dict[str, Any]) -> str:
     return shown
 
 
+def _percent(value: float) -> str:
+    whole = int(value + 0.5)
+    return "<1%" if whole == 0 and value > 0 else f"{whole}%"
+
+
+def _bar(remaining: float) -> str:
+    filled = max(0, min(BAR_WIDTH, int(remaining / 100 * BAR_WIDTH + 0.5)))
+    return "\u2588" * filled + "\u2591" * (BAR_WIDTH - filled)
+
+
+def _window_cells(win: dict[str, Any] | None) -> tuple[str, str]:
+    """What is left in a window, and when it resets."""
+    if win is None:
+        return "no reading", ""
+    left = f"{_bar(win['remaining_percent'])} {_percent(win['remaining_percent']):>4}"
+    if win["state"] == "not_started":
+        return left, "not started"
+    if win["state"] == "reset_passed":
+        return left, "reset passed"
+    return left, f"resets {win['resets_in']}" if win["resets_in"] else "reset unknown"
+
+
+def _quota_lines(quota: dict[str, Any]) -> list[str]:
+    pools = quota["pools"]
+    cells = {
+        p["pool"]: (*_window_cells(p["five_hour"]), *_window_cells(p["weekly"]), p["as_of"] or "")
+        for p in pools
+        if p["status"] == "ok"
+    }
+    headers = ("5h window", "", "week", "", "read")
+    widths = [max([len(h)] + [len(c[i]) for c in cells.values()]) for i, h in enumerate(headers)]
+    label_width = max(len("subscription"), *(len(p["label"]) for p in pools))
+
+    def row(label: str, parts: tuple[str, ...]) -> str:
+        five = f"{parts[0]:<{widths[0]}}  {parts[1]:<{widths[1]}}"
+        week = f"{parts[2]:<{widths[2]}}  {parts[3]:<{widths[3]}}"
+        return f"  {label:<{label_width}}  {five}   {week}   {parts[4]}".rstrip()
+
+    lines = ["QUOTA LEFT  bars show what is left"]
+    if cells:
+        lines.append(row("subscription", headers))
+    for p in pools:
+        if p["status"] == "ok":
+            lines.append(row(p["label"], cells[p["pool"]]))
+        else:
+            lines.append(f"  {p['label']:<{label_width}}  no reading: {p['reason']}")
+    lines += [f"  * {note}" for note in quota["notes"]]
+    return lines
+
+
+def _used_lines(d: dict[str, Any]) -> list[str]:
+    total = d["totals"]
+    lines = ["USED THROUGH THE BRIDGE  finished runs; tokens from exact or delta counts only"]
+    if total["runs"] == 0 and total["tokens"]["total_tokens"] == 0 and not total["duration_seconds"]:
+        lines.append("  no runs in this period")
+    else:
+
+        def cells(name: str, b: dict[str, Any]) -> list[str]:
+            return [name, _num(b["runs"]), _num(b["tokens"]["total_tokens"]), _duration(b["duration_seconds"])]
+
+        models = d["by_model"]
+        rows: list[list[str]] = []
+        for pool, bucket in d["by_quota_pool"].items():
+            rows.append(cells(POOL_LABELS.get(pool, pool), bucket))
+            rows += [
+                cells("  " + key.split(":", 1)[-1], b) for key, b in models.items() if b.get("quota_pool") == pool
+            ]
+        # A model with no pool on it (a dict from an older bridge) is still shown.
+        rows += [cells(key, b) for key, b in models.items() if b.get("quota_pool") not in d["by_quota_pool"]]
+        rows.append(cells("total", total))
+        lines += _table(["", "runs", "tokens", "time"], rows)
+        outcomes = ", ".join(
+            f"{_num(total[outcome])} {outcome.replace('_', ' ')}" for outcome in OUTCOMES if total[outcome]
+        )
+        mine, others = d["this_session"], d["other_sessions"]
+        lines += [
+            f"  outcomes: {outcomes or 'none'}",
+            f"  this session: {_runs(mine['runs'])}, {_num(mine['tokens']['total_tokens'])} tokens; "
+            f"other sessions: {_runs(others['runs'])}, {_num(others['tokens']['total_tokens'])} tokens",
+        ]
+    nothing = d["counted_as_nothing_spent"]
+    if nothing["count"]:
+        lines.append(f"  CLI never started, counted as nothing spent: {_num(nothing['count'])}  {_ids(nothing)}")
+    return lines
+
+
+def _not_in_totals_lines(d: dict[str, Any]) -> list[str]:
+    """One row for each caveat that has something under it."""
+    nit = d["not_in_totals"]
+    rows: list[list[str]] = []
+    running = nit["running_or_queued"]
+    if running["count"]:
+        running_desc = ", ".join(
+            f"{j['job_id']} ({j['status']} {_duration(j['elapsed_seconds'])}, {j['session']} session"
+            + (
+                f", {_num(j['tokens_recorded_for_earlier_attempts'])} tokens recorded so far"
+                if "tokens_recorded_for_earlier_attempts" in j
+                else ""
+            )
+            + ")"
+            for j in running["jobs"]
+        )
+        if running.get("more"):
+            running_desc += f" and {running['more']} more"
+        rows.append(["still queued or running", _num(running["count"]), running_desc])
+    part = nit["partial_counts"]
+    if part["count"]:
+        rows.append(
+            [
+                "partial count",
+                _num(part["count"]),
+                f"{_num(part['reported_total_tokens'])} tokens reported, not added: {_ids(part)}",
+            ]
+        )
+    lost = nit["cli_started_no_count"]
+    if lost["count"]:
+        lost_desc = ", ".join(f"{s.replace('_', ' ')} {n}" for s, n in sorted(lost["by_status"].items()))
+        rows.append(["CLI started, no count", _num(lost["count"]), f"{lost_desc}: {_ids(lost)}"])
+    unknown = nit["cannot_tell"]
+    if unknown["count"]:
+        unknown_desc = ", ".join(
+            f"{j['job_id']} ({_REASON_LABELS.get(j['reason'], j['reason'])}"
+            + (
+                f", {_num(j['tokens_recorded_for_earlier_attempts'])} tokens recorded so far"
+                if "tokens_recorded_for_earlier_attempts" in j
+                else ""
+            )
+            + ")"
+            for j in unknown["jobs"]
+        )
+        if unknown.get("more"):
+            unknown_desc += f" and {unknown['more']} more"
+        rows.append(
+            ["cannot tell", _num(unknown["count"]), f"the records cannot speak for these: {unknown_desc}"]
+        )
+    sub = nit["claude_subagents"]
+    if sub["count"]:
+        rows.append(
+            [
+                "Claude subagents",
+                _num(sub["count"]),
+                f"{_num(sub['subagents'])} subagents, tokens not reported: {_ids(sub)}",
+            ]
+        )
+    unrec = nit["claude_subagents_not_on_record"]
+    if unrec["count"]:
+        rows.append(["subagents not on record", _num(unrec["count"]), f"Claude runs that did not say: {_ids(unrec)}"])
+    before = nit["before_records_begin"]
+    if before:
+        # Not a zero: the stretch before the first record is not covered, so it is always said.
+        rows.append(
+            [
+                "before records begin",
+                "",
+                f"nothing on record before {_local(before['records_begin'])}"
+                if before["records_begin"]
+                else before["note"],
+            ]
+        )
+    if not rows:
+        return ["NOT IN THE TOTALS: nothing"]
+    label_width = max(len(r[0]) for r in rows)
+    count_width = max(len("runs"), *(len(r[1]) for r in rows))
+    lines = ["NOT IN THE TOTALS"]
+    if any(count for _, count, _ in rows):
+        lines.append(f"  {'':<{label_width}}  {'runs':>{count_width}}")
+    lines += [f"  {label:<{label_width}}  {count:>{count_width}}  {desc}".rstrip() for label, count, desc in rows]
+    return lines
+
+
 def render_text(d: dict[str, Any]) -> str:
     period = d["period"]
-    total = d["totals"]
     offset = datetime.fromisoformat(period["to"]).strftime("%z") if period["to"] else ""
     zone = f"UTC{offset[:3]}:{offset[3:]}" if offset else "local time"
     lines: list[str] = [
         f"agent-bridge usage, {period['name']}: {_local(period['from'])} to {_local(period['to'])} ({zone})",
-        "From the bridge's own records. " + PERIOD_RULE,
-        f"{d['covers']} Not in it: {', '.join(d['not_covered'])}.",
     ]
     if period["until_is_future"]:
         lines.append("The period runs past now; it is shown up to now.")
-    if d["records_begin"] is None:
-        lines.append("There are no usage records yet.")
-    else:
-        lines.append(f"Records begin {_local(d['records_begin'])}.")
 
-    t = total["tokens"]
+    quota = d.get("quota")
+    if quota:
+        lines += ["", *_quota_lines(quota)]
+    lines += ["", *_used_lines(d), "", *_not_in_totals_lines(d)]
     lines += [
         "",
-        "TOTAL  finished runs; tokens from exact or delta counts only",
-        f"  runs {_num(total['runs'])}: completed {_num(total['completed'])}, failed {_num(total['failed'])}, "
-        f"timed out {_num(total['timed_out'])}, cancelled {_num(total['cancelled'])}",
-        f"  tokens {_num(t['total_tokens'])}  (input {_num(t['input_tokens'])}, output {_num(t['output_tokens'])})"
-        f"  time {_duration(total['duration_seconds'])}",
-        "",
-        "SESSIONS",
-    ]
-    mine = d["this_session"]
-    others = d["other_sessions"]
-    started = f", started {_local(mine['started_at'])}" if mine["started_at"] else ""
-    lines += _table(
-        ["", "runs", "tokens"],
-        [
-            [f"this session ({mine['owner_id']}{started})", _num(mine["runs"]), _num(mine["tokens"]["total_tokens"])],
-            ["other sessions", _num(others["runs"]), _num(others["tokens"]["total_tokens"])],
-            ["total", _num(total["runs"]), _num(t["total_tokens"])],
-        ],
-    )
-
-    lines += ["", "BY BACKEND"]
-    lines += _table(
-        ["backend", "runs", "completed", "failed", "timed out", "cancelled", "tokens", "time"],
-        [
-            [
-                name,
-                _num(b["runs"]),
-                _num(b["completed"]),
-                _num(b["failed"]),
-                _num(b["timed_out"]),
-                _num(b["cancelled"]),
-                _num(b["tokens"]["total_tokens"]),
-                _duration(b["duration_seconds"]),
-            ]
-            for name, b in d["by_backend"].items()
-        ],
-    )
-    lines += ["", "BY QUOTA POOL"]
-    lines += _table(
-        ["pool", "runs", "tokens", "time"],
-        [
-            [name, _num(b["runs"]), _num(b["tokens"]["total_tokens"]), _duration(b["duration_seconds"])]
-            for name, b in d["by_quota_pool"].items()
-        ],
-    )
-    lines += ["", "BY MODEL"]
-    if d["by_model"]:
-        lines += _table(
-            ["backend:model", "runs", "tokens"],
-            [[name, _num(b["runs"]), _num(b["tokens"]["total_tokens"])] for name, b in d["by_model"].items()],
-        )
-    else:
-        lines.append("  no runs in this period")
-
-    nit = d["not_in_totals"]
-    rows: list[list[str]] = []
-    running = nit["running_or_queued"]
-    running_desc = ", ".join(
-        f"{j['job_id']} ({j['status']} {_duration(j['elapsed_seconds'])}, {j['session']} session"
-        + (
-            f", {_num(j['tokens_recorded_for_earlier_attempts'])} tokens recorded so far"
-            if "tokens_recorded_for_earlier_attempts" in j
-            else ""
-        )
-        + ")"
-        for j in running["jobs"]
-    )
-    if running.get("more"):
-        running_desc += f" and {running['more']} more"
-    rows.append(["still queued or running", _num(running["count"]), running_desc or "none"])
-    part = nit["partial_counts"]
-    rows.append(
-        [
-            "partial count",
-            _num(part["count"]),
-            f"{_num(part['reported_total_tokens'])} tokens reported, not added: {_ids(part)}" if part["count"] else "none",
-        ]
-    )
-    lost = nit["cli_started_no_count"]
-    lost_desc = ", ".join(f"{s.replace('_', ' ')} {n}" for s, n in sorted(lost["by_status"].items()))
-    rows.append(
-        ["CLI started, no count", _num(lost["count"]), f"{lost_desc}: {_ids(lost)}" if lost["count"] else "none"]
-    )
-    unknown = nit["cannot_tell"]
-    unknown_desc = ", ".join(
-        f"{j['job_id']} ({_REASON_LABELS.get(j['reason'], j['reason'])}"
-        + (
-            f", {_num(j['tokens_recorded_for_earlier_attempts'])} tokens recorded so far"
-            if "tokens_recorded_for_earlier_attempts" in j
-            else ""
-        )
-        + ")"
-        for j in unknown["jobs"]
-    )
-    if unknown.get("more"):
-        unknown_desc += f" and {unknown['more']} more"
-    rows.append(
-        [
-            "cannot tell",
-            _num(unknown["count"]),
-            f"the records cannot speak for these: {unknown_desc}" if unknown["count"] else "none",
-        ]
-    )
-    sub = nit["claude_subagents"]
-    rows.append(
-        [
-            "Claude subagents",
-            _num(sub["count"]),
-            f"{_num(sub['subagents'])} subagents, tokens not reported: {_ids(sub)}" if sub["count"] else "none",
-        ]
-    )
-    unrec = nit["claude_subagents_not_on_record"]
-    rows.append(
-        [
-            "subagents not on record",
-            _num(unrec["count"]),
-            f"Claude runs that did not say: {_ids(unrec)}" if unrec["count"] else "none",
-        ]
-    )
-    before = nit["before_records_begin"]
-    rows.append(
-        [
-            "before records begin",
-            "",
-            (f"nothing on record before {_local(before['records_begin'])}" if before["records_begin"] else before["note"])
-            if before
-            else "the period starts after the first record",
-        ]
-    )
-    label_width = max(len(r[0]) for r in rows)
-    count_width = max(len("runs"), *(len(r[1]) for r in rows))
-    lines += ["", "NOT IN THE TOTALS", f"  {'':<{label_width}}  {'runs':>{count_width}}"]
-    lines += [f"  {label:<{label_width}}  {count:>{count_width}}  {desc}".rstrip() for label, count, desc in rows]
-
-    nothing = d["counted_as_nothing_spent"]
-    lines += [
-        "",
-        "COUNTED AS NOTHING SPENT",
-        f"  CLI never started: {_num(nothing['count'])}" + (f"  {_ids(nothing)}" if nothing["count"] else ""),
-        "",
-        "LEFT OUT: live quota readings and Claude Code's cost estimate (not bridge records).",
-        "Token kinds differ by CLI: claude input includes cache reads and writes; codex cached is part of",
-        "input; agy cached can exceed its total.",
+        f"{d['covers']} Not in it: {', '.join(d['not_covered'])}.",
+        "Tokens are each CLI's own count, and their kinds differ by CLI. A run counts in the period it finished.",
     ]
     return "\n".join(lines)
