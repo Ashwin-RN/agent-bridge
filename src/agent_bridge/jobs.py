@@ -963,6 +963,7 @@ class JobManager:
             first_attempt = True
             try:
                 while True:
+                    at_shutdown = self._flush_final_writes.is_set()
                     committed, error = await _try_commit_once(
                         lock_timeout=0.35 if first_attempt else 0.8
                     )
@@ -991,15 +992,22 @@ class JobManager:
                         continue
                     failures += 1
                     stalled.set()
-                    logger.warning(
-                        "Could not store the result of job %s (%s). It is kept in memory, where this window "
-                        "still reports it, its session stays claimed, and the write is tried again in "
-                        "%.1fs (failed write %d) and once more at shutdown.",
-                        record.job_id,
-                        error,
-                        error_delay,
-                        failures,
-                    )
+                    if at_shutdown:
+                        # The one last attempt shutdown asked for. Shutdown names the job that is left.
+                        logger.warning(
+                            "Could not store the result of job %s at shutdown either (%s).", record.job_id, error
+                        )
+                        return False
+                    if failures & (failures - 1) == 0:  # the 1st, 2nd, 4th, 8th... failure
+                        logger.warning(
+                            "Could not store the result of job %s (%s; failed write %d). It is kept in memory, "
+                            "where this window still reports it, its session stays claimed, and the write is "
+                            "tried again in %.1fs, and once more at shutdown.",
+                            record.job_id,
+                            error,
+                            failures,
+                            error_delay,
+                        )
                     await self._wait_before_final_write_retry(error_delay)
                     error_delay = min(error_delay_max, error_delay * 2)
             finally:
@@ -1039,9 +1047,6 @@ class JobManager:
 
     async def _wait_before_final_write_retry(self, delay: float) -> None:
         """Sleep `delay`, or less once shutdown has asked every unstored result to be tried at once."""
-        if self._flush_final_writes.is_set():
-            await asyncio.sleep(min(delay, 0.25))
-            return
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._flush_final_writes.wait(), timeout=delay)
 

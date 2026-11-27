@@ -477,10 +477,11 @@ async def test_finalize_never_writes_a_different_outcome_over_a_stored_result(tm
         record, status="cancelled", failure_reason="cancelled", provider_state="stopped", error="Job cancelled.",
         finished_at=time.time(), duration_seconds=2.0,
     )
-    assert store.finalize_job(late) == "kept"
+    outcome = store.finalize_job(late)
     stored = store.get_job(record.job_id)
     assert stored is not None
     assert (stored.status, stored.failure_reason, stored.response) == ("completed", None, "the answer")
+    assert outcome == "kept"
     # The same outcome may be written again, as a retried write would.
     assert store.finalize_job(done) == "written"
 
@@ -542,6 +543,35 @@ async def test_a_final_write_still_failing_is_tried_once_more_at_shutdown(
     await asyncio.wait_for(manager.shutdown(), timeout=30)
     stored = manager.store.get_job(rec.job_id)
     assert stored is not None and (stored.status, stored.response) == ("completed", "OK:go")
+
+
+async def test_a_final_write_that_never_lands_gets_one_attempt_at_shutdown_and_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _quick_codex(tmp_path)))
+    manager._finalize_error_backoff = (600.0, 600.0)
+    attempts = 0
+
+    def finalize_job(record: JobRecord, **kwargs: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        raise sqlite3.DatabaseError("disk I/O error")
+
+    monkeypatch.setattr(manager.store, "finalize_job", finalize_job)
+    rec = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
+    before = attempts
+    with caplog.at_level(logging.WARNING, logger="agent_bridge.jobs"):
+        started = time.monotonic()
+        await manager.shutdown(flush_timeout=20)
+        took = time.monotonic() - started
+    assert took < 10  # one last attempt, not a retry loop for the whole flush timeout
+    assert attempts == before + 1
+    assert "at shutdown either" in caplog.text
+    assert f"could not be stored ({rec.job_id})" in caplog.text
+    assert manager.store.get_job(rec.job_id).status == "running"  # left for the next window to recover
 
 
 async def test_a_turn_revealing_a_session_another_live_job_holds_is_stopped_and_does_not_take_it(
