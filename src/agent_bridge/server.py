@@ -383,6 +383,8 @@ def create_server(
 
     # --- MCP tasks: a host that declares the extension gets each `run` as a task row ---
 
+    task_reply_files: set[str] = set()
+
     def _job_id_from_result(result: Any) -> str | None:
         data = result.get("structuredContent") if isinstance(result, dict) else getattr(
             result, "structured_content", None
@@ -398,12 +400,19 @@ def create_server(
             return None
         record = job_manager.with_fast_request(record)
         updated = record.finished_at or record.last_activity_at or record.started_at or record.created_at
+        detail = await _reply(record, response_file=job_id in task_reply_files) if record.is_terminal else None
+        line = record.line() if detail is None else detail["line"]
+        if detail is not None and record.status == "cancelled" and record.provider_state == "possibly_running":
+            line += " · The provider turn may still be running."
+            if record.retry_guidance:
+                line += f" {record.retry_guidance}"
+            detail["line"] = line
         return JobView(
             status=record.status,
-            line=record.line(),
+            line=line,
             created_at=record.created_at,
             updated_at=updated,
-            detail=await _reply(record) if record.is_terminal else None,
+            detail=detail,
         )
 
     job_tasks = JobTasks({"run"}, _job_id_from_result, _task_view, job_manager.cancel)
@@ -513,6 +522,8 @@ def create_server(
             stop.set()
             for task in progress:
                 task.cancel()
+        if as_task and response_file:
+            task_reply_files.add(record.job_id)
         if record.is_terminal and wait > 0:
             reply = await _reply(record, response_file=response_file)
         else:
@@ -530,7 +541,7 @@ def create_server(
     @mcp.tool(
         name="jobs",
         description=JOBS_DESCRIPTION,
-        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     )
     @_reported
     async def jobs(
@@ -612,7 +623,7 @@ def create_server(
     @mcp.tool(
         name="usage",
         description=USAGE_DESCRIPTION,
-        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
     )
     @_reported
     async def usage(
@@ -656,7 +667,7 @@ def create_server(
     @mcp.tool(
         name="backends",
         description=BACKENDS_DESCRIPTION,
-        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     )
     @_reported
     async def backends(ctx: Context, refresh_models: bool = False) -> dict[str, Any]:

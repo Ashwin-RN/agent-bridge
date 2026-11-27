@@ -194,6 +194,31 @@ def test_claude_json_merge_keeps_other_servers_and_keys(run: Run, home: Path, py
     }
 
 
+def test_json_install_redacts_secrets_from_preview_and_print(run: Run, home: Path) -> None:
+    other = {
+        "env": {"OPENAI_API_KEY": "sk-test-SECRET", "CUSTOM": "private-env"},
+        "headers": {"Authorization": "Bearer abc.SECRET", "X-Custom": "private-header"},
+        "clientSecret": "private-client",
+        "url": "https://login:private-url@example.test/mcp",
+        "args": ["Bearer private-arg"],
+    }
+    original = json.dumps({"mcpServers": {"other": other}})
+    path = _write(home / ".claude.json", original)
+    args = ("--host", "claude-code", "--no-skill", "--no-status-line")
+    secrets = (
+        "sk-test-SECRET", "abc.SECRET", "private-env", "private-header", "private-client",
+        "login:private-url", "private-arg",
+    )
+    for flags, answers in [((), ["n"]), (("--print", "--yes"), [])]:
+        assert run.install(*args, *flags, answers=answers) == 0
+        assert all(secret not in run.text for secret in secrets), "preview exposed a JSON credential"
+        assert '\n+    "agent-bridge": {\n' in run.text
+        assert path.read_bytes() == original.encode()
+    assert run.install(*args, answers=["yes"]) == 0
+    assert all(secret not in run.text for secret in secrets), "confirmed install exposed a JSON credential"
+    assert json.loads(path.read_bytes())["mcpServers"]["other"] == other
+
+
 def test_antigravity_merge_keeps_crlf_unknown_keys_and_other_rules(run: Run, home: Path, python: Path) -> None:
     mcp = _write(home / ".gemini" / "config" / "mcp_config.json", AGY_MCP)
     settings = _write(home / ".gemini" / "antigravity-cli" / "settings.json", AGY_SETTINGS)
@@ -271,6 +296,24 @@ def test_project_scope_edits_the_project_file_and_never_runs_the_hosts_command(
 
 
 # ------------------------------------------------------------------ TOML
+
+
+def test_toml_install_redacts_credentials_in_context(run: Run, home: Path) -> None:
+    original = (
+        '[mcp_servers.agent-bridge]\ncommand = "old"\n'
+        'headers = { Custom = "private-header" }\n'
+        '"api\\u005fkey" = """\nprivate-multiline\n"""\n'
+        'url = "https://login:private-url@example.test"\n'
+        'args = ["Bearer private-arg"]\n'
+        '[mcp_servers.agent-bridge."env"]\nCustom = "private-env"\n'
+    )
+    path = _write(home / ".codex" / "config.toml", original)
+    assert run.install("--host", "codex", "--print", "--no-skill") == 0
+    secrets = ("private-header", "private-multiline", "login:private-url", "private-arg", "private-env")
+    assert all(secret not in run.text for secret in secrets), "preview exposed a TOML credential"
+    assert path.read_bytes() == original.encode()
+    assert run.install("--host", "codex", "--yes", "--no-skill") == 0
+    assert all(secret in path.read_text(encoding="utf-8") for secret in secrets if secret != "private-arg")
 
 
 def test_codex_toml_gains_the_table_and_keeps_every_other_line(run: Run, home: Path, python: Path) -> None:

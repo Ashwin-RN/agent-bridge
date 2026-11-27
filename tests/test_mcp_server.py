@@ -51,11 +51,10 @@ async def test_stdio_mcp_handshake_tools_and_default_timeout(
             tools_result = await session.list_tools()
             tool_names = {t.name for t in tools_result.tools}
             assert tool_names == {"run", "jobs", "cancel", "usage", "backends"}
-            # `codex exec` refuses a tool that is not marked read-only unless approvals are switched off.
-            # `usage` asks each CLI for its quota, so it is open-world as well.
+            # Quota probes ask the CLIs for readings and can cache them in SQLite.
             tools = {t.name: t.annotations for t in tools_result.tools}
-            assert (tools["usage"].read_only_hint, tools["usage"].open_world_hint) == (True, True)
-            assert (tools["jobs"].read_only_hint, tools["backends"].read_only_hint) == (True, True)
+            assert (tools["usage"].read_only_hint, tools["usage"].open_world_hint) == (False, True)
+            assert (tools["jobs"].read_only_hint, tools["backends"].read_only_hint) == (False, False)
             assert (tools["run"].read_only_hint, tools["cancel"].read_only_hint) == (False, False)
 
             dash_res = await session.call_tool("usage", {"period": "session", "view": "dashboard", "quota": True})

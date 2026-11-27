@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,11 +20,12 @@ from mcp_types import CallToolResult, Request, Result
 from pydantic import ConfigDict, TypeAdapter
 
 from agent_bridge import server as server_mod
-from agent_bridge.jobs import JobManager
+from agent_bridge.jobs import AGY_REMOTE_TURN_CANCEL_ERROR, JobManager
 from agent_bridge.nesting import NOT_NESTED
 from agent_bridge.process_control import is_pid_alive
 from agent_bridge.server import create_server
 
+from test_replies import _job
 from test_surface import STAND_IN_CODEX, StubCodexRunner, _settings
 
 TASKS = "io.modelcontextprotocol/tasks"
@@ -143,6 +145,24 @@ async def test_codex_fast_stays_on_the_task_row(tmp_path: Path) -> None:
         await manager.shutdown()
 
 
+async def test_task_row_collects_its_reply_as_a_file(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    async with _client(mcp, declares=True) as client:
+        receipt = await client.call_tool(
+            "run", {"backend": "codex", "prompt": "file please", "response_file": True}, allow_claimed=True,
+        )
+        assert isinstance(receipt, TaskReceipt)
+        job_id = receipt.model_dump(by_alias=True)["taskId"]
+        done = await _until(client, job_id, "completed")
+        reply = done["result"]["structuredContent"]
+        assert "response_file" in reply
+        assert Path(reply["response_file"]) == manager.settings.state_dir / "replies" / f"{job_id}.md"
+        assert Path(reply["response_file"]).read_text(encoding="utf-8") == "OK:file please"
+        assert reply["response_head"] == "OK:file please" and reply["response_total_chars"] == 14
+        assert "response" not in reply
+        assert (await _task(client, "tasks/get", job_id))["result"]["structuredContent"] == reply
+
+
 async def test_a_host_that_does_not_declare_tasks_gets_the_ordinary_receipt(tmp_path: Path) -> None:
     mcp, manager = _bridge(tmp_path)
     async with _client(mcp, declares=False) as client:
@@ -174,6 +194,26 @@ async def test_a_stop_from_the_host_s_task_list_cancels_the_job(tmp_path: Path) 
     stored = manager.store.get_job(job_id)
     assert stored is not None and stored.status == "cancelled" and stored.provider_state == "stopped"
     assert not is_pid_alive(pid)
+
+
+async def test_cancelled_task_reports_that_the_provider_may_still_be_running(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    job = _job(job_id="neon-1a2b3c4d", backend="neon", owner_id=manager.owner_id, response="", response_chars=0)
+    guidance = f"Confirm that this turn has ended, then resume with confirm_prior_job_id={job.job_id!r}."
+    manager.store.insert_job(replace(job, status="running", finished_at=None))
+    manager.store.finalize_job(replace(
+        job, status="cancelled", provider_state="possibly_running", failure_reason="cancelled",
+        error=AGY_REMOTE_TURN_CANCEL_ERROR, retry_guidance=guidance,
+    ))
+    async with _client(mcp, declares=True) as client:
+        task = await _task(client, "tasks/get", job.job_id)
+        cancelled = await client.call_tool("cancel", {"job_id": job.job_id})
+        assert task["status"] == "cancelled"
+        assert "may still be running" in task["statusMessage"]
+        assert cancelled.structured_content["retry_guidance"] in task["statusMessage"]
+        assert task["result"]["isError"] is True
+        detail = task["result"]["structuredContent"]
+        assert detail == {**cancelled.structured_content, "line": task["statusMessage"]}
 
 
 async def test_a_waiting_run_sends_its_line_as_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

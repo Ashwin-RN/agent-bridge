@@ -140,6 +140,17 @@ def unknown_host(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- run and jobs ---
 
 
+async def test_tool_annotations_account_for_writes(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        hints = {tool.name: tool.annotations.model_dump(by_alias=True) for tool in await mcp.list_tools()}
+        assert (hints["jobs"]["readOnlyHint"], hints["jobs"]["destructiveHint"],
+                hints["jobs"]["idempotentHint"]) == (False, False, True)
+        assert {name: hint["readOnlyHint"] for name, hint in hints.items()} == dict.fromkeys(hints, False)
+    finally:
+        await manager.shutdown()
+
+
 async def test_host_wait_caps_jobs_and_leaves_the_job_running(tmp_path: Path, host_limit: dict) -> None:
     mcp, manager = _bridge(tmp_path)
     async with InMemoryTransport(mcp) as (read, write):
