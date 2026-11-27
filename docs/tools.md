@@ -37,6 +37,7 @@ A host that supports the MCP tasks extension (`io.modelcontextprotocol/tasks`, s
 | `timeout_seconds` | `None` | The job's own deadline in seconds, clamped to 10–3600 (defaults to `AGENT_BRIDGE_DEFAULT_TIMEOUT`, 300) |
 | `wait_seconds` | `0` | Wait up to this many seconds before answering (max 300, also capped by the host's limit). Ignored on MCP task calls |
 | `response_file` | `False` | Save a finished non-empty reply to `<state_dir>/replies/<job_id>.md` and return a preview instead of `response`. Forwarded into `next` on a receipt |
+| `fast` | `False` | Codex only: ask for the faster service tier for this job, at about twice the quota. Worth it when Codex's weekly window is about to reset with quota unused. Not inherited by a resume: pass it on each turn. Another backend runs as usual and its reply carries a `warning` |
 | `resume_from` | `None` | A prior `job_id` or `session_id` to continue. Inherits `cwd`, worktree, `model`, `effort` and `parent_run` |
 | `worktree` | `False` | For `codex` and `claude` in `edit` mode: give the job its own Git worktree |
 | `extra_dirs` | `None` | Additional folders the subagent may use. Refused on a Codex resume |
