@@ -1769,6 +1769,7 @@ class JobManager:
         request: RunRequest,
         *,
         wait_seconds: int | None = None,
+        on_started: Callable[[JobRecord], None] | None = None,
     ) -> JobRecord:
         """Run a job and wait for completion (or up to `wait_seconds`).
 
@@ -1776,12 +1777,15 @@ class JobManager:
         runs to its end in a task the manager owns (see `_cancel_jobs_owned`).
         If `wait_seconds` expires before the job's own deadline, the job stays active and the live
         `JobRecord` (with `job_id`) is returned so the caller can collect it with `jobs`.
+        `on_started` is called with the job's record once it has started, before any wait.
         """
         record = await self.start_async(request)
         ev = self._events.get(record.job_id)
         # Until the caller holds the job's record, the job has no receipt: a cancel anywhere up to then,
         # the last lookup included, cancels the job.
         try:
+            if on_started is not None:
+                on_started(record)
             if ev is not None:
                 if wait_seconds is None:
                     await ev.wait()
@@ -1802,11 +1806,18 @@ class JobManager:
                 await self._cancel_jobs_owned([record.job_id])
             raise
 
-    def peek(self, job_id: str) -> JobRecord | None:
-        """Read a local live record or the stored row without running recovery."""
+    def peek_local(self, job_id: str) -> JobRecord | None:
+        """This window's own copy of a job it runs or has not yet stored, from memory; never the database."""
         local = self._terminal_uncommitted.get(job_id) or self._local_jobs.get(job_id)
         if local is not None and local.owner_id == self.owner_id:
             return self._visible_record(local)
+        return None
+
+    def peek(self, job_id: str) -> JobRecord | None:
+        """Read a local live record or the stored row without running recovery."""
+        local = self.peek_local(job_id)
+        if local is not None:
+            return local
         return self.store.peek_job(job_id)
 
     def get(self, job_id: str) -> JobRecord:

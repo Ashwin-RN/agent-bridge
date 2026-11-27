@@ -12,21 +12,24 @@ import asyncio
 import functools
 import logging
 import sys
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal, TypeVar
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from agent_bridge.config import EffortLevel, Settings, normalize_backend
 from agent_bridge.jobs import ALL_BACKENDS, JobManager
+from agent_bridge.mcp_tasks import TASK_CALL, JobTasks, JobView, pump_progress
 from agent_bridge.model_resolver import ModelPoolUnavailableError
 from agent_bridge.models import DEFAULT_RESPONSE_CHARS, JobRecord
 from agent_bridge.nesting import UNKNOWN_NESTING, NestedBridgeError, Nesting, detect_nesting
 from agent_bridge.quota import build_quota_view
+from agent_bridge.status_text import format_summary_line
 
 UsagePeriodName = Literal["today", "7d", "30d", "all", "session"]
 
@@ -34,6 +37,8 @@ UsagePeriodName = Literal["today", "7d", "30d", "all", "session"]
 MAX_WAIT_SECONDS = 300
 # The wait a receipt's `next` call suggests: under the shortest host limit known.
 NEXT_WAIT_SECONDS = 50
+# How often a waiting call reports progress, and re-reads a job another window runs.
+PROGRESS_INTERVAL_SECONDS = 5.0
 
 SERVER_INSTRUCTIONS = """
 agent-bridge runs the other AI coding CLIs on this machine as subagent jobs, whichever CLI you \
@@ -222,6 +227,62 @@ def _detect_nesting(job_manager: JobManager) -> Nesting:
         return marker if marker.nested else UNKNOWN_NESTING
 
 
+class _LiveLines:
+    """The status line of the jobs a call waits for, read without blocking the event loop.
+
+    A job this window runs is read from memory each time. One that another window runs is read from
+    the database in a thread every few seconds, and the last copy is used in between.
+    """
+
+    def __init__(self, manager: JobManager, job_ids: list[str]) -> None:
+        self._manager = manager
+        self._ids = list(dict.fromkeys(job_ids))
+        self._last: dict[str, JobRecord] = {}
+
+    def records(self) -> list[JobRecord]:
+        out = []
+        for job_id in self._ids:
+            rec = self._manager.peek_local(job_id)
+            if rec is not None:
+                # Kept, so that a job this window has just finished and let go of stays on the line.
+                self._last[job_id] = rec
+            else:
+                rec = self._last.get(job_id)
+            if rec is not None:
+                out.append(rec)
+        return out
+
+    def line(self) -> str:
+        recs = self.records()
+        if len(recs) == 1:
+            return recs[0].line()
+        return format_summary_line([r.line_fields() for r in recs], now=time.time())
+
+    async def refresh(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            for job_id in self._ids:
+                if self._manager.peek_local(job_id) is None:
+                    try:
+                        rec = await asyncio.to_thread(self._manager.peek, job_id)
+                    except Exception:
+                        rec = None
+                    if rec is not None:
+                        self._last[job_id] = rec
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=PROGRESS_INTERVAL_SECONDS)
+            except TimeoutError:
+                pass
+
+
+async def _report_while_waiting(ctx: Context, lines: _LiveLines, stop: asyncio.Event) -> None:
+    """Send the jobs' line as progress until `stop` is set. Returns at once if the host asked for none."""
+    refresher = asyncio.create_task(lines.refresh(stop))
+    try:
+        await pump_progress(ctx, lines.line, interval=PROGRESS_INTERVAL_SECONDS, stop=stop)
+    finally:
+        refresher.cancel()
+
+
 def create_server(
     settings: Settings | None = None,
     manager: JobManager | None = None,
@@ -250,15 +311,47 @@ def create_server(
         response_chars: int = DEFAULT_RESPONSE_CHARS,
         verbose: bool = False,
     ) -> dict[str, Any]:
-        """The one full reply about a job: a waited `run`, `jobs` and `cancel`."""
+        """The one full reply about a job: a waited `run`, `jobs`, `cancel` and a finished task row."""
         return record.to_detail(response_offset=response_offset, response_chars=response_chars, verbose=verbose)
+
+    def _start_progress(ctx: Context, job_ids: list[str], stop: asyncio.Event) -> asyncio.Task[None]:
+        return asyncio.create_task(_report_while_waiting(ctx, _LiveLines(job_manager, job_ids), stop))
+
+    # --- MCP tasks: a host that declares the extension gets each `run` as a task row ---
+
+    def _job_id_from_result(result: Any) -> str | None:
+        data = result.get("structuredContent") if isinstance(result, dict) else getattr(
+            result, "structured_content", None
+        )
+        job_id = data.get("job_id") if isinstance(data, dict) else None
+        return job_id if isinstance(job_id, str) else None
+
+    async def _task_view(job_id: str) -> JobView | None:
+        record = job_manager.peek_local(job_id)
+        if record is None:
+            record = await asyncio.to_thread(job_manager.peek, job_id)
+        if record is None:
+            return None
+        updated = record.finished_at or record.last_activity_at or record.started_at or record.created_at
+        return JobView(
+            status=record.status,
+            line=record.line(),
+            created_at=record.created_at,
+            updated_at=updated,
+            detail=_reply(record) if record.is_terminal else None,
+        )
+
+    job_tasks = JobTasks({"run"}, _job_id_from_result, _task_view, job_manager.cancel)
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            await job_manager.shutdown()
+            try:
+                await job_tasks.aclose()
+            finally:
+                await job_manager.shutdown()
 
     mcp = MCPServer(
         name="agent-bridge",
@@ -269,6 +362,7 @@ def create_server(
         ),
         instructions=NESTED_INSTRUCTIONS if nest.nested else SERVER_INSTRUCTIONS,
         lifespan=lifespan,
+        extensions=[job_tasks],
     )
 
     # Not marked read-only: a job may edit, and a review on `agy` is read-only by its prompt, not a sandbox.
@@ -279,6 +373,7 @@ def create_server(
     )
     @_reported
     async def run(
+        ctx: Context,
         backend: Annotated[
             str | None,
             Field(description="codex, neon (agy), agy-claude, agy-opus, agy-gpt or claude. "
@@ -333,8 +428,21 @@ def create_server(
             allow_cross_pool_fallback=allow_cross_pool_fallback,
             **fields,
         )
-        wait = _effective_wait(wait_seconds)
-        record = await job_manager.run(req, wait_seconds=wait)
+        # A host that shows the call as a task row collects the job through the task, never by waiting.
+        wait = 0 if TASK_CALL.get() else _effective_wait(wait_seconds)
+        stop = asyncio.Event()
+        progress: list[asyncio.Task[None]] = []
+
+        def _started(record: JobRecord) -> None:
+            if wait > 0:
+                progress.append(_start_progress(ctx, [record.job_id], stop))
+
+        try:
+            record = await job_manager.run(req, wait_seconds=wait, on_started=_started)
+        finally:
+            stop.set()
+            for task in progress:
+                task.cancel()
         if record.is_terminal and wait > 0:
             return _reply(record)
         return record.to_receipt(timeout_seconds=req.timeout_seconds, next_call=_next_call(record.job_id))
@@ -346,6 +454,7 @@ def create_server(
     )
     @_reported
     async def jobs(
+        ctx: Context,
         job_ids: list[str] | None = None,
         wait_seconds: int = 0,
         wait_mode: Literal["all", "any"] = "all",
@@ -361,10 +470,18 @@ def create_server(
         if job_ids:
             if response_offset < 0:
                 raise ValueError("response_offset cannot be negative.")
+            wait = _effective_wait(wait_seconds)
             missing: list[str] = []
-            records = await job_manager.wait_for(
-                job_ids, wait_seconds=_effective_wait(wait_seconds), wait_mode=wait_mode, missing=missing,
-            )
+            stop = asyncio.Event()
+            progress = _start_progress(ctx, job_ids, stop) if wait > 0 else None
+            try:
+                records = await job_manager.wait_for(
+                    job_ids, wait_seconds=wait, wait_mode=wait_mode, missing=missing,
+                )
+            finally:
+                stop.set()
+                if progress is not None:
+                    progress.cancel()
             details = {
                 r.job_id: _reply(r, response_offset=response_offset, response_chars=response_chars, verbose=verbose)
                 for r in records
