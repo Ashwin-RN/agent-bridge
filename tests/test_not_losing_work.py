@@ -14,7 +14,7 @@ from mcp import Client
 
 from agent_bridge.config import Settings
 from agent_bridge.jobs import JobManager
-from agent_bridge.models import JobRecord
+from agent_bridge.models import JobRecord, RunResult
 from agent_bridge.nesting import NOT_NESTED
 from agent_bridge.process_control import is_pid_alive
 from agent_bridge.runners import CodexRunner, NeonRunner
@@ -328,5 +328,103 @@ async def test_agy_clean_exit_without_a_result_carrying_a_status_is_a_failure(
         assert rec.error is not None and rec.error.startswith(CUT_SHORT)
         assert rec.response == "half"
         assert rec.usage_status == "partial"
+    finally:
+        await manager.shutdown()
+
+
+# --- 4. Cancel keeps "possibly running" ---
+
+
+@pytest.mark.parametrize("agy_says_still_running", [True, False])
+async def test_cancelled_agy_turn_that_reported_remote_work_keeps_the_session_blocked(
+    tmp_path: Path, agy_says_still_running: bool,
+) -> None:
+    signal = (
+        "sys.stderr.write('print timeout elapsed while turn is still in progress\\n')\n"
+        "sys.stderr.flush()\n"
+        if agy_says_still_running
+        else ""
+    )
+    script = tmp_path / "agy_remote.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "if 'models' in sys.argv:\n"
+        "    print('gemini-4-neon-high\\tGemini 4 Neon (High)')\n"
+        "    sys.exit(0)\n"
+        + signal
+        + "print(json.dumps({'event': 'init', 'conversation_id': 'conv-rip', "
+        "'init': {'model': 'gemini-4-neon-high'}}), flush=True)\n"
+        "print(json.dumps({'event': 'step_update', 'step_update': {'conversation_id': 'conv-rip', "
+        "'step_index': 1, 'state': 'ACTIVE', 'step_type': 'agent_response', 'text_delta': 'working'}}), flush=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, neon_runner=StubAgyRunner(settings, script))
+    try:
+        job = await manager.start_async(manager.prepare_request(backend="neon", prompt="go"))
+        async with asyncio.timeout(15):
+            while manager._local_jobs[job.job_id].last_activity != "agent_response (ACTIVE)":
+                await asyncio.sleep(0.02)
+        await asyncio.sleep(0.5)  # let the stderr reader take the line in
+        await manager.cancel(job.job_id)
+        stored = manager.store.get_job(job.job_id)
+        assert stored is not None and stored.status == "cancelled"
+        block = manager.store.get_session_safety_block("neon", "conv-rip")
+        if not agy_says_still_running:
+            assert stored.provider_state == "stopped"
+            assert block is None
+            return
+        # As on the timeout path: the session stays blocked, and a resume is refused until confirmed.
+        assert stored.provider_state == "possibly_running"
+        assert block == {"blocking_job_id": job.job_id, "provider_state": "possibly_running"}
+        resumed = await manager.run(manager.prepare_request(backend="neon", prompt="again", resume_from=job.job_id))
+        assert resumed.status == "failed"
+        assert resumed.failure_reason == "prior_turn_uncertain"
+    finally:
+        await manager.shutdown()
+
+
+class _AgyRunnerEndingAsTheCancelComes(NeonRunner):
+    """Plays a runner whose CLI had ended with agy's remote in-progress signal as the cancel came."""
+
+    def __init__(self, settings: Settings, started: asyncio.Event) -> None:
+        super().__init__(settings)
+        self._started = started
+
+    async def run(self, request, *, deadline=None, prior_watermark=None, on_session=None,  # type: ignore[override]
+                  on_activity=None, on_model=None, on_provider_start=None, on_attempt=None) -> RunResult:
+        await on_provider_start()
+        on_session("conv-late")
+        self._started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            pass  # its own cleanup is done, and it reports what agy had said
+        return RunResult(
+            status="timed_out", session_id="conv-late", failure_reason="provider_timeout_still_running",
+            provider_state="possibly_running", provider_invoked=True, error="turn is still in progress",
+        )
+
+
+async def test_cancel_keeps_possibly_running_from_an_agy_result_that_ended_as_the_cancel_came(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    started = asyncio.Event()
+    manager = JobManager(settings, neon_runner=_AgyRunnerEndingAsTheCancelComes(settings, started))
+    try:
+        job = await manager.start_async(manager.prepare_request(backend="neon", prompt="go"))
+        async with asyncio.timeout(10):
+            await started.wait()
+            while manager.store.get_job(job.job_id).session_id != "conv-late":
+                await asyncio.sleep(0.02)
+        await manager.cancel(job.job_id)
+        stored = manager.store.get_job(job.job_id)
+        assert stored is not None and stored.status == "cancelled"
+        assert stored.provider_state == "possibly_running"
+        assert manager.store.get_session_safety_block("neon", "conv-late") == {
+            "blocking_job_id": job.job_id, "provider_state": "possibly_running",
+        }
     finally:
         await manager.shutdown()

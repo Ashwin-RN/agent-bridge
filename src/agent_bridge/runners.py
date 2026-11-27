@@ -288,6 +288,14 @@ def _repo_worktree_lock(repo_root_key: str) -> asyncio.Lock:
     return lock
 
 
+def agy_reports_turn_still_running(exit_code: int | None, text: str) -> bool:
+    """Whether `agy` said its turn may still be going on at the server: exit code 3, or words to that effect.
+
+    Stopping the local CLI does not stop that turn, so a job that saw this keeps `possibly_running`.
+    """
+    return exit_code == 3 or any(p.search(text) for p in _AGY_TIMEOUT_PATTERNS)
+
+
 def classify_failure(
     *,
     backend: str,
@@ -304,9 +312,7 @@ def classify_failure(
 
     # Preserve Antigravity's remote in-progress signal EVEN when our local deadline also fired
     # and the local CLI process was verified stopped (killing the CLI does not stop the remote turn!).
-    if backend == "neon" and (
-        exit_code == 3 or any(p.search(combined) for p in _AGY_TIMEOUT_PATTERNS)
-    ):
+    if backend == "neon" and agy_reports_turn_still_running(exit_code, combined):
         return (
             "timed_out",
             "provider_timeout_still_running",
@@ -1365,9 +1371,13 @@ class NeonRunner:
                 usage_status = "partial"
 
         if cancelled:
+            # The timeout path honours agy's word that its turn goes on at the server; so does a cancel.
+            env_error = str(envelope.get("error") or "") if isinstance(envelope, dict) else ""
+            remote_running = agy_reports_turn_still_running(proc.returncode, f"{env_error}\n{stderr_text}")
             raise RunCancelled(
                 RunResult(status="cancelled", session_id=session_id, usage=usage,
-                          provider_metrics=provider_metrics, usage_status=usage_status)
+                          provider_metrics=provider_metrics, usage_status=usage_status,
+                          provider_state="possibly_running" if remote_running else None)
             )
 
         # Only publish a new cumulative checkpoint when this turn completed cleanly with valid,

@@ -100,6 +100,20 @@ class WorktreeMissingError(RuntimeError):
         )
 
 
+AGY_REMOTE_TURN_CANCEL_ERROR = (
+    "Job cancelled. agy had reported that its turn may still be running at the server; stopping the local "
+    "CLI does not stop that turn."
+)
+
+
+def _agy_remote_turn_cancel_guidance(job_id: str) -> str:
+    return (
+        "The session stays blocked, as after a timeout with the same signal. Confirm that this turn has "
+        "ended (and inspect git status/diff for edits), then resume with "
+        f"confirm_prior_job_id={job_id!r}."
+    )
+
+
 def _sum_attempt_usage(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Aggregate available token counters across prior executed attempts."""
     keys = (
@@ -1311,12 +1325,19 @@ class JobManager:
             cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
             await _drain_progress(cancel_session_claims=True)
             _keep_cancelled_usage(exc.result if isinstance(exc, RunCancelled) else result)
+            # agy may have said its turn goes on at the server, which stopping the local CLI cannot change:
+            # in the cancelled runner's own result, or in the result it had returned before the cancel came.
+            remote_running = (
+                isinstance(exc, RunCancelled) and exc.result.provider_state == "possibly_running"
+            ) or (result is not None and result.failure_reason == "provider_timeout_still_running")
             record.status = "cancelled"
             record.failure_reason = "cancelled"
-            record.provider_state = "stopped" if stopped else "possibly_running"
-            record.error = "Job cancelled."
+            record.provider_state = "stopped" if (stopped and not remote_running) else "possibly_running"
+            record.error = AGY_REMOTE_TURN_CANCEL_ERROR if remote_running else "Job cancelled."
             record.retry_guidance = (
-                "Subprocess tree was verified stopped. For edit tasks inspect git status/diff before retrying."
+                _agy_remote_turn_cancel_guidance(record.job_id)
+                if remote_running
+                else "Subprocess tree was verified stopped. For edit tasks inspect git status/diff before retrying."
                 if stopped
                 else "Job was cancelled, but child process termination could not be verified. "
                 "Verify no child process remains and inspect git status/diff before retrying."
@@ -1466,12 +1487,16 @@ class JobManager:
                 cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
                 await _drain_progress(cancel_session_claims=True)
                 _keep_cancelled_usage(result)
+                # The runner had already ended, perhaps with agy's word that its turn goes on at the server.
+                remote_running = result.failure_reason == "provider_timeout_still_running"
                 record.status = "cancelled"
                 record.failure_reason = "cancelled"
-                record.provider_state = "stopped" if stopped else "possibly_running"
-                record.error = "Job cancelled."
+                record.provider_state = "stopped" if (stopped and not remote_running) else "possibly_running"
+                record.error = AGY_REMOTE_TURN_CANCEL_ERROR if remote_running else "Job cancelled."
                 record.retry_guidance = (
-                    "Subprocess tree was verified stopped. For edit tasks inspect git status/diff before retrying."
+                    _agy_remote_turn_cancel_guidance(record.job_id)
+                    if remote_running
+                    else "Subprocess tree was verified stopped. For edit tasks inspect git status/diff before retrying."
                     if stopped
                     else "Subprocess termination could not be verified after cancellation."
                 )
