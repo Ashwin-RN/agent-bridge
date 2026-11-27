@@ -598,14 +598,14 @@ def test_claude_rate_limit_reading_and_merge() -> None:
 
 
 def test_advisory_never_urges_spending_the_claude_plan_before_its_reset() -> None:
-    """13% left with a day to go reads "use it before reset" on the other pools. Not on this one."""
+    """25% left with a day to go reads "use it before reset" on the other pools. Not on this one."""
     from datetime import datetime, timedelta, timezone
 
     from agent_bridge.quota import build_quota_advisory
 
     now = datetime(2026, 11, 26, 14, 0, tzinfo=timezone.utc)
     reset = (now + timedelta(hours=21)).isoformat(timespec="seconds")
-    window = {"window": "weekly", "used_percent": 87.0, "remaining_percent": 13.0, "reset_time": reset}
+    window = {"window": "weekly", "used_percent": 75.0, "remaining_percent": 25.0, "reset_time": reset}
 
     claude_only = build_quota_advisory(
         {"claude": {"backend": "claude", "pool": "claude", "status": "ok", "windows": [dict(window, id="seven_day")]}},
