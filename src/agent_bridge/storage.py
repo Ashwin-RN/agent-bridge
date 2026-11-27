@@ -186,16 +186,34 @@ def _loads_opt(raw: str | None) -> dict[str, Any] | None:
         return None
 
 
+# Creation times read twice of one process can differ a little: `ps` gives the elapsed time to the second.
+_PROCESS_START_TOLERANCE_SECONDS = 2.0
+
+
 def _is_owner_row_alive(
     pid: int | None,
     exited_at: float | None,
+    process_started_at: float | None = None,
     *,
     is_pid_alive_fn: Callable[[int], bool],
+    process_start_time_fn: Callable[[int], float | None] | None = None,
 ) -> bool:
-    """Single canonical liveness predicate used by status checks, cancellation, recovery, and session claims."""
+    """Single canonical liveness predicate used by status checks, cancellation, recovery, and session claims.
+
+    An owner is live while its row has no exit time, its pid is alive, and that pid is still the process
+    that registered: its creation time matches the one recorded. Where either time is unknown (a row
+    from an older bridge, no reader given, or one that cannot be read now) the pid check decides alone.
+    """
     if exited_at is not None or pid is None:
         return False
-    return bool(is_pid_alive_fn(int(pid)))
+    if not is_pid_alive_fn(int(pid)):
+        return False
+    if process_started_at is None or process_start_time_fn is None:
+        return True
+    current = process_start_time_fn(int(pid))
+    if current is None:
+        return True
+    return abs(float(current) - float(process_started_at)) <= _PROCESS_START_TOLERANCE_SECONDS
 
 
 class SessionHeldError(RuntimeError):
@@ -851,7 +869,20 @@ class BridgeStore:
                 (str(now),),
             )
 
+            self._migrate_owner_process_start_cur(cur)
+
         self._import_legacy_files_if_needed()
+
+    @staticmethod
+    def _migrate_owner_process_start_cur(cur: sqlite3.Cursor) -> None:
+        """Migration step: `owners.process_started_at`, the owning process's own creation time.
+
+        Additive and nullable. A row without it, written by an older bridge, is "unknown": its liveness
+        is the pid check alone, as before.
+        """
+        owner_cols = {str(r["name"]) for r in cur.execute("PRAGMA table_info(owners)").fetchall()}
+        if "process_started_at" not in owner_cols:
+            cur.execute("ALTER TABLE owners ADD COLUMN process_started_at REAL")
 
     def _import_legacy_files_if_needed(self) -> None:
         """One-time, idempotent import of v1 `jobs.json` and `usage.jsonl` into SQLite."""
@@ -1130,22 +1161,17 @@ class BridgeStore:
 
     # --- Owner tracking & crash recovery ---
 
-    def register_owner(self, owner_id: str, pid: int) -> None:
+    def register_owner(self, owner_id: str, pid: int, *, process_started_at: float | None = None) -> None:
+        """Record a live bridge process. `process_started_at` is its creation time, None when unknown."""
         now = time.time()
         with self._tx(write=True) as cur:
             cur.execute(
                 """
-                INSERT OR REPLACE INTO owners (owner_id, pid, started_at, last_heartbeat, exited_at)
-                VALUES (?, ?, ?, ?, NULL)
+                INSERT OR REPLACE INTO owners (
+                    owner_id, pid, started_at, last_heartbeat, exited_at, process_started_at
+                ) VALUES (?, ?, ?, ?, NULL, ?)
                 """,
-                (owner_id, int(pid), now, now),
-            )
-
-    def heartbeat_owner(self, owner_id: str) -> None:
-        with self._tx(write=True) as cur:
-            cur.execute(
-                "UPDATE owners SET last_heartbeat = ? WHERE owner_id = ?",
-                (time.time(), owner_id),
+                (owner_id, int(pid), now, now, process_started_at),
             )
 
     def mark_owner_exited(self, owner_id: str) -> None:
@@ -1170,12 +1196,11 @@ class BridgeStore:
         owner_id: str,
         *,
         is_pid_alive_fn: Callable[[int], bool],
-        stale_seconds: float = 30.0,
+        process_start_time_fn: Callable[[int], float | None] | None = None,
     ) -> bool:
-        _ = stale_seconds  # Kept for API compatibility; liveness uses the unified OS PID check.
         with self._tx(write=False) as cur:
             row = cur.execute(
-                "SELECT pid, exited_at FROM owners WHERE owner_id = ?",
+                "SELECT pid, exited_at, process_started_at FROM owners WHERE owner_id = ?",
                 (owner_id,),
             ).fetchone()
             if row is None:
@@ -1183,7 +1208,9 @@ class BridgeStore:
             return _is_owner_row_alive(
                 row["pid"],
                 row["exited_at"],
+                row["process_started_at"],
                 is_pid_alive_fn=is_pid_alive_fn,
+                process_start_time_fn=process_start_time_fn,
             )
 
     def recover_dead_owner_jobs(
@@ -1191,16 +1218,16 @@ class BridgeStore:
         current_owner_id: str,
         *,
         is_pid_alive_fn: Callable[[int], bool],
-        stale_seconds: float = 30.0,
+        process_start_time_fn: Callable[[int], float | None] | None = None,
     ) -> list[str]:
         """Recover only queued/running jobs whose owning bridge process has actually exited."""
-        _ = stale_seconds
         recovered: list[str] = []
         now = time.time()
         with self._tx(write=True) as cur:
             rows = cur.execute(
                 """
-                SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at
+                SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+                       o.process_started_at AS owner_process_started_at
                 FROM jobs j
                 LEFT JOIN owners o ON j.owner_id = o.owner_id
                 WHERE j.status IN ('queued', 'running') AND j.owner_id != ?
@@ -1213,7 +1240,9 @@ class BridgeStore:
                 alive = _is_owner_row_alive(
                     row["owner_pid"],
                     row["owner_exited_at"],
+                    row["owner_process_started_at"],
                     is_pid_alive_fn=is_pid_alive_fn,
+                    process_start_time_fn=process_start_time_fn,
                 )
                 if alive:
                     continue
@@ -1265,6 +1294,7 @@ class BridgeStore:
         owner_id: str,
         *,
         is_pid_alive_fn: Callable[[int], bool],
+        process_start_time_fn: Callable[[int], float | None] | None = None,
         confirm_prior_job_id: str | None = None,
     ) -> tuple[Literal["claimed", "busy", "blocked"], str | None, str | None]:
         """Atomically claim `(backend, session_id)` for `job_id`.
@@ -1292,7 +1322,8 @@ class BridgeStore:
 
                 holder_row = cur.execute(
                     """
-                    SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at
+                    SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+                           o.process_started_at AS owner_process_started_at
                     FROM jobs j
                     LEFT JOIN owners o ON j.owner_id = o.owner_id
                     WHERE j.job_id = ?
@@ -1311,7 +1342,9 @@ class BridgeStore:
                         or _is_owner_row_alive(
                             holder_row["owner_pid"],
                             holder_row["owner_exited_at"],
+                            holder_row["owner_process_started_at"],
                             is_pid_alive_fn=is_pid_alive_fn,
+                            process_start_time_fn=process_start_time_fn,
                         )
                     )
                     if holder_alive:
@@ -1327,7 +1360,8 @@ class BridgeStore:
             # Defensive check: ensure no active RUNNING job on `(backend, session_id)` lacks a claim row.
             running_rows = cur.execute(
                 """
-                SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at
+                SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+                       o.process_started_at AS owner_process_started_at
                 FROM jobs j
                 LEFT JOIN owners o ON j.owner_id = o.owner_id
                 WHERE j.backend = ? AND j.session_id = ?
@@ -1343,7 +1377,9 @@ class BridgeStore:
                     or _is_owner_row_alive(
                         rrow["owner_pid"],
                         rrow["owner_exited_at"],
+                        rrow["owner_process_started_at"],
                         is_pid_alive_fn=is_pid_alive_fn,
+                        process_start_time_fn=process_start_time_fn,
                     )
                 )
                 if running_alive:
@@ -2473,6 +2509,7 @@ class BridgeStore:
         session_owner_id: str,
         only_session: bool,
         is_pid_alive_fn: Callable[[int], bool],
+        process_start_time_fn: Callable[[int], float | None] | None = None,
     ) -> dict[str, Any]:
         """Every record the usage dashboard reads, from one snapshot so that its figures agree. It writes nothing.
 
@@ -2523,7 +2560,8 @@ class BridgeStore:
                 f"""
                 SELECT j.job_id, j.owner_id, j.backend, j.quota_pool, j.model, j.requested_model, j.status,
                        j.created_at, j.started_at, j.last_activity, j.provider_invoked,
-                       o.pid AS owner_pid, o.exited_at AS owner_exited_at
+                       o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+                       o.process_started_at AS owner_process_started_at
                 FROM jobs j
                 LEFT JOIN owners o ON o.owner_id = j.owner_id
                 {running_where}
@@ -2543,9 +2581,14 @@ class BridgeStore:
             job = dict(r)
             pid = job.pop("owner_pid")
             exited_at = job.pop("owner_exited_at")
+            process_started_at = job.pop("owner_process_started_at")
             # The calling window is alive by definition. Any other: the check recovery uses, read only.
             job["owner_alive"] = job["owner_id"] == session_owner_id or _is_owner_row_alive(
-                pid, exited_at, is_pid_alive_fn=is_pid_alive_fn
+                pid,
+                exited_at,
+                process_started_at,
+                is_pid_alive_fn=is_pid_alive_fn,
+                process_start_time_fn=process_start_time_fn,
             )
             running_jobs.append(job)
 

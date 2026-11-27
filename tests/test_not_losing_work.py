@@ -568,3 +568,99 @@ async def test_a_turn_revealing_a_session_another_live_job_holds_is_stopped_and_
         assert (done.status, done.session_id, done.response) == ("completed", "thr-shared", "OK:A")
     finally:
         await manager.shutdown()
+
+
+# --- 6. Owner liveness that survives PID reuse ---
+
+
+def _running_job(job_id: str, owner_id: str, cwd: Path) -> JobRecord:
+    return JobRecord(
+        job_id=job_id, owner_id=owner_id, backend="codex", cwd=str(cwd), mode="read_only",
+        requested_model=None, model="m", prompt_preview="p", status="running", started_at=time.time(),
+        provider_invoked=True,
+    )
+
+
+async def test_an_owner_whose_pid_now_belongs_to_another_process_is_not_live(tmp_path: Path) -> None:
+    import subprocess
+
+    from agent_bridge.nesting import process_start_time
+    from agent_bridge.storage import BridgeStore
+
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        async with asyncio.timeout(10):
+            while (started := process_start_time(other.pid)) is None:
+                await asyncio.sleep(0.05)
+        assert abs(started - time.time()) < 120
+        store = BridgeStore(tmp_path / "state")
+        check = dict(is_pid_alive_fn=is_pid_alive, process_start_time_fn=process_start_time)
+        store.register_owner("same", other.pid, process_started_at=started)
+        # Registered by an earlier process that had this pid: the pid is alive, but it is not that process.
+        store.register_owner("reused", other.pid, process_started_at=started - 3600)
+        store.register_owner("older-bridge", other.pid)  # a row from a bridge that recorded no time
+        assert store.is_owner_alive("same", **check) is True
+        assert store.is_owner_alive("reused", **check) is False
+        assert store.is_owner_alive("older-bridge", **check) is True
+        store.insert_job(_running_job("codex-0000same", "same", tmp_path))
+        store.insert_job(_running_job("codex-000reuse", "reused", tmp_path))
+        assert store.recover_dead_owner_jobs("me", **check) == ["codex-000reuse"]
+        assert store.get_job("codex-000reuse").failure_reason == "owner_exited"
+        assert store.get_job("codex-0000same").status == "running"
+    finally:
+        other.kill()
+        other.wait()
+
+
+async def test_a_bridge_records_its_own_process_start_time(tmp_path: Path) -> None:
+    import os
+
+    from agent_bridge.nesting import process_start_time
+
+    manager = JobManager(_settings(tmp_path))
+    try:
+        conn = sqlite3.connect(manager.store.db_path)
+        try:
+            (recorded,) = conn.execute(
+                "SELECT process_started_at FROM owners WHERE owner_id = ?", (manager.owner_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        expected = process_start_time(os.getpid())
+        assert expected is not None and recorded is not None
+        assert abs(recorded - expected) < 2.0
+    finally:
+        await manager.shutdown()
+
+
+def test_an_older_owners_table_gains_the_column_and_its_rows_read_as_unknown(tmp_path: Path) -> None:
+    import os
+
+    from agent_bridge.nesting import process_start_time
+    from agent_bridge.storage import BridgeStore
+
+    state = tmp_path / "state"
+    state.mkdir()
+    conn = sqlite3.connect(state / "bridge.db")
+    conn.execute(
+        "CREATE TABLE owners (owner_id TEXT PRIMARY KEY, pid INTEGER NOT NULL, started_at REAL NOT NULL, "
+        "last_heartbeat REAL NOT NULL, exited_at REAL)"
+    )
+    now = time.time()
+    conn.execute("INSERT INTO owners VALUES ('legacy', ?, ?, ?, NULL)", (os.getpid(), now, now))
+    conn.commit()
+    conn.close()
+
+    store = BridgeStore(state)
+    conn = sqlite3.connect(state / "bridge.db")
+    try:
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(owners)")}
+        (value,) = conn.execute("SELECT process_started_at FROM owners WHERE owner_id = 'legacy'").fetchone()
+    finally:
+        conn.close()
+    assert "process_started_at" in columns and columns["process_started_at"][3] == 0  # nullable
+    assert value is None
+    # Unknown: the pid check decides alone, as before.
+    assert store.is_owner_alive(
+        "legacy", is_pid_alive_fn=is_pid_alive, process_start_time_fn=process_start_time
+    ) is True

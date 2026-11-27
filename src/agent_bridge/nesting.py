@@ -371,6 +371,40 @@ def _linux_boot_time() -> float | None:
     return None
 
 
+def process_start_time(pid: int) -> float | None:
+    """Wall-clock creation time of process `pid`, or None when it cannot be read.
+
+    Windows reads it from the process itself, Linux from `/proc`, others from `ps`'s elapsed time (to the
+    second). Together with the pid it tells one process from a later one that was given the same number.
+    """
+    try:
+        if pid <= 0:
+            return None
+        if sys.platform == "win32":
+            return _windows_start_time(pid)
+        if os.path.isdir("/proc/self"):
+            boot = _linux_boot_time()
+            if boot is None:
+                return None
+            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+                parsed = parse_proc_stat(fh.read())
+            if parsed is None:
+                return None
+            try:
+                ticks_per_second = float(os.sysconf("SC_CLK_TCK"))
+            except (ValueError, OSError, AttributeError):
+                ticks_per_second = 100.0
+            return boot + parsed[1] / ticks_per_second
+        out = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout
+        elapsed = parse_etime(out)
+        return time.time() - elapsed if elapsed is not None else None
+    except Exception:
+        return None
+
+
 def _posix_ancestors(pid: int) -> list[tuple[int, float | None]] | None:
     chain: list[tuple[int, float | None]] = []
     if os.path.isdir("/proc/self"):
