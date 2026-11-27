@@ -28,7 +28,7 @@ Useful options:
 |---|---|
 | `--print` | Show the diffs and commands without writing anything |
 | `--host NAME` | Set up named hosts only (repeatable). Default: offer each host found on the machine |
-| `--scope user\|project` | Write user config (every project, the default) or project config |
+| `--scope user\|project` | Write user config (every project, the default) or project config. With `project`, nothing under your home folder is written: a tool-call limit or approval rule that lives in a user-level file is printed as a snippet |
 | `--project DIR` | Project folder for `--scope project` (default: current folder) |
 | `--command CMD` | Command that starts the bridge (default: this Python with `-m agent_bridge`) |
 | `--yes`, `-y` | Accept every change without asking |
