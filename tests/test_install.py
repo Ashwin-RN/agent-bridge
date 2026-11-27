@@ -361,7 +361,11 @@ def test_a_missing_status_line_is_set_with_its_refresh_interval(run: Run, home: 
 
 
 def test_a_host_whose_file_is_unverified_gets_a_snippet_not_a_write(run: Run, home: Path) -> None:
-    assert run.install("--host", "vscode-copilot", "--yes", "--no-skill") == 0
+    def must_not_run(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"ran {argv} for a file that cannot be checked first")
+
+    lookup = {"code": "C:/Code/bin/code.cmd"}.get
+    assert run.install("--host", "vscode-copilot", "--yes", "--no-skill", runner=must_not_run, path_lookup=lookup) == 0
     assert not (home / "AppData").exists() and not (home / ".config").exists() and not (home / "Library").exists()
     assert "not verified" in run.text
     assert "code --add-mcp" in run.text

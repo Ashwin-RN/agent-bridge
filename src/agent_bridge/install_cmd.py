@@ -792,12 +792,17 @@ class Session:
             self.out(f"note: {note}")
         if not host.timeout.raisable:
             limit = host.timeout.default_seconds
-            self.out(f"note: {host.label}'s tool-call limit cannot be raised" + (f" ({limit:g} s)" if limit else ""))
+            self.out(
+                f"note: {host.label}'s tool-call limit cannot be raised"
+                + (f" ({limit:g} s)" if limit else "")
+                + ": use start_agent, and check_jobs waits under the limit"
+            )
         elif host.timeout.key is None and host.timeout.needs_raising():
             self.out(f"note: no verified key raises {host.label}'s tool-call limit; set it to {WANTED_TIMEOUT_SECONDS} s in its settings if it has one")
 
-        path, _ = config_path(host, self.roots, opts.scope)
-        self.official_command(host, path, report)
+        path, why_not = config_path(host, self.roots, opts.scope)
+        if why_not is None:  # an unverified file cannot be checked for an existing registration first
+            self.official_command(host, path, report)
 
         planner = Planner(self.roots, opts)
         plan_registration(host, self.roots, opts, planner)

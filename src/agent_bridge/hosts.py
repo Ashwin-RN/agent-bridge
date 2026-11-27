@@ -339,9 +339,7 @@ HOSTS: tuple[Host, ...] = (
         skills_source=docs("https://cursor.com/docs/skills"),
         process_names=("cursor", "cursor-agent"),
         detect_source=Source("run", note="the cursor launcher and ~/.cursor were found here; no MCP file yet"),
-        notes=(
-            "Cursor's CLI stops a tool call after 60 s and cannot be raised: use start_agent and short check_jobs waits.",
-        ),
+        notes=("The 60 s limit is the Cursor CLI's; the Cursor IDE allows about 60 minutes.",),
     ),
     Host(
         name="copilot-cli",
@@ -398,7 +396,7 @@ HOSTS: tuple[Host, ...] = (
         user_config_source=Source(
             "unverified", VSCODE_DOCS, "the docs name the user mcp.json but not where it is on disk"
         ),
-        timeout=Timeout(key=None, default_seconds=None, raisable=False, source=docs(VSCODE_DOCS, "no timeout key")),
+        timeout=Timeout(key=None, default_seconds=None, source=docs(VSCODE_DOCS, "no timeout key on the page")),
         register=Register(
             argv=("code", "--add-mcp", "{vscode_json}"),
             source=docs(VSCODE_DOCS),
