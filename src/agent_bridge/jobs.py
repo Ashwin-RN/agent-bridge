@@ -1596,7 +1596,8 @@ class JobManager:
     ) -> JobRecord:
         """Run a job and wait for completion (or up to `wait_seconds`).
 
-        If the MCP caller cancels this synchronous wait, the underlying job is cancelled cleanly.
+        If the MCP caller cancels this synchronous wait, the underlying job is cancelled, and the cancel
+        runs to its end in a task the manager owns (see `_cancel_jobs_owned`).
         If `wait_seconds` expires before the job's own deadline, the job stays active and the live
         `JobRecord` (with `job_id`) is returned so the caller can poll via `check_jobs`.
         """
@@ -1612,7 +1613,8 @@ class JobManager:
                     except asyncio.TimeoutError:
                         pass
         except asyncio.CancelledError:
-            await self.cancel(record.job_id)
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cancel_jobs_owned([record.job_id])
             raise
         return await self.get_async(record.job_id)
 
@@ -1668,7 +1670,8 @@ class JobManager:
         try:
             return await self.wait_for(job_ids, wait_seconds=effective_wait, wait_mode="all")
         except asyncio.CancelledError:
-            await asyncio.gather(*(self.cancel(jid) for jid in job_ids), return_exceptions=True)
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cancel_jobs_owned(job_ids)
             raise
 
     def get(self, job_id: str) -> JobRecord:

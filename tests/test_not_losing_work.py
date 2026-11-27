@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import pytest
+from mcp import Client
 
 from agent_bridge.config import Settings
 from agent_bridge.jobs import JobManager
@@ -164,3 +165,55 @@ async def test_batch_cancelled_while_starting_its_jobs_cancels_the_ones_already_
     finally:
         release.set()
         await manager.shutdown()
+
+
+# --- 2. A cancel that finishes ---
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("run_agent", {"backend": "codex", "prompt": "hold"}),
+        ("run_parallel", {"tasks": [{"backend": "codex", "prompt": "hold"}]}),
+        ("review_code", {"backends": ["codex"]}),
+    ],
+)
+async def test_host_cancel_of_a_waiting_call_stops_the_job_through_the_mcp_sdk(
+    tmp_path: Path, tool: str, args: dict,
+) -> None:
+    """A host that gives up on a waiting call sends `notifications/cancelled` for it.
+
+    The SDK then cancels the request's scope, and that scope interrupts every later await the handler
+    makes. `mode="legacy"` makes the in-process client speak JSON-RPC over memory streams, as a host does
+    over stdio. The default mode calls the handler directly in the caller's task, and would not show it.
+    """
+    pid_file = tmp_path / "pid.txt"
+    script = tmp_path / "codex_wait.py"
+    script.write_text(
+        "import json, os, sys, time\n"
+        f"tmp = {str(pid_file)!r} + '.tmp'\n"
+        "open(tmp, 'w').write(str(os.getpid()))\n"
+        f"os.replace(tmp, {str(pid_file)!r})\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'thr-wait'}), flush=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    settings = _settings(tmp_path, default_timeout_seconds=120)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
+    mcp, _ = create_server(settings=settings, manager=manager, nesting=NOT_NESTED)
+    async with Client(mcp, mode="legacy") as client:
+        call = asyncio.create_task(client.call_tool(tool, {**args, "cwd": str(tmp_path)}))
+        await _wait_for_file(pid_file)
+        pid = int(pid_file.read_text())
+        [job] = manager.store.list_jobs(limit=5)
+        assert job.status == "running"
+        call.cancel()  # the client sends notifications/cancelled for this request
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        # Still inside the session, so the bridge's shutdown, which cancels every job, has not run.
+        async with asyncio.timeout(10):
+            while manager.store.get_job(job.job_id).status != "cancelled":
+                await asyncio.sleep(0.05)
+        assert not is_pid_alive(pid)
+        assert manager.store.get_job(job.job_id).provider_state == "stopped"
