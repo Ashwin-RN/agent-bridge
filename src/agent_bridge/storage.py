@@ -198,6 +198,21 @@ def _is_owner_row_alive(
     return bool(is_pid_alive_fn(int(pid)))
 
 
+class SessionHeldError(RuntimeError):
+    """A job's CLI reported a session that another job, not yet ended, holds. Nothing was written."""
+
+    def __init__(self, *, backend: str, session_id: str, holder_job_id: str) -> None:
+        self.backend = backend
+        self.session_id = session_id
+        self.holder_job_id = holder_job_id
+        super().__init__(
+            f"Session {session_id!r} on {backend!r} is held by job {holder_job_id!r}, which has not ended."
+        )
+
+
+FinalizeOutcome = Literal["written", "kept", "missing"]
+
+
 def is_sqlite_lock_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
         return False
@@ -1575,6 +1590,31 @@ class BridgeStore:
         vals.append(job_id)
         now = time.time()
         with self._tx(write=True, lock_timeout=lock_timeout) as cur:
+            if session_id is not None:
+                # A session another job holds and has not ended is refused before anything is written:
+                # the error rolls this transaction back, and the caller stops its run.
+                claim_backend = backend
+                if not claim_backend:
+                    brow = cur.execute("SELECT backend FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                    claim_backend = str(brow["backend"]) if brow is not None else None
+                if claim_backend:
+                    held = cur.execute(
+                        """
+                        SELECT c.job_id, j.status FROM session_claims c
+                        LEFT JOIN jobs j ON j.job_id = c.job_id
+                        WHERE c.backend = ? AND c.session_id = ?
+                        """,
+                        (claim_backend, session_id),
+                    ).fetchone()
+                    if (
+                        held is not None
+                        and str(held["job_id"]) != job_id
+                        and held["status"] is not None
+                        and str(held["status"]) not in TERMINAL_STATUSES
+                    ):
+                        raise SessionHeldError(
+                            backend=claim_backend, session_id=session_id, holder_job_id=str(held["job_id"])
+                        )
             cur.execute(
                 f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ? "
                 "AND status NOT IN ('completed', 'failed', 'cancelled', 'timed_out')",
@@ -1633,8 +1673,13 @@ class BridgeStore:
         touched_provider: bool | None = None,
         attempts: list[dict[str, Any]] | None = None,
         lock_timeout: float = 5.0,
-    ) -> None:
-        """Atomically and idempotently persist terminal status, per-attempt usage, claim release, and safety state."""
+    ) -> FinalizeOutcome:
+        """Atomically and idempotently persist terminal status, per-attempt usage, claim release, and safety state.
+
+        Returns "written"; "kept" when the row had already ended with another outcome, which is then
+        left as it is, usage, watermark and safety state included; or "missing" when there is no row
+        (pruned), in which case the usage is still recorded as before.
+        """
         now = time.time()
         pool = record.quota_pool or classify_quota_pool(
             record.backend,
@@ -1654,6 +1699,59 @@ class BridgeStore:
             pm["attempts"] = att_list
             record.provider_metrics = pm
         with self._tx(write=True, lock_timeout=lock_timeout) as cur:
+            current = cur.execute(
+                "SELECT status, failure_reason FROM jobs WHERE job_id = ?", (record.job_id,)
+            ).fetchone()
+            if (
+                current is not None
+                and str(current["status"]) in TERMINAL_STATUSES
+                and (str(current["status"]), current["failure_reason"]) != (record.status, record.failure_reason)
+            ):
+                # A late writer never overwrites a result that is already stored. The same outcome may be
+                # written again (a retried write), and is.
+                logger.warning(
+                    "Job %s had already ended %s (%s); a later %s (%s) result is not written over it.",
+                    record.job_id,
+                    current["status"],
+                    current["failure_reason"],
+                    record.status,
+                    record.failure_reason,
+                )
+                cur.execute("DELETE FROM session_claims WHERE job_id = ?", (record.job_id,))
+                return "kept"
+            outcome: FinalizeOutcome = "written" if current is not None else "missing"
+
+            # A session that another job holds and has not ended is not this job's to touch: the row keeps
+            # the session it had, and that session's watermark and safety state are left alone.
+            foreign_session = False
+            if record.session_id:
+                held = cur.execute(
+                    """
+                    SELECT c.job_id, j.status FROM session_claims c
+                    LEFT JOIN jobs j ON j.job_id = c.job_id
+                    WHERE c.backend = ? AND c.session_id = ?
+                    """,
+                    (record.backend, record.session_id),
+                ).fetchone()
+                foreign_session = (
+                    held is not None
+                    and str(held["job_id"]) != record.job_id
+                    and held["status"] is not None
+                    and str(held["status"]) not in TERMINAL_STATUSES
+                )
+                if foreign_session:
+                    logger.warning(
+                        "Job %s reported session %s, which job %s holds; it is not recorded on %s.",
+                        record.job_id,
+                        record.session_id,
+                        held["job_id"],
+                        record.job_id,
+                    )
+                    row_sid = cur.execute(
+                        "SELECT session_id FROM jobs WHERE job_id = ?", (record.job_id,)
+                    ).fetchone()
+                    record.session_id = row_sid["session_id"] if row_sid is not None else None
+
             cur.execute(
                 """
                 UPDATE jobs SET
@@ -1778,6 +1876,7 @@ class BridgeStore:
                 """,
                 (record.job_id, self.max_stored_jobs),
             )
+            return outcome
 
     def delete_aborted_queued_job(self, job_id: str, *, lock_timeout: float = 2.0) -> bool:
         """Remove a queued job row whose submission was cancelled before execution started."""

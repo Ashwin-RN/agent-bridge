@@ -51,7 +51,7 @@ from agent_bridge.runners import CodexRunner, NeonRunner, prepare_job_worktree
 ALL_BACKENDS: tuple[str, ...] = ("neon", "codex", "claude")
 # Backends whose edit jobs can run in a Git worktree the bridge makes for them.
 WORKTREE_BACKENDS: frozenset[str] = frozenset({"codex", "claude"})
-from agent_bridge.storage import BridgeStore, UsagePeriod, is_sqlite_lock_error
+from agent_bridge.storage import BridgeStore, SessionHeldError, UsagePeriod, is_sqlite_lock_error
 
 logger = logging.getLogger("agent_bridge.jobs")
 
@@ -190,6 +190,10 @@ class JobManager:
         self._session_waiters: dict[tuple[str, str], set[asyncio.Event]] = {}
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
         self._finalize_retry_seconds: float = 15.0
+        # A final write that fails with something other than a lock: first delay and the cap, in seconds.
+        self._finalize_error_backoff: tuple[float, float] = (0.5, 30.0)
+        # Set at shutdown, so that every result not yet stored is tried once more without waiting.
+        self._flush_final_writes = asyncio.Event()
         # Tasks the manager owns rather than the request that started them, such as a cancel that must
         # finish after its caller has gone. Kept here until they end; shutdown waits for them.
         self._owned_tasks: set[asyncio.Task[Any]] = set()
@@ -884,12 +888,18 @@ class JobManager:
         touched_provider: bool | None = None,
         attempts: list[dict[str, Any]] | None = None,
     ) -> bool:
-        """Persist terminal job state idempotently off the event loop, retaining result & claim until committed."""
+        """Persist terminal job state idempotently off the event loop, retaining result & claim until committed.
+
+        A lock is retried quickly. Any other storage error is retried too, with a growing delay, for as
+        long as this window lives, and once more at shutdown: meanwhile the result is kept in memory,
+        where this window's readers see it, and the session claim stays held.
+        """
         # Mark finalizing immediately so `cancel()` and `shutdown()` wait for this commit instead of cancelling it!
         self._finalizing_records[record.job_id] = record
+        stalled = asyncio.Event()  # set once a write has failed with something other than a lock
 
-        async def _try_commit_once(lock_timeout: float) -> tuple[bool, bool]:
-            """Return `(committed, retryable)`."""
+        async def _try_commit_once(lock_timeout: float) -> tuple[bool, str | None]:
+            """Return `(committed, error)`: error is None, "lock", or the text of any other failure."""
             try:
                 await self._db(
                     self.store.finalize_job,
@@ -900,22 +910,27 @@ class JobManager:
                     attempts=attempts,
                     lock_timeout=lock_timeout,
                 )
-                return True, False
+                return True, None
             except Exception as exc:
                 if is_sqlite_lock_error(exc):
-                    return False, True
-                logger.warning("Unexpected error finalizing job %s: %s", record.job_id, exc)
-                return False, False
+                    return False, "lock"
+                return False, f"{type(exc).__name__}: {exc}"
 
         async def _commit_loop() -> bool:
             delay = 0.08
+            error_delay, error_delay_max = self._finalize_error_backoff
+            failures = 0
             first_attempt = True
             try:
                 while True:
-                    committed, retryable = await _try_commit_once(
+                    committed, error = await _try_commit_once(
                         lock_timeout=0.35 if first_attempt else 0.8
                     )
                     if committed:
+                        if failures:
+                            logger.warning(
+                                "Stored the result of job %s after %d failed write(s).", record.job_id, failures
+                            )
                         self._terminal_uncommitted.pop(record.job_id, None)
                         self._uncommitted_session_ids.discard(record.job_id)
                         self._finalizing_records.pop(record.job_id, None)
@@ -926,14 +941,27 @@ class JobManager:
                         if task_ref is None or task_ref.done():
                             self._cleanup_local_job(record.job_id)
                         return True
-                    if not retryable:
-                        return False
-                    # Lock contention detected: expose full terminal result in RAM while holding session_claims!
+                    # Not stored yet: expose the full terminal result in RAM while holding session_claims!
                     self._terminal_uncommitted[record.job_id] = record
                     self._local_jobs[record.job_id] = record
                     first_attempt = False
-                    await asyncio.sleep(delay)
-                    delay = min(0.4, delay * 1.5)
+                    if error == "lock":
+                        await asyncio.sleep(delay)
+                        delay = min(0.4, delay * 1.5)
+                        continue
+                    failures += 1
+                    stalled.set()
+                    logger.warning(
+                        "Could not store the result of job %s (%s). It is kept in memory, where this window "
+                        "still reports it, its session stays claimed, and the write is tried again in "
+                        "%.1fs (failed write %d) and once more at shutdown.",
+                        record.job_id,
+                        error,
+                        error_delay,
+                        failures,
+                    )
+                    await self._wait_before_final_write_retry(error_delay)
+                    error_delay = min(error_delay_max, error_delay * 2)
             finally:
                 if self._pending_finalizations.get(record.job_id) is asyncio.current_task():
                     self._pending_finalizations.pop(record.job_id, None)
@@ -943,18 +971,39 @@ class JobManager:
             fin_task = asyncio.create_task(_commit_loop(), name=f"finalize-{record.job_id}")
             self._pending_finalizations[record.job_id] = fin_task
 
-        # Fast-path wait: if SQLite is uncontended, finishes immediately without exposing `_terminal_uncommitted`.
-        done, _ = await asyncio.wait({fin_task}, timeout=0.35)
-        if fin_task in done:
-            return bool(fin_task.result()) if not fin_task.cancelled() and fin_task.exception() is None else False
+        def _committed(task: asyncio.Task[Any]) -> bool:
+            return bool(task.result()) if not task.cancelled() and task.exception() is None else False
 
-        # Delayed write or lock contention: expose terminal result in RAM while continuing to wait (uncancelled!).
-        self._terminal_uncommitted[record.job_id] = record
-        self._local_jobs[record.job_id] = record
-        done2, _ = await asyncio.wait({fin_task}, timeout=max(0.2, self._finalize_retry_seconds))
-        if fin_task in done2:
-            return bool(fin_task.result()) if not fin_task.cancelled() and fin_task.exception() is None else False
-        return False
+        # Fast-path wait: if SQLite is uncontended, finishes immediately without exposing `_terminal_uncommitted`.
+        stalled_wait = asyncio.create_task(stalled.wait())
+        try:
+            done, _ = await asyncio.wait({fin_task, stalled_wait}, timeout=0.35, return_when=asyncio.FIRST_COMPLETED)
+            if fin_task in done:
+                return _committed(fin_task)
+            # Delayed write or lock contention: expose terminal result in RAM while continuing to wait
+            # (uncancelled!). A write that fails for another reason is left to retry in the background.
+            self._terminal_uncommitted[record.job_id] = record
+            self._local_jobs[record.job_id] = record
+            if stalled.is_set():
+                return False
+            done2, _ = await asyncio.wait(
+                {fin_task, stalled_wait},
+                timeout=max(0.2, self._finalize_retry_seconds),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if fin_task in done2:
+                return _committed(fin_task)
+            return False
+        finally:
+            stalled_wait.cancel()
+
+    async def _wait_before_final_write_retry(self, delay: float) -> None:
+        """Sleep `delay`, or less once shutdown has asked every unstored result to be tried at once."""
+        if self._flush_final_writes.is_set():
+            await asyncio.sleep(min(delay, 0.25))
+            return
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._flush_final_writes.wait(), timeout=delay)
 
     async def _execute(
         self,
@@ -1421,6 +1470,44 @@ class JobManager:
             )
             record.cleanup_seconds = cleanup_secs
             record.last_activity = "timed_out"
+            final_attempts = _attach_interrupted_attempts()
+            finalized_committed = await self._finalize_job_durable(
+                record,
+                request_session_id=request.session_id,
+                touched_provider=record.provider_invoked,
+                attempts=final_attempts,
+            )
+            return
+        except SessionHeldError as exc:
+            # The CLI reported a session another job holds and has not ended. Two turns must not run on one
+            # session, so this run was stopped; it records neither that session nor anything about it.
+            work_stop_wall = time.time()
+            c0 = time.monotonic()
+            stopped = await tracker.terminate_all_and_verify()
+            cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
+            await _drain_progress(cancel_session_claims=True)
+            record.session_id = request.session_id
+            self._uncommitted_session_ids.discard(record.job_id)
+            record.status = "failed"
+            record.failure_reason = "cli_error"
+            record.provider_state = "stopped" if stopped else "possibly_running"
+            record.error = (
+                f"The CLI reported session {exc.session_id!r}, which job {exc.holder_job_id!r} holds and has "
+                "not ended. Two turns must not run on one session at once, so this job was stopped, and that "
+                "session is not recorded on it."
+            )
+            record.retry_guidance = (
+                f"Wait for job {exc.holder_job_id!r} to end, then pass resume_from={exc.session_id!r} if this "
+                "turn was meant to continue that session. For edit tasks inspect git status/diff first."
+            )
+            record.finished_at = time.time()
+            record.duration_seconds = (
+                round(max(0.0, work_stop_wall - record.started_at), 2)
+                if record.started_at is not None
+                else 0.0
+            )
+            record.cleanup_seconds = cleanup_secs
+            record.last_activity = "failed"
             final_attempts = _attach_interrupted_attempts()
             finalized_committed = await self._finalize_job_durable(
                 record,
@@ -2224,6 +2311,8 @@ class JobManager:
             )
 
         # 2. Wait for BOTH in-progress finalizing job tasks AND background finalization/cleanup tasks!
+        # A result whose write failed is tried once more now, without waiting out its delay.
+        self._flush_final_writes.set()
         dl = time.monotonic() + max(0.5, flush_timeout)
         while True:
             wait_tasks = [
@@ -2249,7 +2338,11 @@ class JobManager:
             except Exception:
                 pass
         else:
+            unstored = sorted({*self._terminal_uncommitted, *self._finalizing_records})
             logger.warning(
-                "Shutdown flush timeout reached with %d uncommitted terminal job(s); skipping mark_owner_exited.",
-                len(self._terminal_uncommitted) or len(self._finalizing_records),
+                "Shutdown: the result of %d job(s) could not be stored (%s); their rows still read queued or "
+                "running, and the next window to look will mark them failed with owner_exited. Skipping "
+                "mark_owner_exited.",
+                len(unstored),
+                ", ".join(unstored),
             )

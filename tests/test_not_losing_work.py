@@ -428,3 +428,143 @@ async def test_cancel_keeps_possibly_running_from_an_agy_result_that_ended_as_th
         }
     finally:
         await manager.shutdown()
+
+
+# --- 5. Fenced final writes ---
+
+
+def _quick_codex(tmp_path: Path, *, thread_id: str = "thr-quick", sleep_for: dict[str, float] | None = None) -> Path:
+    """A Codex stand-in that starts `thread_id`, works for `sleep_for[prompt]` seconds, then answers."""
+    script = tmp_path / "codex_quick.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "prompt = sys.stdin.read().strip()\n"
+        f"print(json.dumps({{'type': 'thread.started', 'thread_id': {thread_id!r}}}), flush=True)\n"
+        f"time.sleep({sleep_for or {}!r}.get(prompt, 0))\n"
+        "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'OK:' + prompt}}), flush=True)\n"
+        "print(json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 5, 'output_tokens': 2}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+def _claims_of(manager: JobManager, job_id: str) -> list[tuple[str, str]]:
+    conn = sqlite3.connect(manager.store.db_path)
+    try:
+        return conn.execute(
+            "SELECT backend, session_id FROM session_claims WHERE job_id = ?", (job_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+async def test_finalize_never_writes_a_different_outcome_over_a_stored_result(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from agent_bridge.storage import BridgeStore
+
+    store = BridgeStore(tmp_path / "state")
+    store.register_owner("win", 1)
+    record = JobRecord(
+        job_id="codex-0000feed", owner_id="win", backend="codex", cwd=str(tmp_path), mode="read_only",
+        requested_model=None, model="m", prompt_preview="p", status="running", started_at=time.time(),
+        provider_invoked=True,
+    )
+    store.insert_job(record)
+    done = replace(record, status="completed", response="the answer", finished_at=time.time(), duration_seconds=1.0)
+    assert store.finalize_job(done) == "written"
+    late = replace(
+        record, status="cancelled", failure_reason="cancelled", provider_state="stopped", error="Job cancelled.",
+        finished_at=time.time(), duration_seconds=2.0,
+    )
+    assert store.finalize_job(late) == "kept"
+    stored = store.get_job(record.job_id)
+    assert stored is not None
+    assert (stored.status, stored.failure_reason, stored.response) == ("completed", None, "the answer")
+    # The same outcome may be written again, as a retried write would.
+    assert store.finalize_job(done) == "written"
+
+
+async def test_a_final_write_that_fails_is_kept_and_retried_until_it_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _quick_codex(tmp_path)))
+    manager._finalize_error_backoff = (0.05, 0.2)
+    real_finalize = manager.store.finalize_job
+    failures = 0
+
+    def finalize_job(record: JobRecord, **kwargs: object) -> str:
+        nonlocal failures
+        if failures < 3:
+            failures += 1
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return real_finalize(record, **kwargs)
+
+    monkeypatch.setattr(manager.store, "finalize_job", finalize_job)
+    try:
+        with caplog.at_level(logging.WARNING, logger="agent_bridge.jobs"):
+            rec = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
+            # Readable at once from this window, whether or not the row has landed yet.
+            assert (rec.status, rec.response) == ("completed", "OK:go")
+            async with asyncio.timeout(10):
+                while manager.store.get_job(rec.job_id).status != "completed":
+                    await asyncio.sleep(0.05)
+        assert failures == 3
+        assert manager.store.get_job(rec.job_id).response == "OK:go"
+        assert _claims_of(manager, rec.job_id) == []  # its session claim went with the write
+        assert "Could not store the result of job" in caplog.text and "tried again" in caplog.text
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_final_write_still_failing_is_tried_once_more_at_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _quick_codex(tmp_path)))
+    manager._finalize_error_backoff = (600.0, 600.0)  # only the retry at shutdown can land it
+    real_finalize = manager.store.finalize_job
+    broken = True
+
+    def finalize_job(record: JobRecord, **kwargs: object) -> str:
+        if broken:
+            raise sqlite3.DatabaseError("disk I/O error")
+        return real_finalize(record, **kwargs)
+
+    monkeypatch.setattr(manager.store, "finalize_job", finalize_job)
+    rec = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
+    assert rec.status == "completed"
+    assert manager.store.get_job(rec.job_id).status == "running"  # not stored yet
+    broken = False
+    await asyncio.wait_for(manager.shutdown(), timeout=30)
+    stored = manager.store.get_job(rec.job_id)
+    assert stored is not None and (stored.status, stored.response) == ("completed", "OK:go")
+
+
+async def test_a_turn_revealing_a_session_another_live_job_holds_is_stopped_and_does_not_take_it(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    script = _quick_codex(tmp_path, thread_id="thr-shared", sleep_for={"A": 5.0, "B": 5.0})
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, script))
+    try:
+        first = await manager.start_async(manager.prepare_request(backend="codex", prompt="A"))
+        async with asyncio.timeout(15):
+            while manager.store.get_job(first.job_id).session_id != "thr-shared":
+                await asyncio.sleep(0.05)
+        second = await manager.run(manager.prepare_request(backend="codex", prompt="B"))
+        assert second.status == "failed"
+        assert second.failure_reason == "cli_error"
+        assert second.error is not None and first.job_id in second.error and "thr-shared" in second.error
+        assert second.session_id is None
+        assert manager.store.get_job(second.job_id).session_id is None
+        assert (second.duration_seconds or 0) < 4.0  # stopped, not left to run its five seconds
+        # The holder is untouched: it keeps its claim while it runs, and ends normally.
+        assert _claims_of(manager, first.job_id) == [("codex", "thr-shared")]
+        [done] = await manager.wait_for([first.job_id], wait_seconds=20)
+        assert (done.status, done.session_id, done.response) == ("completed", "thr-shared", "OK:A")
+    finally:
+        await manager.shutdown()
