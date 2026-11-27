@@ -8,8 +8,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from agent_bridge.models import JobRecord
 from agent_bridge.storage import BridgeStore
+
+from test_surface import _bridge, _call
 
 NOW = 1_800_000_000.0
 
@@ -128,6 +132,86 @@ def test_a_job_that_completed_with_an_empty_reply_carries_a_warning() -> None:
     assert "empty reply" in _job(response="  \n", response_chars=3).to_detail(now=NOW)["warning"]
     assert "warning" not in _job().to_detail(now=NOW)
     assert "warning" not in _job(status="failed", response="").to_detail(now=NOW)
+
+
+async def test_jobs_writes_the_full_stored_reply_and_returns_a_small_entry(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        expected = ("  \u00e9\r\nx" + "0123456789" * 4500)[:45_000]
+        record = _job(owner_id=manager.owner_id, response=expected, response_chars=len(expected))
+        manager.store.insert_job(record)
+        manager.store.finalize_job(record)
+        path = manager.settings.state_dir / "replies" / f"{record.job_id}.md"
+        for _ in range(2):
+            out = await _call(mcp, "jobs", {
+                "job_ids": [record.job_id], "response_file": True, "response_offset": 2, "response_chars": 3,
+            })
+            [reply] = out["jobs"]
+            assert reply["response_file"] == str(path.absolute())
+            assert path.read_bytes().decode("utf-8") == expected
+            assert reply["response_head"] == expected[:400] and reply["response_total_chars"] == 45_000
+            assert not {"response", "response_truncated", "response_offset", "next_offset", "response_note"} & reply.keys()
+            assert len(json.dumps(reply, ensure_ascii=False, separators=(",", ":"))) < 1_000
+            path.write_text("stale", encoding="utf-8")
+    finally:
+        await manager.shutdown()
+
+
+async def test_waited_run_can_write_its_reply_to_a_file(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        reply = await _call(mcp, "run", {
+            "backend": "codex", "prompt": "hello", "wait_seconds": 10, "response_file": True,
+        })
+        assert reply["status"] == "completed"
+        assert reply["response_head"] == "OK:hello" and reply["response_total_chars"] == 8
+        assert Path(reply["response_file"]).read_text(encoding="utf-8") == "OK:hello"
+        assert "response" not in reply
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize("unsafe_id", [False, True], ids=["write-failure", "unsafe-id"])
+async def test_response_file_falls_back_to_the_normal_page(tmp_path: Path, unsafe_id: bool) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        job_id = "../escape" if unsafe_id else "codex-1a2b3c4d"
+        record = _job(job_id=job_id, owner_id=manager.owner_id)
+        manager.store.insert_job(record)
+        manager.store.finalize_job(record)
+        replies = manager.settings.state_dir / "replies"
+        if not unsafe_id:
+            replies.write_text("blocks directory creation", encoding="utf-8")
+        args = {"job_ids": [job_id], "response_offset": 2, "response_chars": 3}
+        [paged] = (await _call(mcp, "jobs", args))["jobs"]
+        [reply] = (await _call(mcp, "jobs", {**args, "response_file": True}))["jobs"]
+        warning = reply.pop("warning")
+        assert "reply" in warning and len(warning.splitlines()) == 1
+        assert {k: v for k, v in reply.items() if k != "line"} == {
+            k: v for k, v in paged.items() if k != "line"
+        }
+        assert not (manager.settings.state_dir / "escape.md").exists()
+    finally:
+        await manager.shutdown()
+
+
+async def test_response_file_leaves_running_and_empty_replies_alone(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        running = await _call(mcp, "run", {"backend": "codex", "prompt": "SLEEP:10 hold"})
+        empty_job = _job(owner_id=manager.owner_id, response="", response_chars=0)
+        manager.store.insert_job(empty_job)
+        manager.store.finalize_job(empty_job)
+        out = await _call(mcp, "jobs", {
+            "job_ids": [running["job_id"], empty_job.job_id], "response_file": True,
+        })
+        live, empty = out["jobs"]
+        assert live["status"] == "running" and "response" not in live
+        assert empty["response"] == "" and "empty reply" in empty["warning"]
+        assert not any("response_file" in job for job in out["jobs"])
+        assert not (manager.settings.state_dir / "replies").exists()
+    finally:
+        await manager.shutdown()
 
 
 def test_a_background_receipt_is_small() -> None:

@@ -12,9 +12,11 @@ import asyncio
 import functools
 import logging
 import sys
+import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -22,8 +24,10 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from agent_bridge import host_limits
 from agent_bridge.config import EffortLevel, Settings, normalize_backend
-from agent_bridge.jobs import ALL_BACKENDS, JobManager
+from agent_bridge.hosts import Host
+from agent_bridge.jobs import ALL_BACKENDS, JobManager, _JOB_ID_RE
 from agent_bridge.mcp_tasks import TASK_CALL, JobTasks, JobView, pump_progress
 from agent_bridge.model_resolver import ModelPoolUnavailableError
 from agent_bridge.models import DEFAULT_RESPONSE_CHARS, JobRecord
@@ -32,11 +36,12 @@ from agent_bridge.quota import build_quota_view
 from agent_bridge.status_text import format_summary_line
 
 UsagePeriodName = Literal["today", "7d", "30d", "all", "session"]
+ResponseFile = Annotated[bool, Field(description="Save the finished reply to a file and return a preview.")]
 
 # The longest a call may wait, whatever it asks for. Hosts cut tool calls at 60 to 180 seconds.
 MAX_WAIT_SECONDS = 300
-# The wait a receipt's `next` call suggests: under the shortest host limit known.
-NEXT_WAIT_SECONDS = 50
+# The suggested wait when the host has no known cap.
+FALLBACK_NEXT_WAIT_SECONDS = 50
 # How often a waiting call reports progress, and re-reads a job another window runs.
 PROGRESS_INTERVAL_SECONDS = 5.0
 
@@ -50,7 +55,8 @@ checks the CLIs. Default mode is read_only. `completed` only means a job ended: 
 
 - Fan out by calling `run` once per job, in parallel, routed by the `order` of `usage(quota=True)`.
 - Collect a job with the call in its receipt's `next`: `jobs(job_ids=[...], wait_seconds=...)`. A \
-long reply comes in pages; call again with the `next_offset` it gives.
+long reply comes in pages; call again with the `next_offset` it gives. `response_file=True` keeps a \
+long reply out of the conversation.
 - `resume_from` takes a job_id or session_id and inherits cwd, worktree, model, effort and \
 parent_run. Pass `cwd` on new jobs only.
 - `mode="edit"` lets a job change files; `worktree=True` (codex, claude) gives it its own Git worktree.
@@ -86,8 +92,8 @@ USAGE_DESCRIPTION = (
     "its figures. `backend`, `cwd` and `parent_run` filter the summary view."
 )
 BACKENDS_DESCRIPTION = (
-    "Each CLI's health and version, the backend defaults, agy's model shortcuts, and whether this "
-    "bridge runs inside a bridge job. `refresh_models` reads agy's model list again."
+    "Each CLI's health and version, backend defaults, agy's model shortcuts, the host and its wait cap "
+    "in seconds, and whether the bridge is nested. `refresh_models` reads agy's model list again."
 )
 
 
@@ -100,20 +106,31 @@ class Review(BaseModel):
     focus: str | None = None
 
 
-def _effective_wait(wait_seconds: int | None) -> int:
-    """How long a call may wait, in whole seconds: the one place a wait is bounded, for `run` and `jobs`.
+def _read_host_limits(client_name: str | None) -> tuple[Host | None, int | None]:
+    host = host_limits.identify_host(client_name)
+    return host, host_limits.wait_cap_seconds(host)
 
-    A cap for the host that is calling belongs here, so that every wait obeys it.
-    """
+
+def _next_call(job_id: str, wait_cap: int | None, *, response_file: bool) -> str:
+    wait = min(MAX_WAIT_SECONDS, FALLBACK_NEXT_WAIT_SECONDS if wait_cap is None else wait_cap)
+    file_arg = ", response_file=True" if response_file else ""
+    return f"jobs(job_ids=['{job_id}'], wait_seconds={wait}{file_arg})"
+
+
+def _write_reply_file(state_dir: Path, record: JobRecord) -> str:
+    if not _JOB_ID_RE.fullmatch(record.job_id):
+        raise ValueError("Invalid job ID")
+    path = (state_dir / "replies" / f"{record.job_id}.md").absolute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = tempfile.NamedTemporaryFile(dir=path.parent, delete=False)
+    temp_path = Path(temp.name)
     try:
-        asked = int(wait_seconds or 0)
-    except (TypeError, ValueError):
-        asked = 0
-    return max(0, min(asked, MAX_WAIT_SECONDS))
-
-
-def _next_call(job_id: str) -> str:
-    return f"jobs(job_ids=['{job_id}'], wait_seconds={_effective_wait(NEXT_WAIT_SECONDS)})"
+        with temp:
+            temp.write(record.response.encode("utf-8"))
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return str(path)
 
 
 def _build_review_prompt(
@@ -296,6 +313,34 @@ def create_server(
     job_manager = manager or JobManager(cfg)
     nest = nesting if nesting is not None else _detect_nesting(job_manager)
     job_manager.nesting = nest
+    host_lookup: asyncio.Task[tuple[Host | None, int | None]] | None = None
+    capped_wait: asyncio.Task[tuple[int, str | None]] | None = None
+
+    async def _host_details(ctx: Context) -> tuple[Host | None, int | None]:
+        nonlocal host_lookup
+        if host_lookup is None:
+            try:
+                params = ctx.session.client_params
+            except ValueError:  # A direct tool call has no MCP session.
+                params = None
+            client_name = params.client_info.name if params else None
+            host_lookup = asyncio.create_task(asyncio.to_thread(_read_host_limits, client_name))
+        return await asyncio.shield(host_lookup)
+
+    async def _effective_wait(ctx: Context, wait_seconds: int) -> tuple[int, str | None]:
+        """Apply the same wait bounds to run and jobs."""
+        nonlocal capped_wait
+        if wait_seconds <= 0:
+            return 0, None
+        host, cap = await _host_details(ctx)
+        if cap is not None and cap <= MAX_WAIT_SECONDS and wait_seconds > cap:
+            # A host's cap and its notice apply to any wait shortened by that cap.
+            if capped_wait is None:
+                capped_wait = asyncio.create_task(asyncio.to_thread(host_limits.cap_wait, wait_seconds, host))
+            return await asyncio.shield(capped_wait)
+        if wait_seconds > MAX_WAIT_SECONDS:
+            return MAX_WAIT_SECONDS, f"Wait capped at {MAX_WAIT_SECONDS} s."
+        return wait_seconds, None
 
     def _refuse_if_nested(tool: str) -> None:
         nest = job_manager.nesting
@@ -304,15 +349,28 @@ def create_server(
         if nest.nested:
             raise NestedBridgeError(nest.refusal(tool))
 
-    def _reply(
+    async def _reply(
         record: JobRecord,
         *,
         response_offset: int = 0,
         response_chars: int = DEFAULT_RESPONSE_CHARS,
+        response_file: bool = False,
         verbose: bool = False,
     ) -> dict[str, Any]:
         """The one full reply about a job: a waited `run`, `jobs`, `cancel` and a finished task row."""
-        return record.to_detail(response_offset=response_offset, response_chars=response_chars, verbose=verbose)
+        path = None
+        warning = None
+        if response_file and record.is_terminal and record.response:
+            try:
+                path = await asyncio.to_thread(_write_reply_file, job_manager.settings.state_dir, record)
+            except (OSError, ValueError):
+                warning = "Could not write reply file. Returning the paged reply."
+        reply = record.to_detail(
+            response_offset=response_offset, response_chars=response_chars, response_file=path, verbose=verbose,
+        )
+        if warning:
+            reply["warning"] = warning
+        return reply
 
     def _start_progress(ctx: Context, job_ids: list[str], stop: asyncio.Event) -> asyncio.Task[None]:
         return asyncio.create_task(_report_while_waiting(ctx, _LiveLines(job_manager, job_ids), stop))
@@ -338,7 +396,7 @@ def create_server(
             line=record.line(),
             created_at=record.created_at,
             updated_at=updated,
-            detail=_reply(record) if record.is_terminal else None,
+            detail=await _reply(record) if record.is_terminal else None,
         )
 
     job_tasks = JobTasks({"run"}, _job_id_from_result, _task_view, job_manager.cancel)
@@ -390,6 +448,7 @@ def create_server(
         effort: EffortLevel | None = None,
         timeout_seconds: Annotated[int | None, Field(description="The job's own deadline.")] = None,
         wait_seconds: Annotated[int, Field(description="Wait up to this long before answering (max 300).")] = 0,
+        response_file: ResponseFile = False,
         resume_from: Annotated[str | None, Field(description="A prior job_id or session_id.")] = None,
         worktree: Annotated[bool, Field(description="codex/claude edit jobs: own Git worktree.")] = False,
         extra_dirs: list[str] | None = None,
@@ -429,7 +488,9 @@ def create_server(
             **fields,
         )
         # A host that shows the call as a task row collects the job through the task, never by waiting.
-        wait = 0 if TASK_CALL.get() else _effective_wait(wait_seconds)
+        as_task = TASK_CALL.get()
+        wait, wait_note = (0, None) if as_task else await _effective_wait(ctx, wait_seconds)
+        _, cap = (None, None) if as_task else await _host_details(ctx)
         stop = asyncio.Event()
         progress: list[asyncio.Task[None]] = []
 
@@ -444,8 +505,16 @@ def create_server(
             for task in progress:
                 task.cancel()
         if record.is_terminal and wait > 0:
-            return _reply(record)
-        return record.to_receipt(timeout_seconds=req.timeout_seconds, next_call=_next_call(record.job_id))
+            reply = await _reply(record, response_file=response_file)
+        else:
+            reply = record.to_receipt(
+                timeout_seconds=req.timeout_seconds,
+                next_call=_next_call(record.job_id, cap, response_file=response_file),
+            )
+        # The note says the job is still running, so it goes only on a wait that ended before the job did.
+        if wait_note and not record.is_terminal:
+            reply["wait_note"] = wait_note
+        return reply
 
     @mcp.tool(
         name="jobs",
@@ -460,6 +529,7 @@ def create_server(
         wait_mode: Literal["all", "any"] = "all",
         response_offset: int = 0,
         response_chars: Annotated[int, Field(description="Max 100000.")] = DEFAULT_RESPONSE_CHARS,
+        response_file: ResponseFile = False,
         verbose: Annotated[bool, Field(description="Add provider metrics and attempts.")] = False,
         status: str | None = None,
         backend: str | None = None,
@@ -470,7 +540,7 @@ def create_server(
         if job_ids:
             if response_offset < 0:
                 raise ValueError("response_offset cannot be negative.")
-            wait = _effective_wait(wait_seconds)
+            wait, wait_note = await _effective_wait(ctx, wait_seconds)
             missing: list[str] = []
             stop = asyncio.Event()
             progress = _start_progress(ctx, job_ids, stop) if wait > 0 else None
@@ -483,10 +553,13 @@ def create_server(
                 if progress is not None:
                     progress.cancel()
             details = {
-                r.job_id: _reply(r, response_offset=response_offset, response_chars=response_chars, verbose=verbose)
+                r.job_id: await _reply(
+                    r, response_offset=response_offset, response_chars=response_chars,
+                    response_file=response_file, verbose=verbose,
+                )
                 for r in records
             }
-            return {
+            reply = {
                 "jobs": [
                     details[jid]
                     if jid in details
@@ -501,6 +574,10 @@ def create_server(
                 "all_done": all(r.is_terminal for r in records),
                 "any_done": any(r.is_terminal for r in records),
             }
+            waited_out = reply["any_done"] if wait_mode == "any" else reply["all_done"]
+            if wait_note and not waited_out:
+                reply["wait_note"] = wait_note
+            return reply
 
         summaries = await job_manager.list_jobs_async(
             limit=limit,
@@ -518,7 +595,8 @@ def create_server(
     )
     @_reported
     async def cancel(job_id: str) -> dict[str, Any]:
-        return _reply(await job_manager.cancel(job_id))
+        record = await job_manager.cancel(job_id)
+        return await _reply(record)
 
     @mcp.tool(
         name="usage",
@@ -570,7 +648,7 @@ def create_server(
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
     )
     @_reported
-    async def backends(refresh_models: bool = False) -> dict[str, Any]:
+    async def backends(ctx: Context, refresh_models: bool = False) -> dict[str, Any]:
         def _unhealthy(exc: Exception) -> dict[str, Any]:
             return {
                 "command_found": False,
@@ -646,10 +724,12 @@ def create_server(
                 **claude_health,
             }
 
-        neon_info, codex_info, claude_info = await asyncio.gather(
-            _probe_neon(), _probe_codex(), _probe_claude()
+        neon_info, codex_info, claude_info, (host, cap) = await asyncio.gather(
+            _probe_neon(), _probe_codex(), _probe_claude(), _host_details(ctx),
         )
         return {
+            "host": host.name if host is not None else None,
+            "wait_cap": cap,
             "default_cwd": str(cfg.default_cwd),
             "default_timeout_seconds": cfg.default_timeout_seconds,
             "max_concurrent_jobs_per_process": cfg.max_concurrent_jobs,

@@ -225,10 +225,11 @@ class JobRecord:
         *,
         response_offset: int = 0,
         response_chars: int = DEFAULT_RESPONSE_CHARS,
+        response_file: str | None = None,
         verbose: bool = False,
         now: float | None = None,
     ) -> dict[str, Any]:
-        """The full reply about one job, its text cut to `response_chars` from `response_offset`."""
+        """The full reply about one job, with paged text or a preview of the exported text."""
         out: dict[str, Any] = {
             "line": self.line(now=now),
             "job_id": self.job_id,
@@ -249,7 +250,13 @@ class JobRecord:
                 out[key] = value
         if self.effective_cwd and self.effective_cwd != self.cwd:
             out["effective_cwd"] = self.effective_cwd
-        if self.is_terminal or self.response:
+        if response_file is not None:
+            out.update(
+                response_file=response_file,
+                response_head=self.response[:400],
+                response_total_chars=len(self.response),
+            )
+        elif self.is_terminal or self.response:
             out.update(self._response_page(response_offset, response_chars))
         if self.usage:
             out["usage"] = self.usage if verbose else {

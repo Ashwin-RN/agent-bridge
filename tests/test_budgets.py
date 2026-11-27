@@ -7,6 +7,10 @@ of definitions (77 arguments), 3,492 of instructions, and about 1,800 for a fini
 from __future__ import annotations
 
 import json
+import os
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -51,6 +55,58 @@ def test_the_instructions_fit_and_their_first_512_characters_stand_alone() -> No
     ):
         assert needed in head, needed
     assert len(NESTED_INSTRUCTIONS) <= CODEX_KEEPS
+
+
+def test_tool_definitions_and_instructions_are_stable_across_processes(tmp_path: Path) -> None:
+    script = """
+import asyncio, json, os
+from agent_bridge.nesting import NOT_NESTED
+from agent_bridge.server import create_server
+
+async def main():
+    mcp, manager = create_server(nesting=NOT_NESTED)
+    try:
+        tools = [t.model_dump(by_alias=True, exclude_none=True, mode="json") for t in await mcp.list_tools()]
+        print(json.dumps([os.getpid(), json.dumps(tools, ensure_ascii=False), mcp.instructions]))
+    finally:
+        await manager.shutdown()
+
+asyncio.run(main())
+"""
+    snapshots = []
+    pids = []
+    for seed in ("1", "2"):
+        state = tmp_path / seed
+        env = dict(
+            os.environ,
+            PYTHONHASHSEED=seed,
+            AGENT_BRIDGE_STATE_DIR=str(state),
+            AGENT_BRIDGE_DEFAULT_CWD=str(tmp_path),
+            AGENT_BRIDGE_CODEX_MODEL=f"gpt-99.{seed}-sol",
+            AGENT_BRIDGE_CLAUDE_MODEL=f"claude-sonnet-99-{seed}",
+            AGENT_BRIDGE_NEON_MODEL=f"gemini-99.{seed}-pro",
+            AGENT_BRIDGE_AGY_BIN=str(tmp_path / "missing-agy"),
+            AGENT_BRIDGE_CODEX_BIN=str(tmp_path / "missing-codex"),
+            AGENT_BRIDGE_CLAUDE_BIN=str(tmp_path / "missing-claude"),
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], env=env, capture_output=True, check=True, timeout=30,
+        )
+        pid, tools, instructions = json.loads(result.stdout)
+        pids.append(pid)
+        snapshots.append((tools.encode("utf-8"), instructions.encode("utf-8")))
+
+    assert pids[0] != pids[1]
+    assert snapshots[0] == snapshots[1]
+    for data in snapshots[0]:
+        text = data.decode("utf-8").replace("\\\\", "\\")
+        assert not re.search(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{8}\b|\b\d{1,2}:\d{2}\b|\d\s*%", text)
+        assert not re.search(r"\b(?:gpt|gemini|claude(?:-\w+)?)-\d", text, re.I)
+        for pid in pids:
+            assert not re.search(rf"(?<!\d){pid}(?!\d)", text)
+        local_paths = (Path.home(), Path.cwd(), tmp_path)
+        for path in local_paths:
+            assert path.as_posix().casefold() not in text.replace("\\", "/").casefold()
 
 
 REVIEW_LINE = "1. src/agent_bridge/jobs.py:1291 labels a Codex model it never observed.\n"
