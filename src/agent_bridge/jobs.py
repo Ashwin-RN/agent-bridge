@@ -43,6 +43,7 @@ from agent_bridge.quota import (
     fetch_neon_quota,
     has_passed_reset,
     merge_claude_quota,
+    without_passed_windows,
 )
 from agent_bridge.runners import CodexRunner, NeonRunner, prepare_job_worktree
 
@@ -1980,14 +1981,12 @@ class JobManager:
         period: str | None = None,
         since: str | None = None,
         until: str | None = None,
-        quota: bool = True,
     ) -> dict[str, Any]:
         """What is left of each subscription, then what the bridge has run in a period; see `dashboard.py`.
 
         It writes nothing. A job left running by a window that has closed is not recovered here, as
         `get_usage` would: the dashboard lists it under "cannot tell" instead. The quota readings are a
         recent cached one where there is one, and otherwise read from each CLI and not stored.
-        `quota=False` starts no CLI and gives the records alone.
         """
         now_ts = time.time()
         window = resolve_window(period, since, until, now_ts=now_ts)
@@ -2001,26 +2000,24 @@ class JobManager:
             only_session=window.only_session,
             is_pid_alive_fn=self._is_pid_alive,
         )
-        readings: dict[str, Any] | None = None
-        if quota:
-            # Each backend on its own, so that one reading that fails does not take the others with it.
-            results = await asyncio.gather(
-                *(self.get_quota([name], store=False) for name in ALL_BACKENDS),
-                return_exceptions=True,
-            )
-            readings = {}
-            for name, result in zip(ALL_BACKENDS, results):
-                if isinstance(result, Exception):
-                    logger.debug("Could not read %s quota for the dashboard: %s", name, result)
-                    readings[name] = {
-                        "backend": name,
-                        "status": "unknown",
-                        "error": f"{type(result).__name__}: {result}",
-                    }
-                elif isinstance(result, BaseException):
-                    raise result
-                else:
-                    readings.update(result)
+        # Each backend on its own, so that one reading that fails does not take the others with it.
+        results = await asyncio.gather(
+            *(self.get_quota([name], store=False) for name in ALL_BACKENDS),
+            return_exceptions=True,
+        )
+        readings: dict[str, Any] = {}
+        for name, result in zip(ALL_BACKENDS, results):
+            if isinstance(result, Exception):
+                logger.debug("Could not read %s quota for the dashboard: %s", name, result)
+                readings[name] = {
+                    "backend": name,
+                    "status": "unknown",
+                    "error": f"{type(result).__name__}: {result}",
+                }
+            elif isinstance(result, BaseException):
+                raise result
+            else:
+                readings.update(result)
         return build_dashboard(records, window=window, owner_id=self.owner_id, now_ts=now_ts, quota=readings)
 
     def _build_quota_advisory(self, quota: dict[str, Any]) -> dict[str, Any]:
@@ -2067,9 +2064,11 @@ class JobManager:
         async def _probe_one(bname: str) -> tuple[str, dict[str, Any]]:
             if bname == "claude":
                 # Claude Code has no command that prints the plan limits. The reading is whatever the
-                # last Claude job's output carried, however old, until its reset time passes.
-                last = await self._db(self.store.get_cached_quota, "claude", float("inf"))
-                if last is None or has_passed_reset(last):
+                # Claude jobs' output carried, however old, each window until its own reset passes.
+                last = without_passed_windows(
+                    await self._db(self.store.get_cached_quota, "claude", float("inf"))
+                )
+                if last is None:
                     return bname, {
                         "backend": "claude",
                         "pool": "claude",

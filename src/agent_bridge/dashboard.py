@@ -102,14 +102,15 @@ _POOL_BACKEND: dict[str, str] = {
 }
 QUOTA_SOURCE = (
     "Read from each CLI, not from the bridge's records. Each pool carries the time it was read. The "
-    "Claude plan has no live read-out: its reading is what the last Claude job run through the bridge "
-    "reported."
+    "Claude plan has no live read-out: its reading is what the Claude jobs run through the bridge "
+    "reported, each window kept until its own reset, and its time is that of its oldest figure."
 )
 CLAUDE_NO_READING = "Claude Code prints none; it shows after a Claude job runs through the bridge"
 NO_PLAN_WINDOW = "the reading holds no 5h or weekly window"
 _AGY_POOLS: frozenset[str] = frozenset({"agy_gemini", "agy_claude_gpt"})
 CLAUDE_SHARED_NOTE = (
-    "Claude plan: as of its last bridge job. Your own Claude Code and claude.ai use draw on it too."
+    "Claude plan: as its bridge jobs reported it, at the read time or later. Your own Claude Code and "
+    "claude.ai use draw on it too."
 )
 BAR_WIDTH = 10
 REASON_LIMIT = 70
@@ -234,6 +235,7 @@ def _quota_window(win: dict[str, Any] | None) -> dict[str, Any] | None:
         "reset_time": win.get("reset_time"),
         "resets_in": countdown,
         "state": state,
+        "read_at": win.get("fetched_at"),  # set only when it was read at another time than the reading
     }
 
 
@@ -253,6 +255,17 @@ def _as_of(fetched_at: Any, *, now_ts: float) -> str | None:
         return None
     today = datetime.fromtimestamp(now_ts).astimezone().date()
     return taken.strftime("%H:%M") if taken.date() == today else taken.strftime("%m-%d %H:%M")
+
+
+def _oldest(times: list[Any]) -> str | None:
+    """The earliest of some ISO times, as it was given. One that cannot be read is passed over."""
+    read: list[tuple[datetime, str]] = []
+    for raw in times:
+        try:
+            read.append((datetime.fromisoformat(str(raw)).astimezone(), str(raw)))
+        except (TypeError, ValueError):
+            continue
+    return min(read)[1] if read else None
 
 
 def _short_reason(text: Any) -> str:
@@ -311,10 +324,15 @@ def build_quota_section(readings: dict[str, Any], *, now_ts: float) -> dict[str,
             continue
 
         priority = priorities.get(pool)
+        shown = [w for w in (week, five) if w is not None]
+        for w in shown:
+            w["read_at"] = w["read_at"] or reading.get("fetched_at")
+        # A pool is as fresh as its oldest figure.
+        read_at = _oldest([w["read_at"] for w in shown])
         entry.update(
             status="ok",
-            as_of=_as_of(reading.get("fetched_at"), now_ts=now_ts),
-            read_at=reading.get("fetched_at"),
+            as_of=_as_of(read_at, now_ts=now_ts),
+            read_at=read_at,
             source="last_claude_job" if backend == "claude" else ("cached" if reading.get("cached") else "live"),
             five_hour=five,
             weekly=week,
@@ -322,7 +340,6 @@ def build_quota_section(readings: dict[str, Any], *, now_ts: float) -> dict[str,
         )
         pools.append(entry)
 
-        shown = [w for w in (week, five) if w is not None]
         tight = min(shown, key=lambda w: w["remaining_percent"])
         if priority == "stale" or any(w["state"] == "reset_passed" for w in shown):
             notes.append(f"{label}: a reset time in this reading has passed, so it is out of date.")
@@ -362,7 +379,7 @@ def build_dashboard(
 ) -> dict[str, Any]:
     """Turn the rows from `BridgeStore.dashboard_records` into the dashboard, text view included.
 
-    `quota` is the readings from `JobManager.get_quota`; None leaves the quota section out.
+    `quota` is the readings from `JobManager.get_quota`. Without it the view has no quota section.
     """
     total = _bucket()
     by_backend: dict[str, dict[str, Any]] = {name: _bucket() for name in BACKENDS}

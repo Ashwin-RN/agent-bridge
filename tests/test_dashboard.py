@@ -34,6 +34,7 @@ from agent_bridge.nesting import Nesting
 from agent_bridge.quota import (
     claude_quota_from_rate_limit,
     enrich_quota_reading,
+    merge_claude_quota,
     parse_codex_rate_limits,
     parse_neon_usage_envelope,
 )
@@ -657,23 +658,6 @@ async def test_a_quota_reading_taken_for_the_view_is_not_stored_and_a_fresh_cach
     await manager.shutdown()
 
 
-async def test_quota_false_starts_no_cli_and_gives_the_records_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    manager = _manager(tmp_path)
-    calls = _stand_in_clis(manager, monkeypatch)
-    _finish(manager, "codex-a", tokens=7)
-    mcp, _ = create_server(settings=manager.settings, manager=manager)
-
-    raw = await mcp.call_tool("usage_dashboard", {"period": "all", "quota": False})
-    d = raw[1] if isinstance(raw, tuple) else json.loads(raw.content[0].text)
-
-    assert calls == {"codex": 0, "agy": 0}
-    assert d["quota"] is None and "QUOTA LEFT" not in d["text"]
-    assert _total(d["totals"]) == 7 and d["text"].splitlines()[2].startswith("USED THROUGH THE BRIDGE")
-    await manager.shutdown()
-
-
 async def test_the_text_lists_models_under_their_pool_and_only_the_caveats_that_hold_something(
     tmp_path: Path,
 ) -> None:
@@ -747,13 +731,20 @@ async def test_quota_readings_change_no_total_and_a_bad_period_or_one_failing_cl
     _finish(manager, "codex-a", tokens=1000)
     _finish(manager, "codex-b", status="cancelled", tokens=None, usage_status="missing")
 
-    with_quota = await manager.usage_dashboard(period="all")
-    without = await manager.usage_dashboard(period="all", quota=False)
+    read = await manager.usage_dashboard(period="all")
+    assert all(p["status"] == "ok" for p in list(_pools(read).values())[:3])
 
-    # The readings are shown beside the records and added to nothing.
+    # The readings are shown beside the records and added to nothing: with every pool read, the
+    # figures are the ones the records alone give.
+    records = manager.store.dashboard_records(
+        since_ts=None, until_ts=None, session_owner_id=ME, only_session=False, is_pid_alive_fn=lambda _pid: True
+    )
+    alone = build_dashboard(records, window=resolve_window("all", None, None, now_ts=time.time()), owner_id=ME,
+                            now_ts=time.time())
+    assert alone["quota"] is None and "QUOTA LEFT" not in alone["text"]
     for key in ("totals", "by_backend", "by_quota_pool", "by_model", "not_in_totals", "counted_as_nothing_spent"):
-        assert with_quota[key] == without[key], key
-    assert _total(with_quota["totals"]) == 1000
+        assert read[key] == alone[key], key
+    assert _total(read["totals"]) == 1000
 
     # A period that is refused is refused before any CLI is asked.
     asked = dict(calls)
@@ -882,3 +873,47 @@ def test_a_period_with_time_but_no_finished_run_is_not_called_empty() -> None:
     text = render_text(view)
     assert "no runs in this period" not in text
     assert _line(text, "  total").split() == ["total", "0", "0", "5s"]
+
+
+async def test_a_claude_window_is_kept_until_its_own_reset_and_carries_its_own_read_time(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    three_days_ago = (datetime.now().astimezone() - timedelta(days=3)).isoformat(timespec="seconds")
+    week = claude_quota_from_rate_limit(
+        {"unifiedWindows": {"seven_day": {"utilization": 0.4, "resetsAt": _from_now(60).timestamp()}}},
+        fetched_at=three_days_ago,
+    )
+    # A later job hit the 5h limit and reported that window only.
+    five = claude_quota_from_rate_limit(
+        {"status": "rejected", "rateLimitType": "five_hour", "utilization": 1.0, "resetsAt": _from_now(2).timestamp()}
+    )
+    assert week is not None and five is not None
+    merged = merge_claude_quota(week, five)
+    manager.store.set_cached_quota("claude", merged)
+
+    claude = _pools(await manager.usage_dashboard(period="all"))["claude"]
+    assert (claude["five_hour"]["remaining_percent"], claude["weekly"]["remaining_percent"]) == (0.0, 60.0)
+    # The week was read three days ago, and the row does not pass it off as read today.
+    assert claude["five_hour"]["read_at"] == five["fetched_at"] and claude["weekly"]["read_at"] == three_days_ago
+    assert claude["read_at"] == three_days_ago and len(claude["as_of"]) == len("11-24 21:14")
+
+    # Once the 5h window has reset, the week is still on show, and the limit that was hit is not.
+    for window in merged["windows"]:
+        if window["window"] == "5h":
+            window["reset_time"] = _from_now(-1).isoformat(timespec="seconds")
+    manager.store.set_cached_quota("claude", merged)
+    reading = (await manager.get_quota(["claude"]))["claude"]
+    assert reading["status"] == "ok" and [w["window"] for w in reading["windows"]] == ["weekly"]
+    assert reading["rate_limit_reached"] is False
+    d = await manager.usage_dashboard(period="all")
+    claude = _pools(d)["claude"]
+    assert claude["five_hour"] is None and claude["weekly"]["remaining_percent"] == 60.0
+    claude_line = _line(d["text"], "  Claude plan")
+    assert "no reading" in claude_line and "60%" in claude_line and "out of quota" not in d["text"]
+
+    # When every window has reset, there is no reading.
+    for window in merged["windows"]:
+        window["reset_time"] = _from_now(-1).isoformat(timespec="seconds")
+    manager.store.set_cached_quota("claude", merged)
+    claude = _pools(await manager.usage_dashboard(period="all"))["claude"]
+    assert claude["status"] == "unknown" and "after a Claude job runs through the bridge" in claude["reason"]
+    await manager.shutdown()

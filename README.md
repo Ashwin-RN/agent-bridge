@@ -420,12 +420,11 @@ It only reads: it writes nothing to the database, and a quota reading it takes i
 |---|---|---|
 | `period` | `today` | `today` (since local midnight), `7d`, `30d`, `all`, or `session` (this window only) |
 | `since`, `until` | none | Instead of `period`: a local date such as `2026-11-25`, or an ISO time such as `2026-11-25T14:30`. A date alone as `until` takes in that whole day. Giving both `period` and one of these is refused |
-| `quota` | `True` | `False` leaves the quota section out and starts no CLI: the records alone |
 
 What the reply holds:
 
 - `text`: the whole view as fixed-width text, ready to show as it is. It is rendered from the same figures as the rest of the reply. A caveat is shown only when there is something under it; the rest of the reply always holds every entry.
-- `quota`: what is left in every pool, in a fixed order: `codex`, `agy_gemini`, `agy_claude_gpt`, `claude`. A pool that was read has `five_hour` and `weekly` (each with `remaining_percent`, `resets_in`, `reset_time` and a `state` of `ok`, `not_started`, `exhausted` or `reset_passed`; `None` when the CLI reported no such window), `as_of` and `read_at` (when it was read), `source` (`live`, `cached`, or `last_claude_job`) and `priority`. A pool that could not be read, or whose reading holds neither window, has status `unknown` and a `reason`; one backend failing does not hide the others. `notes` holds the lines worth acting on, such as a week about to reset with quota unused. The period does not change this section. With `quota=False` it is `None`.
+- `quota`: what is left in every pool, in a fixed order: `codex`, `agy_gemini`, `agy_claude_gpt`, `claude`. A pool that was read has `five_hour` and `weekly` (each with `remaining_percent`, `resets_in`, `reset_time`, `read_at` and a `state` of `ok`, `not_started`, `exhausted` or `reset_passed`; `None` when the CLI reported no such window), `as_of` and `read_at` (when it was read: the time of its oldest window), `source` (`live`, `cached`, or `last_claude_job`) and `priority`. A pool that could not be read, or whose reading holds neither window, has status `unknown` and a `reason`; one backend failing does not hide the others. `notes` holds the lines worth acting on, such as a week about to reset with quota unused. The period does not change this section.
 - `covers` and `not_covered`: it covers jobs run through the bridge only. Not in it: the host session's own tokens, a host's own subagents, and CLI runs made outside the bridge. The view says so in its footer.
 - `totals`: runs, their outcomes, time and tokens.
 - `this_session` and `other_sessions`: the same figures split between the calling window and every other window. The two add up to `totals`.
@@ -450,7 +449,7 @@ Rules the figures follow:
   | `before_records_begin` | Set when the period reaches back before the bridge's first record. That stretch is not covered, which is not the same as zero |
 
 - A job whose row still says queued or running, but whose window has closed, is found by reading the owners table. Unlike `get_usage`, the dashboard does not mark it failed; it lists it under `cannot_tell` as `window_closed`.
-- The quota readings are not bridge records, and no figure from them is added to a total. The Claude plan has no live read-out: its reading is what the last Claude job run through the bridge reported, and it says `no reading` until one has run since the last reset.
+- The quota readings are not bridge records, and no figure from them is added to a total. The Claude plan has no live read-out: its reading is what the Claude jobs run through the bridge reported. Each window is kept until its own reset passes and carries the time it was read, so the week stays on show after the 5h window has reset. The pool says `no reading` when no window is left.
 - Left out on purpose: Claude Code's cost estimate, which is not a bill and repeats earlier turns on a resume.
 
 ### list_backends
@@ -618,7 +617,7 @@ Each pool has a 5 hour window and a weekly window. The Claude and GPT pool on `a
 
 The `claude` pool is different. Claude Code has no command that prints the plan limits, so the bridge keeps what the last Claude job's output carried:
 
-- Before any Claude job has run, or once that reading's reset time has passed, the pool shows `status: "unknown"` with a note.
+- Before any Claude job has run, or once every window of that reading has reset, the pool shows `status: "unknown"` with a note. A window whose reset has passed is dropped on its own; the others stay.
 - After a job, it shows the windows that job reported, with `source: "last_claude_job"`. In the runs made here Claude Code reported only the weekly window, which was past 75% used. A window that is not listed was not reported; it is not known to be empty or full.
 - The reading does not see your own Claude use since that job. `refresh_quota` does not change it.
 - The advice never marks this pool `use_before_reset`. What is left of the plan before its reset is also what your own Claude sessions run on.

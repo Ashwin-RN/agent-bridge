@@ -666,14 +666,12 @@ def create_server(
         period: DashboardPeriod | None = None,
         since: str | None = None,
         until: str | None = None,
-        quota: bool = True,
     ) -> dict[str, Any]:
         """What is left of each subscription, then what the bridge has run in a period.
 
         - `period`: `'today'` (the default), `'7d'`, `'30d'`, `'all'`, or `'session'` (this window only).
         - `since` / `until`: instead of `period`, a local date (`2026-11-25`) or an ISO time. A date alone as
           `until` takes in that whole day.
-        - `quota`: `False` leaves the quota section out and starts no CLI.
 
         `quota` lists every pool with the 5h and weekly windows its reading holds: percent left, the
         reset, and when it was read.
@@ -686,7 +684,7 @@ def create_server(
         never added in. The tool writes nothing. Show `text` to the user as it is: every figure in it is
         already worked out.
         """
-        return await job_manager.usage_dashboard(period=period, since=since, until=until, quota=quota)
+        return await job_manager.usage_dashboard(period=period, since=since, until=until)
 
     @mcp.tool(
         annotations=ToolAnnotations(

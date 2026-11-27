@@ -220,6 +220,35 @@ def has_passed_reset(
     return False
 
 
+def without_passed_windows(
+    reading: dict[str, Any] | None,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any] | None:
+    """A reading without the windows whose reset has passed. None when no window is left.
+
+    For the Claude plan, whose windows are reported by different jobs and reset on their own: a 5h
+    window that has reset says nothing about the week.
+    """
+    if not isinstance(reading, dict) or reading.get("status") != "ok":
+        return None
+    now = now_utc or datetime.now(timezone.utc)
+    windows = [w for w in reading.get("windows") or [] if isinstance(w, dict)]
+    kept: list[dict[str, Any]] = []
+    for w in windows:
+        reset_dt = _parse_iso_utc(w.get("reset_time"))
+        if reset_dt is not None and (reset_dt - now).total_seconds() <= 0:
+            continue
+        kept.append(w)
+    if not kept:
+        return None
+    out = {**reading, "windows": kept}
+    if len(kept) < len(windows):
+        # The limit the last job hit may be the one that has since reset.
+        out["rate_limit_reached"] = any((_as_number(w.get("remaining_percent")) or 0.0) <= 0.0 for w in kept)
+    return out
+
+
 def enrich_quota_reading(
     reading: dict[str, Any],
     *,
@@ -531,9 +560,10 @@ def build_quota_advisory(
 
 
 CLAUDE_QUOTA_NOTE = (
-    "Claude Code has no command that prints the plan limits. This pool's reading comes from the last "
-    "Claude job the bridge ran, and stays unknown until one has run since the last reset. Claude jobs "
-    "draw on the same plan limits as your own Claude Code and claude.ai use."
+    "Claude Code has no command that prints the plan limits. This pool's reading is what the Claude "
+    "jobs the bridge ran reported: each window is kept until its own reset passes, and the pool is "
+    "unknown when none is left. Claude jobs draw on the same plan limits as your own Claude Code and "
+    "claude.ai use."
 )
 
 # The names Claude Code gives its limit windows, as the bridge labels them.
@@ -596,6 +626,7 @@ def merge_claude_quota(
     """Keep the windows an older reading had and the new one does not mention, while they are still current.
 
     A Claude job reports only the window that is closest to its limit, so one job's reading is partial.
+    A window that is kept carries the time it was read, which is older than the merged reading's.
     """
     now = now_utc or datetime.now(timezone.utc)
     merged = {k: v for k, v in new.items() if k not in {"cached", "cache_age_seconds"}}
@@ -608,9 +639,11 @@ def merge_claude_quota(
             reset_dt = _parse_iso_utc(w.get("reset_time"))
             if reset_dt is None or (reset_dt - now).total_seconds() <= 0:
                 continue
-            kept.append(
-                {k: w[k] for k in ("id", "window", "used_percent", "remaining_percent", "reset_time") if k in w}
-            )
+            carried = {
+                k: w[k] for k in ("id", "window", "used_percent", "remaining_percent", "reset_time") if k in w
+            }
+            carried["fetched_at"] = w.get("fetched_at") or previous.get("fetched_at")
+            kept.append(carried)
     merged["windows"] = [*(merged.get("windows") or []), *kept]
     return merged
 
