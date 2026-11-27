@@ -385,6 +385,64 @@ async def test_cancelled_agy_turn_that_reported_remote_work_keeps_the_session_bl
         await manager.shutdown()
 
 
+def _agy_signalling_remote_work(tmp_path: Path, *, conversation: str = "conv-rip") -> Path:
+    """An agy stand-in that says its turn goes on at the server, then keeps working."""
+    script = tmp_path / "agy_remote_signal.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "if 'models' in sys.argv:\n"
+        "    print('gemini-4-neon-high\\tGemini 4 Neon (High)')\n"
+        "    sys.exit(0)\n"
+        "sys.stderr.write('print timeout elapsed while turn is still in progress\\n')\n"
+        "sys.stderr.flush()\n"
+        f"print(json.dumps({{'event': 'init', 'conversation_id': {conversation!r}, "
+        "'init': {'model': 'gemini-4-neon-high'}}), flush=True)\n"
+        f"print(json.dumps({{'event': 'step_update', 'step_update': {{'conversation_id': {conversation!r}, "
+        "'step_index': 1, 'state': 'DONE', 'step_type': 'planner_response', "
+        "'usage': {'input_tokens': 7, 'output_tokens': 3}}}), flush=True)\n"
+        f"print(json.dumps({{'event': 'step_update', 'step_update': {{'conversation_id': {conversation!r}, "
+        "'step_index': 2, 'state': 'ACTIVE', 'step_type': 'agent_response', 'text_delta': 'working'}}), flush=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+async def test_a_second_cancel_from_shutdown_does_not_cut_the_first_cancel_short(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, neon_runner=StubAgyRunner(settings, _agy_signalling_remote_work(tmp_path)))
+    job = await manager.start_async(manager.prepare_request(backend="neon", prompt="go"))
+    async with asyncio.timeout(15):
+        while manager._local_jobs[job.job_id].last_activity != "agent_response (ACTIVE)":
+            await asyncio.sleep(0.02)
+    await asyncio.sleep(0.5)  # let the stderr reader take the line in
+    # Slow the job's own cleanup, so that a second cancel has time to land inside it.
+    tracker = manager._trackers[job.job_id]
+    real_terminate = tracker.terminate_all_and_verify
+    cleanup_entered = asyncio.Event()
+
+    async def slow_terminate() -> bool:
+        stopped = await real_terminate()
+        cleanup_entered.set()
+        await asyncio.sleep(0.5)
+        return stopped
+
+    tracker.terminate_all_and_verify = slow_terminate  # type: ignore[method-assign]
+    first = asyncio.create_task(manager.cancel(job.job_id))
+    async with asyncio.timeout(15):
+        await cleanup_entered.wait()
+    await manager.shutdown()  # cancels every job it still sees running: this one, a second time
+    await first
+    stored = manager.store.get_job(job.job_id)
+    assert stored is not None and stored.status == "cancelled"
+    # The job's own cleanup ran to its end: only it keeps the usage the CLI had streamed.
+    assert stored.usage is not None and stored.usage["total_tokens"] == 10
+    assert stored.provider_state == "possibly_running"
+    assert manager.store.get_session_safety_block("neon", "conv-rip") == {
+        "blocking_job_id": job.job_id, "provider_state": "possibly_running",
+    }
+
+
 class _AgyRunnerEndingAsTheCancelComes(NeonRunner):
     """Plays a runner whose CLI had ended with agy's remote in-progress signal as the cancel came."""
 

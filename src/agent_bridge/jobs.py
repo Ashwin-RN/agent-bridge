@@ -224,6 +224,8 @@ class JobManager:
         # Tasks the manager owns rather than the request that started them, such as a cancel that must
         # finish after its caller has gone. Kept here until they end; shutdown waits for them.
         self._owned_tasks: set[asyncio.Task[Any]] = set()
+        # The one task stopping each job, shared by every caller of `cancel()`.
+        self._stopping: dict[str, asyncio.Task[JobRecord]] = {}
 
         self.store.register_owner(
             self.owner_id,
@@ -1413,17 +1415,21 @@ class JobManager:
                 raise fatal_progress_exc
         except asyncio.CancelledError as exc:
             self._cancelled_ids.discard(record.job_id)
+            # agy may have said its turn goes on at the server, which stopping the local CLI cannot change:
+            # in the cancelled runner's own result, or in the result it had returned before the cancel came.
+            # Noted on the record before the first await, so that a stop that ends this cleanup early
+            # still keeps it (see `_stop_local_job`).
+            remote_running = (
+                isinstance(exc, RunCancelled) and exc.result.provider_state == "possibly_running"
+            ) or (result is not None and result.failure_reason == "provider_timeout_still_running")
+            if remote_running:
+                record.provider_state = "possibly_running"
             work_stop_wall = time.time()
             c0 = time.monotonic()
             stopped = await tracker.terminate_all_and_verify()
             cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
             await _drain_progress(cancel_session_claims=True)
             _keep_cancelled_usage(exc.result if isinstance(exc, RunCancelled) else result)
-            # agy may have said its turn goes on at the server, which stopping the local CLI cannot change:
-            # in the cancelled runner's own result, or in the result it had returned before the cancel came.
-            remote_running = (
-                isinstance(exc, RunCancelled) and exc.result.provider_state == "possibly_running"
-            ) or (result is not None and result.failure_reason == "provider_timeout_still_running")
             record.status = "cancelled"
             record.failure_reason = "cancelled"
             record.provider_state = "stopped" if (stopped and not remote_running) else "possibly_running"
@@ -1613,14 +1619,16 @@ class JobManager:
                 )
             if record.job_id in self._cancelled_ids:
                 self._cancelled_ids.discard(record.job_id)
+                # The runner had already ended, perhaps with agy's word that its turn goes on at the server.
+                remote_running = result.failure_reason == "provider_timeout_still_running"
+                if remote_running:
+                    record.provider_state = "possibly_running"
                 work_stop_wall = time.time()
                 c0 = time.monotonic()
                 stopped = await tracker.terminate_all_and_verify()
                 cleanup_secs = round(max(time.monotonic() - c0, tracker.total_cleanup_seconds), 2)
                 await _drain_progress(cancel_session_claims=True)
                 _keep_cancelled_usage(result)
-                # The runner had already ended, perhaps with agy's word that its turn goes on at the server.
-                remote_running = result.failure_reason == "provider_timeout_still_running"
                 record.status = "cancelled"
                 record.failure_reason = "cancelled"
                 record.provider_state = "stopped" if (stopped and not remote_running) else "possibly_running"
@@ -2022,6 +2030,23 @@ class JobManager:
             )
             return await self.get_async(job_id)
 
+        # One stop per job, whoever asks (a host's cancel, an abandoned wait, shutdown): a second
+        # `task.cancel()` landing in the first one's cleanup would cut it short and lose what it had
+        # learnt, such as agy's word that its turn goes on at the server.
+        stop = self._stopping.get(job_id)
+        if stop is None or stop.done():
+            stop = self._own_task(self._stop_local_job(job_id, record), name=f"stop-{job_id}")
+            self._stopping[job_id] = stop
+
+            def _forget(done: asyncio.Task[Any], jid: str = job_id) -> None:
+                if self._stopping.get(jid) is done:
+                    self._stopping.pop(jid, None)
+
+            stop.add_done_callback(_forget)
+        return await asyncio.shield(stop)
+
+    async def _stop_local_job(self, job_id: str, record: JobRecord) -> JobRecord:
+        """Stop this window's job `job_id` and store it as cancelled. Run once per job; see `cancel()`."""
         local_record = self._local_jobs.get(job_id, record)
         tracker = self._trackers.get(job_id)
         ev = self._events.get(job_id)
@@ -2063,15 +2088,20 @@ class JobManager:
             2,
         )
         verified_stopped = stopped and task_finished
+        # Set by the job's own cleanup as soon as it saw agy's word that the turn goes on at the server,
+        # in case that cleanup was cut short before it could store it.
+        remote_running = local_record.provider_state == "possibly_running"
 
         if not local_record.is_terminal:
             self._cancelled_ids.discard(job_id)
             local_record.status = "cancelled"
             local_record.failure_reason = "cancelled"
-            local_record.provider_state = "stopped" if verified_stopped else "possibly_running"
-            local_record.error = "Job cancelled."
+            local_record.provider_state = "stopped" if (verified_stopped and not remote_running) else "possibly_running"
+            local_record.error = AGY_REMOTE_TURN_CANCEL_ERROR if remote_running else "Job cancelled."
             local_record.retry_guidance = (
-                "Job was cancelled and verified stopped."
+                _agy_remote_turn_cancel_guidance(job_id)
+                if remote_running
+                else "Job was cancelled and verified stopped."
                 if verified_stopped
                 else "Job cancellation requested, but process cleanup did not finish within timeout. "
                 "Verify no child process remains and inspect git status/diff before retrying."
