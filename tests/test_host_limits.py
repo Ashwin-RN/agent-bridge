@@ -61,6 +61,11 @@ def test_ancestor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert host_limits.identify_host("unknown-client") is get_host("antigravity")
 
 
+def test_shell_between_bridge_and_host_is_weak_evidence() -> None:
+    assert host_limits.identify_host("unknown-client", ("node", "pwsh", "Code.exe")) is None
+    assert host_limits.identify_host("unknown-client", ("node", "Code.exe")) is get_host("vscode-copilot")
+
+
 def test_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     # Red when an explicitly empty ancestor list triggers a real ancestry lookup.
     monkeypatch.setattr(host_limits, "ancestor_process_names", lambda: ("codex",))
@@ -70,10 +75,17 @@ def test_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_ancestor_names(monkeypatch: pytest.MonkeyPatch) -> None:
     # Red when executable normalization is removed.
-    command_lines = {7: [r"C:\Tools\AgY.EXE"], 6: None, 5: ["/usr/bin/Codex", "--version"]}
+    command_lines = {7: [r"C:\Tools\AgY.EXE"], 6: ["/usr/bin/Codex", "--version"]}
     monkeypatch.setattr(nesting, "ancestor_chain", lambda: [(pid, None) for pid in command_lines])
     monkeypatch.setattr(nesting, "_process_command_line", command_lines.__getitem__)
     assert host_limits.ancestor_process_names() == ("agy", "codex")
+
+
+def test_unreadable_ancestor_breaks_launcher_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    command_lines = {7: ["node"], 6: None, 5: ["Code.exe"]}
+    monkeypatch.setattr(nesting, "ancestor_chain", lambda: [(pid, None) for pid in command_lines])
+    monkeypatch.setattr(nesting, "_process_command_line", command_lines.__getitem__)
+    assert host_limits.identify_host("unknown-client") is None
 
 
 def test_unreadable_tree(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -105,13 +117,28 @@ def test_antigravity(roots: Roots, timeout: int | None, expected: float) -> None
 
 
 def test_project_config(roots: Roots) -> None:
-    # Red when project lookup is removed or when it takes precedence over a user registration.
+    # Red when project lookup is removed or the user limit always wins.
     host = get_host("codex")
     codex_config(roots, "tool_timeout_sec = 200\n", project=True)
     assert host_limits.tool_call_limit_seconds(host, roots) == 200
     codex_config(roots, "tool_timeout_sec = 300\n")
     host_limits.clear_limit_cache()
-    assert host_limits.tool_call_limit_seconds(host, roots) == 300
+    assert host_limits.tool_call_limit_seconds(host, roots) == 200
+    codex_config(roots, "tool_timeout_sec = 30\n")
+    host_limits.clear_limit_cache()
+    assert host_limits.tool_call_limit_seconds(host, roots) == 30
+
+
+def test_project_config_after_malformed_user_config(roots: Roots) -> None:
+    write(roots.codex_home / "config.toml", "[not valid TOML")
+    codex_config(roots, "tool_timeout_sec = 30\n", project=True)
+    assert host_limits.tool_call_limit_seconds(get_host("codex"), roots) == 30
+
+
+def test_registration_without_override_uses_its_default_in_scope_comparison(roots: Roots) -> None:
+    codex_config(roots, "tool_timeout_sec = 300\n")
+    codex_config(roots, project=True)
+    assert host_limits.tool_call_limit_seconds(get_host("codex"), roots) == 60
 
 
 @pytest.mark.parametrize("kind", ["malformed", "unreadable", "missing", "nonfinite"])
@@ -143,9 +170,9 @@ def test_claude_uncapped(roots: Roots) -> None:
     assert host_limits.cap_wait(120, host, roots) == (120, None)
 
 
-@pytest.mark.parametrize(("limit", "cap"), [(60.9, 50), (12, 5)], ids=["margin", "floor"])
+@pytest.mark.parametrize(("limit", "cap"), [(60.9, 50), (12, 2)], ids=["margin", "short-margin"])
 def test_cap(roots: Roots, limit: float, cap: int) -> None:
-    # Red when the margin or the minimum is removed.
+    # Red when the margin is removed or the cap is rounded up to five seconds.
     codex_config(roots, f"tool_timeout_sec = {limit}\n")
     assert host_limits.wait_cap_seconds(get_host("codex"), roots) == cap
 
@@ -165,9 +192,21 @@ def test_wait_over(roots: Roots) -> None:
 
 
 def test_wait_unknown(roots: Roots) -> None:
-    # Red when an unknown host receives a limit.
-    assert host_limits.wait_cap_seconds(None, roots) is None
-    assert host_limits.cap_wait(120, None, roots) == (120, None)
+    assert host_limits.wait_cap_seconds(None, roots) == 20
+    wait, note = host_limits.cap_wait(120, None, roots)
+    assert wait == 20
+    assert note is not None and "job is still running" in note
+    assert host_limits.cap_wait(15, None, roots) == (15, None)
+
+
+def test_wait_zero_when_host_limit_is_too_short(roots: Roots) -> None:
+    codex_config(roots, "tool_timeout_sec = 3\n")
+    host = get_host("codex")
+    wait, note = host_limits.cap_wait(120, host, roots)
+    assert wait == 0
+    assert note is not None and "too short to wait" in note and "job keeps running" in note
+    assert host_limits.wait_cap_seconds(host, roots) == 0
+    assert host_limits.cap_wait(0, host, roots) == (0, None)
 
 
 def test_fixed_hint(roots: Roots) -> None:

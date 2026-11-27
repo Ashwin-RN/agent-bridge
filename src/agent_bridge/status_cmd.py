@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -134,6 +133,9 @@ def read_snapshot(
     """
     if not db_path.is_file():
         return None
+
+    import sqlite3
+
     uri = db_path.resolve().as_uri() + "?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=LOCK_WAIT_SECONDS, isolation_level=None)
@@ -169,6 +171,9 @@ def read_snapshot(
                 select.append(
                     "o.exited_at AS _o_exited" if "exited_at" in owner_cols else "NULL AS _o_exited"
                 )
+                select.append(
+                    "o.process_identity AS _o_identity" if "process_identity" in owner_cols else "NULL AS _o_identity"
+                )
                 join = "LEFT JOIN owners o ON o.owner_id = j.owner_id"
 
         clauses: list[str] = []
@@ -201,9 +206,10 @@ def read_snapshot(
 
     want_cwd = _norm_path(cwd) if cwd else None
     alive_cache: dict[int, bool] = {}
+    identity_cache: dict[int, str | None] = {}
     active: list[dict[str, Any]] = []
     finished: list[dict[str, Any]] = []
-    names = [*cols, *(["_o_id", "_o_pid", "_o_exited"] if has_owners else [])]
+    names = [*cols, *(["_o_id", "_o_pid", "_o_exited", "_o_identity"] if has_owners else [])]
     for row in rows:
         job = dict(zip(names, row))
         if want_cwd is not None:
@@ -213,6 +219,7 @@ def read_snapshot(
         owner_id, owner_pid, owner_exited = (
             job.pop("_o_id", None), job.pop("_o_pid", None), job.pop("_o_exited", None)
         )
+        owner_identity = job.pop("_o_identity", None)
         status = str(job.get("status") or "")
         job["display_status"] = status
         job["window_closed"] = False
@@ -224,6 +231,12 @@ def read_snapshot(
                     if pid not in alive_cache:
                         alive_cache[pid] = pid_alive(pid)
                     alive = alive_cache[pid]
+                    if alive and owner_identity is not None:
+                        if pid not in identity_cache:
+                            from agent_bridge.nesting import process_identity
+
+                            identity_cache[pid] = process_identity(pid)
+                        alive = identity_cache[pid] == owner_identity
                 if not alive:
                     job["display_status"] = WINDOW_CLOSED
                     job["window_closed"] = True
@@ -324,7 +337,7 @@ def render_json(
     import json
 
     payload: dict[str, Any] = {
-        "database": str(db_path),
+        "database": sanitize(db_path),
         "exists": snapshot is not None,
         "now": round(now, 3),
         "active": [_job_json(j, now=now) for j in (snapshot or {}).get("active", [])],
@@ -342,14 +355,19 @@ def _running(snapshot: Mapping[str, Any] | None) -> list[dict[str, Any]]:
 
 
 def _missing_sentence(db_path: Path) -> str:
-    return f"No bridge database at {db_path}: no job has run with this state folder yet."
+    return f"No bridge database at {sanitize(db_path)}: no job has run with this state folder yet."
 
 
 # --- Command ------------------------------------------------------------------------------------
 
 
+class _StatusParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        super().error(sanitize(message))
+
+
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _StatusParser(
         prog="agent-bridge status",
         description="What the bridge is running now, read from bridge.db without writing to it.",
     )
@@ -422,11 +440,12 @@ def _enable_vt() -> None:
 
 
 def _snapshot(args: argparse.Namespace, db_path: Path, now: float) -> dict[str, Any] | None:
+    line_mode = args.line or args.lines
     return read_snapshot(
         db_path,
         now=now,
-        recent_seconds=max(0.0, args.recent) * 60.0,
-        include_all=args.all,
+        recent_seconds=0.0 if line_mode else max(0.0, args.recent) * 60.0,
+        include_all=args.all and not line_mode,
         cwd=args.cwd,
         parent_run=args.parent_run,
         finished_limit=args.limit,
@@ -434,7 +453,7 @@ def _snapshot(args: argparse.Namespace, db_path: Path, now: float) -> dict[str, 
 
 
 def _error_sentence(db_path: Path, exc: Exception) -> str:
-    return f"agent-bridge status: cannot read {db_path} read-only ({exc}); nothing was changed."
+    return f"agent-bridge status: cannot read {sanitize(db_path)} read-only ({sanitize(exc)}); nothing was changed."
 
 
 def _once(args: argparse.Namespace, db_path: Path) -> int:
