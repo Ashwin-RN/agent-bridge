@@ -516,32 +516,80 @@ def _claims_of(manager: JobManager, job_id: str) -> list[tuple[str, str]]:
         conn.close()
 
 
-async def test_finalize_never_writes_a_different_outcome_over_a_stored_result(tmp_path: Path) -> None:
+def _usage_tokens(store: object, job_id: str) -> list[int | None]:
+    conn = sqlite3.connect(store.db_path)  # type: ignore[attr-defined]
+    try:
+        return [r[0] for r in conn.execute("SELECT total_tokens FROM usage_events WHERE job_id = ?", (job_id,))]
+    finally:
+        conn.close()
+
+
+async def test_finalize_never_rewrites_a_stored_result_whatever_its_status(tmp_path: Path) -> None:
     from dataclasses import replace
 
     from agent_bridge.storage import BridgeStore
 
     store = BridgeStore(tmp_path / "state")
     store.register_owner("win", 1)
-    record = JobRecord(
-        job_id="codex-0000feed", owner_id="win", backend="codex", cwd=str(tmp_path), mode="read_only",
-        requested_model=None, model="m", prompt_preview="p", status="running", started_at=time.time(),
-        provider_invoked=True,
-    )
+    record = replace(_running_job("neon-0000feed", "win", tmp_path), backend="neon", session_id="conv-fence")
     store.insert_job(record)
-    done = replace(record, status="completed", response="the answer", finished_at=time.time(), duration_seconds=1.0)
-    assert store.finalize_job(done) == "written"
-    late = replace(
+    done = replace(
+        record, status="completed", response="the answer", finished_at=time.time(), duration_seconds=1.0,
+        usage={"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}, usage_status="exact",
+    )
+    newer = {"input_tokens": 300, "output_tokens": 30, "total_tokens": 330}
+    assert store.finalize_job(done, watermark_cumulative=newer, watermark_turns=2) == "written"
+
+    late_cancel = replace(
         record, status="cancelled", failure_reason="cancelled", provider_state="stopped", error="Job cancelled.",
         finished_at=time.time(), duration_seconds=2.0,
     )
-    outcome = store.finalize_job(late)
+    # The same status, with an older reply, other usage and an older checkpoint.
+    stale_done = replace(
+        done, response="an older answer", usage={"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+    )
+    older = {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}
+    outcomes = [
+        store.finalize_job(late_cancel),
+        store.finalize_job(stale_done, watermark_cumulative=older, watermark_turns=1),
+    ]
     stored = store.get_job(record.job_id)
     assert stored is not None
     assert (stored.status, stored.failure_reason, stored.response) == ("completed", None, "the answer")
-    assert outcome == "kept"
-    # The same outcome may be written again, as a retried write would.
-    assert store.finalize_job(done) == "written"
+    assert stored.usage is not None and stored.usage["total_tokens"] == 100
+    assert _usage_tokens(store, record.job_id) == [100]
+    watermark = store.get_session_watermark("neon", "conv-fence")
+    assert watermark is not None and watermark["num_turns"] == 2  # not rolled back
+    assert outcomes == ["kept", "kept"]
+
+
+async def test_finalize_of_a_row_that_is_gone_records_usage_and_touches_no_session_state(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from agent_bridge.storage import BridgeStore
+
+    store = BridgeStore(tmp_path / "state")
+    store.register_owner("win", 1)
+    # The session already has a checkpoint from an earlier turn.
+    earlier = replace(_running_job("neon-0000aaaa", "win", tmp_path), backend="neon", session_id="conv-gone")
+    store.insert_job(earlier)
+    checkpoint = {"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}
+    store.finalize_job(
+        replace(earlier, status="completed", finished_at=time.time(), duration_seconds=1.0),
+        watermark_cumulative=checkpoint, watermark_turns=1,
+    )
+    # A job whose row is not there (pruned), ending with an uncertain state on that session.
+    gone = replace(
+        _running_job("neon-0000bbbb", "win", tmp_path), backend="neon", session_id="conv-gone",
+        status="timed_out", failure_reason="timeout", provider_state="possibly_running",
+        finished_at=time.time(), duration_seconds=3.0,
+        usage={"input_tokens": 20, "output_tokens": 5, "total_tokens": 25}, usage_status="partial",
+    )
+    outcome = store.finalize_job(gone)
+    assert store.get_session_watermark("neon", "conv-gone") is not None  # not deleted
+    assert store.get_session_safety_block("neon", "conv-gone") is None  # not written
+    assert _usage_tokens(store, "neon-0000bbbb") == [25]  # the run's usage still counts
+    assert outcome == "missing"
 
 
 async def test_a_final_write_that_fails_is_kept_and_retried_until_it_lands(

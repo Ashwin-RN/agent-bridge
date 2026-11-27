@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from agent_bridge.models import JobRecord
@@ -18,6 +19,11 @@ from agent_bridge.usage import (
     normalize_usage,
     sum_agy_step_usages,
 )
+
+
+def _started(record: JobRecord) -> JobRecord:
+    """The row as a job starts: running. Only finalize_job ends a row, and an ended row is never rewritten."""
+    return replace(record, status="running", finished_at=None, duration_seconds=None)
 
 
 def test_normalize_usage_preserves_provider_metrics() -> None:
@@ -199,7 +205,7 @@ def test_sqlite_usage_scopes_coverage_and_compact(tmp_path: Path) -> None:
         usage={"input_tokens": 1000, "output_tokens": 100, "cached_tokens": 2000, "reasoning_tokens": 20, "total_tokens": 1100},
         usage_status="exact",
     )
-    store.insert_job(j1)
+    store.insert_job(_started(j1))  # a row starts active; finalize_job is what ends it
     store.finalize_job(j1)
 
     j2 = JobRecord(
@@ -220,7 +226,7 @@ def test_sqlite_usage_scopes_coverage_and_compact(tmp_path: Path) -> None:
         usage=None,
         usage_status="missing",
     )
-    store.insert_job(j2)
+    store.insert_job(_started(j2))
     store.finalize_job(j2)
 
     # In-flight job in proj_a
@@ -462,7 +468,7 @@ def test_sqlite_usage_tracks_agy_claude_gpt_pool_separately(tmp_path: Path) -> N
         usage_status="exact",
     )
     for j in (j_gem, j_3p):
-        store.insert_job(j)
+        store.insert_job(_started(j))
         store.finalize_job(j)
 
     summary = store.summarize_usage(period="today", owner_id="o1", compact=True)

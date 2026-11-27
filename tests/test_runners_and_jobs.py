@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1736,7 +1737,8 @@ async def test_worktree_probes_obey_deadline_and_dead_owner_queued_recovery_keep
         usage_status="exact",
         provider_invoked=True,
     )
-    mgr.store.insert_job(done_t1)
+    # A row starts active; finalize_job is what ends it, and an ended row is never rewritten.
+    mgr.store.insert_job(replace(done_t1, status="running", finished_at=None, duration_seconds=None))
     mgr.store.finalize_job(
         done_t1,
         watermark_cumulative={"input_tokens": 90, "output_tokens": 10, "total_tokens": 100},
@@ -1956,7 +1958,7 @@ print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status"
             provider_state="stopped",
             provider_invoked=True,
         )
-        mgr.store.insert_job(filler)
+        mgr.store.insert_job(replace(filler, status="running", finished_at=None, duration_seconds=None))
         mgr.store.finalize_job(filler, touched_provider=True)
 
     assert mgr.store.get_job(t1.job_id) is None, "t1 should have been pruned from jobs table"

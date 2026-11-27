@@ -1708,11 +1708,13 @@ class BridgeStore:
         attempts: list[dict[str, Any]] | None = None,
         lock_timeout: float = 5.0,
     ) -> FinalizeOutcome:
-        """Atomically and idempotently persist terminal status, per-attempt usage, claim release, and safety state.
+        """Atomically persist terminal status, per-attempt usage, claim release, and safety state.
 
-        Returns "written"; "kept" when the row had already ended with another outcome, which is then
-        left as it is, usage, watermark and safety state included; or "missing" when there is no row
-        (pruned), in which case the usage is still recorded as before.
+        Only the write that ends an active row stores a result and touches session state. Returns
+        "written" for that; "kept" when the row had already ended, whatever this record says, and it is
+        then left exactly as it is, usage, watermark and safety state included; or "missing" when there
+        is no row (pruned), in which case the run's usage is recorded and its own claim released, and
+        no session state is touched.
         """
         now = time.time()
         pool = record.quota_pool or classify_quota_pool(
@@ -1736,14 +1738,12 @@ class BridgeStore:
             current = cur.execute(
                 "SELECT status, failure_reason FROM jobs WHERE job_id = ?", (record.job_id,)
             ).fetchone()
-            if (
-                current is not None
-                and str(current["status"]) in TERMINAL_STATUSES
-                and (str(current["status"]), current["failure_reason"]) != (record.status, record.failure_reason)
-            ):
-                # A late writer never overwrites a result that is already stored. The same outcome may be
-                # written again (a retried write), and is.
-                logger.warning(
+            if current is not None and str(current["status"]) in TERMINAL_STATUSES:
+                # A late writer never overwrites a result that is already stored, even with the same
+                # status: its reply, usage or checkpoint may be older than the stored ones. A retried
+                # write of the stored result itself lands here too, which is as it should be.
+                same = (str(current["status"]), current["failure_reason"]) == (record.status, record.failure_reason)
+                (logger.info if same else logger.warning)(
                     "Job %s had already ended %s (%s); a later %s (%s) result is not written over it.",
                     record.job_id,
                     current["status"],
@@ -1753,7 +1753,16 @@ class BridgeStore:
                 )
                 cur.execute("DELETE FROM session_claims WHERE job_id = ?", (record.job_id,))
                 return "kept"
-            outcome: FinalizeOutcome = "written" if current is not None else "missing"
+            if current is None:
+                # No active row is being ended, so no session state is touched; the run's usage still goes
+                # in the ledger, and its own claim is released.
+                logger.warning(
+                    "Job %s has no row to store its result in; only its usage is recorded.", record.job_id
+                )
+                _insert_usage_event_cur(cur, record, attempts=att_list)
+                cur.execute("DELETE FROM session_claims WHERE job_id = ?", (record.job_id,))
+                return "missing"
+            outcome: FinalizeOutcome = "written"
 
             # A session that another job holds and has not ended is not this job's to touch: the row keeps
             # the session it had, and that session's watermark and safety state are left alone.
