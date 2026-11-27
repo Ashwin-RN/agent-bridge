@@ -19,7 +19,6 @@ The tools are those of the MCP server named `agent-bridge`. Its own instructions
 | `claude` | `claude`. Never in `order`: it is the user's own plan, shared with their own sessions |
 
 - A `pools` entry with `priority` `use_before_reset` loses its unused weekly quota soon. Give it every job it can do, even where another backend fits a little better.
-- A pool at `conserve` takes short jobs only.
 
 ## Backend and model
 
@@ -40,7 +39,6 @@ The tools are those of the MCP server named `agent-bridge`. Its own instructions
 
 ## Edits
 
-- Keep `mode` at `read_only` unless the job must change files.
 - An unattended edit runs on `codex` or `claude` with `mode="edit"` and `worktree=True`. The reply's `worktree_path` and `worktree_branch` say where the work is: inspect the diff there before you use it.
 - The bridge never commits, pushes or merges. Bringing the work over is yours to do.
 
