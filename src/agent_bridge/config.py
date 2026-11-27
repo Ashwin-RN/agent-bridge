@@ -266,6 +266,8 @@ class Settings:
     # "trim": leave variables whose names look like credentials out of a Codex or agy job's environment.
     # "inherit": pass the environment on as it is.
     child_env: str = "trim"
+    # Exact variable names exempted from trimming, using Windows' uppercase environment keys there.
+    child_env_keep: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -316,6 +318,11 @@ class Settings:
             raise ValueError(
                 f"Unknown AGENT_BRIDGE_CHILD_ENV {raw_child_env!r}. Expected 'trim' or 'inherit'."
             )
+        child_env_keep = frozenset(
+            name.upper() if os.name == "nt" else name
+            for part in os.environ.get("AGENT_BRIDGE_CHILD_ENV_KEEP", "").split(",")
+            if (name := part.strip())
+        )
 
         default_timeout = int(os.environ.get("AGENT_BRIDGE_DEFAULT_TIMEOUT", "300"))
         max_concurrent = max(1, int(os.environ.get("AGENT_BRIDGE_MAX_CONCURRENT", "8")))
@@ -353,4 +360,5 @@ class Settings:
             claude_bin=claude_bin,
             claude_auth=raw_claude_auth,
             child_env=raw_child_env,
+            child_env_keep=child_env_keep,
         )

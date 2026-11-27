@@ -74,16 +74,23 @@ OnWorktreePlannedCallback = Callable[[dict[str, str | None]], None]
 
 
 def job_env(settings: Settings, request: RunRequest, *, cli: str) -> dict[str, str]:
-    """The environment for a Codex or `agy` job: the bridge's own, the nesting marker, and, unless
-    AGENT_BRIDGE_CHILD_ENV=inherit, without the variables whose names look like credentials.
+    """Build a marked Codex or agy environment, filtering by variable name in trim mode.
 
-    The names left out are logged, never their values. Claude jobs build theirs in `ClaudeRunner`.
+    The filter logs exclusions and explicit exceptions by name. It does not inspect values such as
+    URLs. Claude jobs have their own environment handling in `ClaudeRunner`.
     """
-    dropped = credential_env_names(os.environ) if settings.child_env != "inherit" else []
+    candidates = credential_env_names(os.environ) if settings.child_env != "inherit" else []
+    kept = [name for name in candidates if name in settings.child_env_keep]
+    dropped = [name for name in candidates if name not in settings.child_env_keep]
+    if kept:
+        logger.info(
+            "Kept in %s job %s's environment via AGENT_BRIDGE_CHILD_ENV_KEEP: %s.",
+            cli, request.job_id, ", ".join(kept),
+        )
     if dropped:
         logger.info(
             "Left out of %s job %s's environment, as their names look like credentials: %s. "
-            "AGENT_BRIDGE_CHILD_ENV=inherit passes them on.",
+            "AGENT_BRIDGE_CHILD_ENV_KEEP exempts named variables; AGENT_BRIDGE_CHILD_ENV=inherit passes them all on.",
             cli,
             request.job_id,
             ", ".join(dropped),
@@ -500,14 +507,27 @@ def resolve_codex_command(configured: str | None = None) -> list[str]:
     return [str(found_path)]
 
 
+def _agy_result_envelope(obj: Any) -> dict[str, Any] | None:
+    if not isinstance(obj, dict):
+        return None
+    event = obj.get("event")
+    result = obj.get("result")
+    if event == "result" and isinstance(result, dict):
+        return result
+    cid = obj.get("conversation_id")
+    if event in (None, "result") and isinstance(cid, str) and cid and ("response" in obj or "status" in obj):
+        return obj
+    return None
+
+
 def parse_agy_json_output(stdout_text: str) -> dict[str, Any] | None:
     """Parse single-envelope `agy --output-format json` stdout, tolerating leading non-JSON lines."""
     stripped = stdout_text.strip()
     if not stripped:
         return None
     try:
-        parsed = json.loads(stripped)
-        if isinstance(parsed, dict):
+        parsed = _agy_result_envelope(json.loads(stripped))
+        if parsed is not None:
             return parsed
     except json.JSONDecodeError:
         pass
@@ -517,12 +537,16 @@ def parse_agy_json_output(stdout_text: str) -> dict[str, Any] | None:
         if not line or not line.startswith("{"):
             continue
         try:
-            parsed = json.loads(line)
-            if isinstance(parsed, dict):
+            parsed = _agy_result_envelope(json.loads(line))
+            if parsed is not None:
                 return parsed
         except json.JSONDecodeError:
             continue
     return None
+
+
+def _plain_stdout_reply(lines: list[str]) -> str:
+    return "\n".join(line.rstrip("\r\n") for line in lines if not line.lstrip().startswith("{")).strip()
 
 
 def parse_codex_jsonl_events(lines: list[str]) -> dict[str, Any]:
@@ -1231,18 +1255,15 @@ class NeonRunner:
                         idx = su.get("step_index")
                         key = int(idx) if isinstance(idx, int) else len(step_usages_by_index)
                         step_usages_by_index[key] = su["usage"]
-            elif ev_type == "result":
-                res_obj = obj.get("result")
-                if isinstance(res_obj, dict):
-                    result_envelope = res_obj
-                    cid = res_obj.get("conversation_id")
-                    if isinstance(cid, str) and cid:
-                        session_id = cid
-                        if on_session:
-                            on_session(cid)
-            elif "conversation_id" in obj and ("response" in obj or "status" in obj):
-                plain_envelope = obj
-                cid = obj.get("conversation_id")
+            else:
+                envelope = _agy_result_envelope(obj)
+                if envelope is None:
+                    return
+                if ev_type == "result":
+                    result_envelope = envelope
+                else:
+                    plain_envelope = envelope
+                cid = envelope.get("conversation_id")
                 if isinstance(cid, str) and cid:
                     session_id = cid
                     if on_session:
@@ -1319,8 +1340,7 @@ class NeonRunner:
             envelope = parse_agy_json_output("".join(stdout_lines))
 
         raw_status = str(envelope.get("status") or "").strip().upper() if isinstance(envelope, dict) else ""
-        # A run that ends well ends with a result envelope that carries its status. A clean exit with no
-        # envelope, or one with a blank status (the last JSON line taken as the envelope), was cut short.
+        # A clean exit without a recognized result envelope carrying its status is an incomplete stream.
         final_event_missing = (
             (not timed_out_locally) and (not cancelled) and proc.returncode == 0 and not raw_status
         )
@@ -1479,7 +1499,7 @@ class NeonRunner:
             env_response = str(envelope.get("response") or "").strip() if isinstance(envelope, dict) else ""
             return RunResult(
                 status="failed",
-                response=env_response or partial_text,
+                response=env_response or partial_text or _plain_stdout_reply(stdout_lines),
                 session_id=session_id,
                 model=actual_model,
                 effort=request.effort,
@@ -2300,9 +2320,10 @@ class CodexRunner:
         session_id = parsed["session_id"] or request.session_id
         response = parsed["response"]
         errors = parsed["errors"]
-        # `codex exec review` is held to the old rule: its output is not known to end with turn.completed
-        # (it reports no token counts, and its reply may come as plain text), so a clean exit still counts.
-        builtin_review = request.review_scope is not None and not request.prompt.strip()
+        if proc.returncode == 0 and not errors and not response:
+            response = _plain_stdout_reply(stdout_lines)
+        # `codex exec review` can finish with a reply in plain text and no turn.completed event.
+        builtin_review = request.review_scope is not None and not request.prompt.strip() and bool(response)
         final_event_missing = (
             (not timed_out_locally)
             and (not cancelled)
@@ -2411,13 +2432,6 @@ class CodexRunner:
             )
 
         if turn_completed_cleanly:
-            if not response:
-                non_json = "\n".join(
-                    ln.strip()
-                    for ln in stdout_lines
-                    if ln.strip() and not ln.strip().startswith("{")
-                ).strip()
-                response = non_json
             return RunResult(
                 status="completed",
                 response=response,
