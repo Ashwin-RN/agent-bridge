@@ -516,7 +516,11 @@ def _agy_result_envelope(obj: Any) -> dict[str, Any] | None:
     if event == "result" and isinstance(result, dict):
         return result
     cid = obj.get("conversation_id")
-    if event in (None, "result") and isinstance(cid, str) and cid and ("response" in obj or "status" in obj):
+    has_response = "response" in obj
+    has_status = "status" in obj
+    if event in (None, "result") and (
+        (has_response and has_status) or (isinstance(cid, str) and cid and (has_response or has_status))
+    ):
         return obj
     return None
 
