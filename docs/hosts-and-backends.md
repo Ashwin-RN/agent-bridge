@@ -41,7 +41,7 @@ Two things in Claude Code could replace the wrapper:
 - **Automatic backgrounding.** "An MCP tool call in the main conversation that is still running after two minutes moves to a background task instead of blocking the session." The task "appears in `/tasks`" and its entry "shows the latest progress the server has reported". Calls made by subagents are not moved. [read: [MCP](https://code.claude.com/docs/en/mcp.md)]
 - **MCP tasks.** A server may answer a tool call with a task (`"resultType": "task"`, a `taskId`, a `status`, an optional `statusMessage`) and Claude Code then polls `tasks/get`. "`/tasks` shows the value from your latest `tasks/get` response." [read: same page]
 
-So if the bridge sent progress notifications, a plain `run_agent` that runs past two minutes would show in `/tasks` with a live line such as "codex: tool: Bash", with no wrapper and no Haiku tokens. If the bridge answered with an MCP task, the job would be a task from the start. Neither gives the entry a name you choose; the wrapper still wins on naming.
+So if the bridge sent progress notifications, a waiting `run` that runs past two minutes would show in `/tasks` with a live line such as "codex: tool: Bash", with no wrapper and no Haiku tokens. If the bridge answered with an MCP task, the job would be a task from the start. Neither gives the entry a name you choose; the wrapper still wins on naming.
 
 Not possible: a per-call name for an ordinary subagent without agent teams [reported: [subagents](https://code.claude.com/docs/en/sub-agents.md)].
 
@@ -55,14 +55,14 @@ Not possible: a per-call name for an ordinary subagent without agent teams [repo
 - **Timeout.** A tool call is stopped after 60 seconds unless `mcp_servers.<id>.tool_timeout_sec` is set. [read: [config reference](https://learn.chatgpt.com/docs/config-file/config-reference)] A polling wrapper needs it raised; the README's install entry sets 600.
 - **Approval.** In `codex exec`, a tool not marked read-only fails with "MCP tool call requires approval, but approval policy is never" unless `default_tools_approval_mode = "approve"` is set for the server. [run]
 
-The closest equivalent: a small-model agent file such as `.codex/agents/bridge-job.toml` whose instructions are the wrapper's (make the call, poll `check_jobs`, reply with the job's fields only), listed in `/subagents`. The name shown is Codex's, not `<model>: <task>`.
+The closest equivalent: a small-model agent file such as `.codex/agents/bridge-job.toml` whose instructions are the wrapper's (make the call, poll `jobs`, reply with the job's fields only), listed in `/subagents`. The name shown is Codex's, not `<model>: <task>`.
 
 ### Antigravity
 
 - **Subagents with a role per call.** "The parent agent calls the `invoke_subagent` tool to spawn a new concurrent session with a dedicated role and initial prompt." [read: [Custom subagents](https://antigravity.google/docs/subagents.md)]
 - **Seeing them.** The `/agents` panel "displays a live checklist of all active, completed, killed, or failed background agents" with Identifier, Role, State and Step. [read: same page]
 - **Defining one.** A Markdown file with YAML frontmatter in `.agents/agents/` or `~/.gemini/config/agents/`. Fields include `name`, `description`, `tools`, `model` (`inherit`, `flash` or `pro`) and `mcpServers`. [read: same page]
-- **Without a wrapper.** A per-tool setting in `mcp_config.json`: `tools.<tool>.background` set to `"always"` "runs the tool's calls as background tasks". [read: [MCP](https://antigravity.google/docs/mcp.md)] Setting it for `run_agent` would list each bridge job as a background task with no subagent at all.
+- **Without a wrapper.** A per-tool setting in `mcp_config.json`: `tools.<tool>.background` set to `"always"` "runs the tool's calls as background tasks". [read: [MCP](https://antigravity.google/docs/mcp.md)] Setting it for `run` would list each bridge job as a background task with no subagent at all.
 - **Timeout.** 3 minutes per tool call unless `timeoutSeconds` is set. [read: same page]
 
 Antigravity is the host where the wrapper pattern fits best: the role is the per-call name, the model can be Flash, and the agent can be given the bridge's tools only.
@@ -71,9 +71,9 @@ Antigravity is the host where the wrapper pattern fits best: the role is the per
 
 In order of value for effort:
 
-1. **Send MCP progress notifications** from `run_agent`, `run_parallel` and a waiting `check_jobs`, carrying `last_activity`. Claude Code and Antigravity draw them; Codex ignores them harmlessly. The bridge already tracks `last_activity` for every job, so this is mostly plumbing in `server.py`.
+1. **Send MCP progress notifications** from a waiting `run` or `jobs` call, carrying the status line (now implemented in `mcp_tasks.py`). Claude Code and Antigravity draw them; Codex ignores them harmlessly.
 2. **Ship ready-made wrapper agents**: a `.claude/agents/` file, a `.codex/agents/` file and an `.agents/agents/` file with the same instructions, for people who want the named-agent view. Documentation plus three small files.
-3. **Answer with MCP tasks.** Only Claude Code draws them today, and a host that does not support them fails the call ("Unsupported result type 'task'" per the Claude Code page), so the bridge would have to offer it only when the client says it supports the extension.
+3. **Answer with MCP tasks** (now implemented in `mcp_tasks.py` for `run` when the client declares `io.modelcontextprotocol/tasks`). Only Claude Code draws them today, and a host that does not support them fails the call ("Unsupported result type 'task'" per the Claude Code page), so the bridge offers it only when the client declares the extension.
 
 ## 2. Other CLIs as backends
 
@@ -99,7 +99,7 @@ A backend needs seven things. Claude, added in this change, is the worked exampl
 | Copilot CLI (`copilot`) | Yes | `copilot -p` [read] | `--output-format=json`, JSONL [read] | `--resume=<id>` [reported] | No flag; deny tools instead [read] | Premium requests, not tokens [reported] | Not found | Feasible with gaps |
 | OpenCode (`opencode`) | Yes | `opencode run` [read] | `--format json` [read] | `--session` [reported] | `--agent plan` [reported] | Yes [reported] | Not found | Feasible. The terms that matter are the model provider's |
 
-None of the five has a documented command that prints the remaining quota. Each would show as "unknown" in `get_usage`, as the Claude pool does before its first job.
+None of the five has a documented command that prints the remaining quota. Each would show as `unknown` in `usage(quota=True)`, as the Claude pool does before its first job.
 
 ### Cursor CLI
 
@@ -151,7 +151,7 @@ From adding Claude, the places a backend touches:
 | `jobs.py` | `_runner_for`, whether worktrees are allowed, the quota source |
 | `storage.py` | The SQL that guesses a pool when a row has none |
 | `quota.py` | A reading for the pool, or "unknown" |
-| `server.py` | The health probe in `list_backends`, the instructions text, a `<backend>_model` argument on `review_code` |
+| `server.py` | The health probe in `backends`, the instructions text |
 | Tests | A stand-in script for the CLI, and one test per behaviour |
 
 No table changes were needed for Claude and none would be for these: backend and pool are plain text columns.
