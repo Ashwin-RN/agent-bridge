@@ -611,24 +611,33 @@ def _running_job(job_id: str, owner_id: str, cwd: Path) -> JobRecord:
     )
 
 
+def _identity_or_skip(pid: int) -> str:
+    from agent_bridge.nesting import process_identity
+
+    identity = process_identity(pid)
+    if identity is None:
+        pytest.skip("no stable process identity on this platform")
+    return identity
+
+
 async def test_an_owner_whose_pid_now_belongs_to_another_process_is_not_live(tmp_path: Path) -> None:
     import subprocess
 
-    from agent_bridge.nesting import process_start_time
+    from agent_bridge.nesting import process_identity
     from agent_bridge.storage import BridgeStore
 
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
-        async with asyncio.timeout(10):
-            while (started := process_start_time(other.pid)) is None:
-                await asyncio.sleep(0.05)
-        assert abs(started - time.time()) < 120
+        identity = _identity_or_skip(other.pid)
+        assert process_identity(other.pid) == identity  # read twice, the same token
+        kind, _, ticks = identity.rpartition(":")
         store = BridgeStore(tmp_path / "state")
-        check = dict(is_pid_alive_fn=is_pid_alive, process_start_time_fn=process_start_time)
-        store.register_owner("same", other.pid, process_started_at=started)
-        # Registered by an earlier process that had this pid: the pid is alive, but it is not that process.
-        store.register_owner("reused", other.pid, process_started_at=started - 3600)
-        store.register_owner("older-bridge", other.pid)  # a row from a bridge that recorded no time
+        check = dict(is_pid_alive_fn=is_pid_alive, process_identity_fn=process_identity)
+        store.register_owner("same", other.pid, process_identity=identity)
+        # Registered by an earlier process that had this pid, created one tick before: the pid is alive,
+        # but it is not that process. The comparison is exact, so no tolerance hides a fast reuse.
+        store.register_owner("reused", other.pid, process_identity=f"{kind}:{int(ticks) - 1}")
+        store.register_owner("older-bridge", other.pid)  # a row from a bridge that recorded none
         assert store.is_owner_alive("same", **check) is True
         assert store.is_owner_alive("reused", **check) is False
         assert store.is_owner_alive("older-bridge", **check) is True
@@ -642,23 +651,36 @@ async def test_an_owner_whose_pid_now_belongs_to_another_process_is_not_live(tmp
         other.wait()
 
 
-async def test_a_bridge_records_its_own_process_start_time(tmp_path: Path) -> None:
+def test_owner_identity_is_read_from_the_kernel_and_never_from_the_clock() -> None:
     import os
 
-    from agent_bridge.nesting import process_start_time
+    from agent_bridge.nesting import linux_process_identity, process_identity
+
+    # Linux: the boot id and the process's start ticks since boot. A clock step moves /proc/stat's btime,
+    # which is not read, and neither of these.
+    # Fields after the name: state ppid pgrp session tty tpgid flags, 12 counters, then starttime.
+    stat = "4242 (python3 (worker) x) S 1 4242 4242 0 -1 4194560 " + " ".join(["0"] * 12) + " 987654 1 2"
+    assert linux_process_identity(stat, "1b2c-boot\n") == "linux:1b2c-boot:987654"
+    assert linux_process_identity(stat, "other-boot") == "linux:other-boot:987654"  # after a reboot
+    assert linux_process_identity("garbage", "1b2c-boot") is None
+    assert linux_process_identity(stat, "") is None
+    # Where no such token exists without the clock, none is made: the pid alone decides.
+    assert process_identity(os.getpid(), platform="darwin") is None
+
+
+async def test_a_bridge_records_its_own_process_identity(tmp_path: Path) -> None:
+    import os
 
     manager = JobManager(_settings(tmp_path))
     try:
         conn = sqlite3.connect(manager.store.db_path)
         try:
             (recorded,) = conn.execute(
-                "SELECT process_started_at FROM owners WHERE owner_id = ?", (manager.owner_id,)
+                "SELECT process_identity FROM owners WHERE owner_id = ?", (manager.owner_id,)
             ).fetchone()
         finally:
             conn.close()
-        expected = process_start_time(os.getpid())
-        assert expected is not None and recorded is not None
-        assert abs(recorded - expected) < 2.0
+        assert recorded == _identity_or_skip(os.getpid())
     finally:
         await manager.shutdown()
 
@@ -666,7 +688,7 @@ async def test_a_bridge_records_its_own_process_start_time(tmp_path: Path) -> No
 def test_an_older_owners_table_gains_the_column_and_its_rows_read_as_unknown(tmp_path: Path) -> None:
     import os
 
-    from agent_bridge.nesting import process_start_time
+    from agent_bridge.nesting import process_identity
     from agent_bridge.storage import BridgeStore
 
     state = tmp_path / "state"
@@ -685,14 +707,15 @@ def test_an_older_owners_table_gains_the_column_and_its_rows_read_as_unknown(tmp
     conn = sqlite3.connect(state / "bridge.db")
     try:
         columns = {row[1]: row for row in conn.execute("PRAGMA table_info(owners)")}
-        (value,) = conn.execute("SELECT process_started_at FROM owners WHERE owner_id = 'legacy'").fetchone()
+        (value,) = conn.execute("SELECT process_identity FROM owners WHERE owner_id = 'legacy'").fetchone()
     finally:
         conn.close()
-    assert "process_started_at" in columns and columns["process_started_at"][3] == 0  # nullable
+    assert "process_identity" in columns and columns["process_identity"][2] == "TEXT"
+    assert columns["process_identity"][3] == 0  # nullable
     assert value is None
     # Unknown: the pid check decides alone, as before.
     assert store.is_owner_alive(
-        "legacy", is_pid_alive_fn=is_pid_alive, process_start_time_fn=process_start_time
+        "legacy", is_pid_alive_fn=is_pid_alive, process_identity_fn=process_identity
     ) is True
 
 

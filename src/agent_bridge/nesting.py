@@ -186,6 +186,12 @@ def _windows_process_table() -> dict[int, int]:
 
 def _windows_start_time(pid: int) -> float | None:
     """Wall-clock creation time of a process, or None when it cannot be opened."""
+    ticks = _windows_creation_ticks(pid)
+    return None if ticks is None else (ticks - 116_444_736_000_000_000) / 10_000_000.0
+
+
+def _windows_creation_ticks(pid: int) -> int | None:
+    """A process's creation time as the kernel keeps it (100 ns FILETIME ticks), or None."""
     import ctypes
     from ctypes import wintypes
 
@@ -207,9 +213,7 @@ def _windows_start_time(pid: int) -> float | None:
         ):
             return None
         ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
-        if ticks <= 0:
-            return None
-        return (ticks - 116_444_736_000_000_000) / 10_000_000.0
+        return ticks if ticks > 0 else None
     finally:
         k32.CloseHandle(handle)
 
@@ -399,36 +403,40 @@ def _linux_boot_time() -> float | None:
     return None
 
 
-def process_start_time(pid: int) -> float | None:
-    """Wall-clock creation time of process `pid`, or None when it cannot be read.
+def linux_process_identity(stat_text: str, boot_id: str) -> str | None:
+    """`linux:<boot id>:<start ticks>` from `/proc/<pid>/stat` and `/proc/sys/kernel/random/boot_id`.
 
-    Windows reads it from the process itself, Linux from `/proc`, others from `ps`'s elapsed time (to the
-    second). Together with the pid it tells one process from a later one that was given the same number.
+    The start ticks count from boot and the boot id names the boot, so neither moves when the wall clock
+    is set; `btime` in `/proc/stat` does, and is not used.
     """
+    parsed = parse_proc_stat(stat_text)
+    boot = boot_id.strip()
+    if parsed is None or not boot:
+        return None
+    return f"linux:{boot}:{parsed[1]}"
+
+
+def process_identity(pid: int, *, platform: str | None = None) -> str | None:
+    """A token that names process `pid` itself, so that a later process given the same pid differs.
+
+    Windows: `win:<creation FILETIME ticks>`. Linux: see `linux_process_identity`. Both are read from
+    the kernel and compared exactly; nothing in them follows the wall clock. Elsewhere there is no such
+    token without reading the clock, so this is None, and the caller relies on the pid alone.
+    """
+    plat = sys.platform if platform is None else platform
     try:
         if pid <= 0:
             return None
-        if sys.platform == "win32":
-            return _windows_start_time(pid)
-        if os.path.isdir("/proc/self"):
-            boot = _linux_boot_time()
-            if boot is None:
-                return None
-            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
-                parsed = parse_proc_stat(fh.read())
-            if parsed is None:
-                return None
-            try:
-                ticks_per_second = float(os.sysconf("SC_CLK_TCK"))
-            except (ValueError, OSError, AttributeError):
-                ticks_per_second = 100.0
-            return boot + parsed[1] / ticks_per_second
-        out = subprocess.run(
-            ["ps", "-o", "etime=", "-p", str(int(pid))],
-            capture_output=True, text=True, timeout=5, check=True,
-        ).stdout
-        elapsed = parse_etime(out)
-        return time.time() - elapsed if elapsed is not None else None
+        if plat == "win32":
+            ticks = _windows_creation_ticks(pid)
+            return f"win:{ticks}" if ticks is not None else None
+        if plat.startswith("linux") and os.path.isdir("/proc/self"):
+            with open(f"/proc/{int(pid)}/stat", encoding="utf-8", errors="replace") as fh:
+                stat_text = fh.read()
+            with open("/proc/sys/kernel/random/boot_id", encoding="utf-8", errors="replace") as fh:
+                boot_id = fh.read()
+            return linux_process_identity(stat_text, boot_id)
+        return None
     except Exception:
         return None
 

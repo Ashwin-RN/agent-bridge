@@ -29,7 +29,7 @@ from agent_bridge.config import (
 from agent_bridge.claude_runner import ClaudeRunner
 from agent_bridge.dashboard import build_dashboard, resolve_window
 from agent_bridge.models import JobRecord, JobStatus, RunCancelled, RunRequest, RunResult
-from agent_bridge.nesting import NOT_NESTED, NestedBridgeError, Nesting, process_start_time
+from agent_bridge.nesting import NOT_NESTED, NestedBridgeError, Nesting, process_identity
 from agent_bridge.process_control import (
     CURRENT_PROCESS_TRACKER,
     ProcessContainmentError,
@@ -115,7 +115,7 @@ def _agy_remote_turn_cancel_guidance(job_id: str) -> str:
     )
 
 
-def _start_time_unknown(_pid: int) -> float | None:
+def _identity_unknown(_pid: int) -> str | None:
     return None
 
 
@@ -179,20 +179,20 @@ class JobManager:
         owner_id: str | None = None,
         pid: int | None = None,
         is_pid_alive_fn: Callable[[int], bool] | None = None,
-        process_start_time_fn: Callable[[int], float | None] | None = None,
+        process_identity_fn: Callable[[int], str | None] | None = None,
     ) -> None:
         self.settings = settings
         self.owner_id = owner_id or f"pid-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self._pid = pid if pid is not None else os.getpid()
         self._is_pid_alive = is_pid_alive_fn or is_pid_alive
         # An owner is live while its pid is alive and is still the process that registered, told apart by
-        # its creation time. A caller that brings its own pid check and no reader leaves the times unknown.
-        if process_start_time_fn is not None:
-            self._process_start_time: Callable[[int], float | None] = process_start_time_fn
+        # its identity. A caller that brings its own pid check and no reader leaves identities unknown.
+        if process_identity_fn is not None:
+            self._process_identity: Callable[[int], str | None] = process_identity_fn
         elif is_pid_alive_fn is not None:
-            self._process_start_time = _start_time_unknown
+            self._process_identity = _identity_unknown
         else:
-            self._process_start_time = process_start_time
+            self._process_identity = process_identity
 
         self.store = store or BridgeStore(
             settings.state_dir,
@@ -228,13 +228,13 @@ class JobManager:
         self.store.register_owner(
             self.owner_id,
             self._pid,
-            # Only this process's own time is known for certain; a pid passed in is some other process's.
-            process_started_at=self._process_start_time(self._pid) if self._pid == os.getpid() else None,
+            # Only this process's own identity is known for certain; a pid passed in is some other process's.
+            process_identity=self._process_identity(self._pid) if self._pid == os.getpid() else None,
         )
         self.store.recover_dead_owner_jobs(
             self.owner_id,
             is_pid_alive_fn=self._is_pid_alive,
-            process_start_time_fn=self._process_start_time,
+            process_identity_fn=self._process_identity,
         )
 
     def _runner_for(self, backend: str) -> NeonRunner | CodexRunner | ClaudeRunner:
@@ -731,7 +731,7 @@ class JobManager:
                         record.job_id,
                         self.owner_id,
                         is_pid_alive_fn=self._is_pid_alive,
-                        process_start_time_fn=self._process_start_time,
+                        process_identity_fn=self._process_identity,
                         confirm_prior_job_id=confirm_prior_job_id,
                     )
                 except Exception as exc:
@@ -1845,12 +1845,12 @@ class JobManager:
                     if not self.store.is_owner_alive(
                         rec.owner_id,
                         is_pid_alive_fn=self._is_pid_alive,
-                        process_start_time_fn=self._process_start_time,
+                        process_identity_fn=self._process_identity,
                     ):
                         self.store.recover_dead_owner_jobs(
                             self.owner_id,
                             is_pid_alive_fn=self._is_pid_alive,
-                            process_start_time_fn=self._process_start_time,
+                            process_identity_fn=self._process_identity,
                         )
                         refreshed = self.store.get_job(job_id)
                         if refreshed is not None:
@@ -1961,7 +1961,7 @@ class JobManager:
                     self.store.recover_dead_owner_jobs,
                     self.owner_id,
                     is_pid_alive_fn=self._is_pid_alive,
-                    process_start_time_fn=self._process_start_time,
+                    process_identity_fn=self._process_identity,
                 )
             except Exception:
                 pass
@@ -2008,7 +2008,7 @@ class JobManager:
                 self.store.is_owner_alive,
                 record.owner_id,
                 is_pid_alive_fn=self._is_pid_alive,
-                process_start_time_fn=self._process_start_time,
+                process_identity_fn=self._process_identity,
             ):
                 raise RuntimeError(
                     f"Job {job_id!r} is owned by another live bridge process ({record.owner_id}) "
@@ -2018,7 +2018,7 @@ class JobManager:
                 self.store.recover_dead_owner_jobs,
                 self.owner_id,
                 is_pid_alive_fn=self._is_pid_alive,
-                process_start_time_fn=self._process_start_time,
+                process_identity_fn=self._process_identity,
             )
             return await self.get_async(job_id)
 
@@ -2108,7 +2108,7 @@ class JobManager:
         self.store.recover_dead_owner_jobs(
             self.owner_id,
             is_pid_alive_fn=self._is_pid_alive,
-            process_start_time_fn=self._process_start_time,
+            process_identity_fn=self._process_identity,
         )
         norm_backend = normalize_backend(backend) if backend and backend.strip() else None
         norm_cwd = str(Path(cwd).expanduser().resolve()) if cwd and cwd.strip() else None
@@ -2143,7 +2143,7 @@ class JobManager:
                 self.store.recover_dead_owner_jobs,
                 self.owner_id,
                 is_pid_alive_fn=self._is_pid_alive,
-                process_start_time_fn=self._process_start_time,
+                process_identity_fn=self._process_identity,
             )
         except Exception:
             pass
@@ -2187,7 +2187,7 @@ class JobManager:
                 self.store.recover_dead_owner_jobs,
                 self.owner_id,
                 is_pid_alive_fn=self._is_pid_alive,
-                process_start_time_fn=self._process_start_time,
+                process_identity_fn=self._process_identity,
             )
         except Exception:
             pass
@@ -2249,7 +2249,7 @@ class JobManager:
             session_owner_id=self.owner_id,
             only_session=window.only_session,
             is_pid_alive_fn=self._is_pid_alive,
-            process_start_time_fn=self._process_start_time,
+            process_identity_fn=self._process_identity,
         )
         # Each backend on its own, so that one reading that fails does not take the others with it.
         results = await asyncio.gather(
