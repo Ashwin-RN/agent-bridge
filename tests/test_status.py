@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from agent_bridge import status_cmd
+from agent_bridge import nesting, status_cmd
 from agent_bridge.config import Settings, state_dir_from_env
 from agent_bridge.status_text import format_job_line, format_summary_line, sanitize
 
@@ -346,6 +346,47 @@ def test_missing_database(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     assert not state.exists()  # nothing was created
 
 
+@pytest.mark.parametrize("mode", [(), ("--json",)])
+def test_missing_state_path_is_sanitised(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], mode: tuple[str, ...]
+) -> None:
+    state = tmp_path / "odd\x1b[2J\u202epath"
+    rc, out, err = _run(capsys, state, *mode)
+    assert rc == 0 and err == ""
+    path = sanitize(state / "bridge.db")
+    if mode:
+        payload = json.loads(out)
+        assert payload["database"] == path
+        out = payload["message"]
+    assert path in out
+    assert all(control not in out for control in ("\x1b", "\u202e", "[2J"))
+
+
+def test_snapshot_error_diagnostic_is_sanitised(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise status_cmd.SnapshotError("corrupt\x1b[2J\nheader\x07")
+
+    monkeypatch.setattr(status_cmd, "read_snapshot", broken)
+    state = tmp_path / "odd\x1b[2J\u202epath"
+    rc, out, err = _run(capsys, state, "--line")
+    assert rc == 1 and out == ""
+    assert sanitize(state / "bridge.db") in err and "corrupt header" in err
+    assert err.count("\n") == 1 and "\x1b" not in err
+
+
+def test_argument_error_diagnostic_is_sanitised(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _run(capsys, tmp_path, "--unexpected=\x1b[2J\u202eforged")
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --unexpected= forged" in err
+    assert "\x1b" not in err and "\u202e" not in err
+
+
 def test_database_lacking_optional_columns(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     state = tmp_path / "old"
     state.mkdir()
@@ -362,6 +403,21 @@ def test_database_lacking_optional_columns(tmp_path: Path, capsys: pytest.Captur
     assert rc == 0 and "neon-1" in out and "neon-2" in out
     rc, out, _ = _run(capsys, state, "--json", "--parent-run", "x")
     assert json.loads(out)["active"] == []
+
+
+def test_legacy_owner_without_identity_column_uses_pid(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    conn = sqlite3.connect(tmp_path / "bridge.db")
+    try:
+        conn.execute("CREATE TABLE owners (owner_id TEXT, pid INTEGER)")
+        conn.execute("CREATE TABLE jobs (job_id TEXT, owner_id TEXT, status TEXT)")
+        conn.execute("INSERT INTO owners VALUES ('legacy', ?)", (os.getpid(),))
+        conn.execute("INSERT INTO jobs VALUES ('job', 'legacy', 'running')")
+        conn.commit()
+    finally:
+        conn.close()
+    assert _run(capsys, tmp_path, "--lines") == (0, "bridge: running\n", "")
 
 
 def test_unreadable_database_is_one_sentence_on_stderr_and_exit_1(
@@ -404,6 +460,53 @@ def test_job_of_a_closed_window_is_shown_as_window_closed(
     assert out.startswith("bridge: codex ·") and "jobs:" not in out  # only the live one
     with sqlite3.connect(state / "bridge.db") as conn:
         assert {r[0] for r in conn.execute("SELECT status FROM jobs")} == {"running", "queued"}
+
+
+def test_reused_owner_pid_is_shown_as_window_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pid = os.getpid()
+    current = nesting.process_identity(pid)
+    if current is None:
+        pytest.skip("the platform does not expose a process identity")
+    family, ticks = current.rsplit(":", 1)
+    store = _store(tmp_path)
+    store.register_owner("old", pid, process_identity=f"{family}:{int(ticks) + 1}")
+    store.register_owner("current", pid, process_identity=current)
+    _add(store, job_id="stale", owner="old")
+    _add(store, job_id="live", owner="current")
+    rc, out, err = _run(capsys, tmp_path, "--json")
+    assert rc == 0 and err == ""
+    shown = {job["job_id"]: job["display_status"] for job in json.loads(out)["active"]}
+    assert shown == {"stale": "window closed", "live": "running"}
+    rc, out, err = _run(capsys, tmp_path, "--lines")
+    assert rc == 0 and err == "" and len(out.splitlines()) == 1
+
+
+@pytest.mark.parametrize("mode", ["--line", "--lines"])
+@pytest.mark.parametrize("all_jobs", [False, True], ids=["default", "all"])
+def test_line_modes_query_only_active_rows(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+    mode: str, all_jobs: bool,
+) -> None:
+    store = _store(tmp_path)
+    _live_owner(store)
+    _add(store)
+    _add(store, job_id="finished", status="completed", finished_at=time.time() - 1)
+    queries: list[str] = []
+    connect = sqlite3.connect
+
+    def trace_connection(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = connect(*args, **kwargs)
+        conn.set_trace_callback(queries.append)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", trace_connection)
+    rc, out, err = _run(capsys, tmp_path, mode, *(["--all"] if all_jobs else []))
+    assert rc == 0 and err == "" and len(out.splitlines()) == 1
+    job_queries = [query for query in queries if "FROM jobs j" in query]
+    assert len(job_queries) == 1
+    assert "WHERE j.status IN ('queued', 'running') ORDER BY" in job_queries[0]
 
 
 def test_watch_appends_when_not_a_terminal_and_stops_on_ctrl_c(
@@ -590,22 +693,29 @@ def test_live_view_follows_a_real_writer_and_never_errors_on_a_lock(
 # --- the command: imports and start-up ----------------------------------------------------------
 
 
-def test_command_imports_neither_store_jobs_server_nor_mcp(tmp_path: Path) -> None:
+@pytest.mark.parametrize("has_database", [True, False], ids=["active", "empty"])
+def test_command_imports_neither_store_jobs_server_nor_mcp(tmp_path: Path, has_database: bool) -> None:
     state = tmp_path / "state"
-    store = _store(state)
-    _live_owner(store)
-    _add(store)
+    if has_database:
+        store = _store(state)
+        pid = os.getpid()
+        store.register_owner("owner-a", pid, process_identity=nesting.process_identity(pid))
+        _add(store)
     probe = (
         "import sys\n"
         "from agent_bridge.cli import main\n"
         "rc = main(['status', '--line'])\n"
         "bad = sorted(m for m in sys.modules if m in {'agent_bridge.storage', 'agent_bridge.jobs', "
         "'agent_bridge.server', 'agent_bridge.process_control', 'asyncio'} or m == 'mcp' or m.startswith('mcp.'))\n"
+        f"if {not has_database!r} and 'sqlite3' in sys.modules: bad.append('sqlite3')\n"
         "print('BAD=' + ','.join(bad))\n"
         "raise SystemExit(rc)\n"
     )
     done = subprocess.run([sys.executable, "-c", probe], capture_output=True, env=_env(state), timeout=60)
     out = done.stdout.decode("utf-8")  # strict: the line is UTF-8 even when piped on Windows
     assert done.returncode == 0, done.stderr
-    assert out.startswith("bridge: codex · requested gpt-6.2-sol")
     assert out.rstrip().endswith("BAD=")
+    if has_database:
+        assert out.startswith("bridge: codex · requested gpt-6.2-sol")
+    else:
+        assert out.strip() == "BAD="
