@@ -125,6 +125,24 @@ async def test_a_host_that_declares_tasks_gets_a_task_row_and_its_last_get_carri
         assert _jobs_table(manager) == before
 
 
+async def test_codex_fast_stays_on_the_task_row(tmp_path: Path) -> None:
+    mcp, manager = _bridge(tmp_path)
+    try:
+        async with _client(mcp, declares=True) as client:
+            receipt = await client.call_tool(
+                "run", {"backend": "codex", "prompt": "hi", "effort": "medium", "fast": True},
+                allow_claimed=True,
+            )
+            assert isinstance(receipt, TaskReceipt)
+            fields = receipt.model_dump(by_alias=True)
+            done = await _until(client, fields["taskId"], "completed")
+            assert " · medium · fast · " in fields["statusMessage"]
+            assert " · medium · fast · " in done["statusMessage"]
+            assert done["result"]["structuredContent"]["line"] == done["statusMessage"]
+    finally:
+        await manager.shutdown()
+
+
 async def test_a_host_that_does_not_declare_tasks_gets_the_ordinary_receipt(tmp_path: Path) -> None:
     mcp, manager = _bridge(tmp_path)
     async with _client(mcp, declares=False) as client:

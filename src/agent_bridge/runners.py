@@ -2034,6 +2034,8 @@ class CodexRunner:
             ]
             if effective_effort:
                 args.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
+            if request.fast:
+                args.extend(["-c", 'service_tier="fast"'])
             if request.review_scope == "uncommitted":
                 args.append("--uncommitted")
             elif request.review_scope == "base" and request.review_base:
@@ -2056,6 +2058,8 @@ class CodexRunner:
             ]
             if effective_effort:
                 args.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
+            if request.fast:
+                args.extend(["-c", 'service_tier="fast"'])
             if effective_model:
                 args.extend(["-m", effective_model])
             args.extend([request.session_id, "-"])
@@ -2073,6 +2077,8 @@ class CodexRunner:
         ]
         if effective_effort:
             args.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
+        if request.fast:
+            args.extend(["-c", 'service_tier="fast"'])
         if effective_model:
             args.extend(["-m", effective_model])
 

@@ -349,6 +349,12 @@ def create_server(
         if nest.nested:
             raise NestedBridgeError(nest.refusal(tool))
 
+    def _add_warnings(reply: dict[str, Any], record: JobRecord, warning: str | None = None) -> None:
+        fast_warning = f"{record.backend} has no fast tier." if record.fast and record.backend != "codex" else None
+        warnings = [message for message in (reply.get("warning"), warning, fast_warning) if message]
+        if warnings:
+            reply["warning"] = " ".join(warnings)
+
     async def _reply(
         record: JobRecord,
         *,
@@ -358,6 +364,7 @@ def create_server(
         verbose: bool = False,
     ) -> dict[str, Any]:
         """The one full reply about a job: a waited `run`, `jobs`, `cancel` and a finished task row."""
+        record = job_manager.with_fast_request(record)
         path = None
         warning = None
         if response_file and record.is_terminal and record.response:
@@ -368,8 +375,7 @@ def create_server(
         reply = record.to_detail(
             response_offset=response_offset, response_chars=response_chars, response_file=path, verbose=verbose,
         )
-        if warning:
-            reply["warning"] = warning
+        _add_warnings(reply, record, warning)
         return reply
 
     def _start_progress(ctx: Context, job_ids: list[str], stop: asyncio.Event) -> asyncio.Task[None]:
@@ -390,6 +396,7 @@ def create_server(
             record = await asyncio.to_thread(job_manager.peek, job_id)
         if record is None:
             return None
+        record = job_manager.with_fast_request(record)
         updated = record.finished_at or record.last_activity_at or record.started_at or record.created_at
         return JobView(
             status=record.status,
@@ -463,6 +470,7 @@ def create_server(
         allow_cross_pool_fallback: Annotated[
             bool, Field(description="Let agy fall back to its other quota pool.")
         ] = False,
+        fast: Annotated[bool, Field(description="Use Codex's faster tier at about twice the quota.")] = False,
     ) -> dict[str, Any]:
         _refuse_if_nested("run")
         fields: dict[str, Any] = {"prompt": prompt, "label": label}
@@ -485,6 +493,7 @@ def create_server(
             parent_run=parent_run,
             confirm_prior_job_id=confirm_prior_job_id,
             allow_cross_pool_fallback=allow_cross_pool_fallback,
+            fast=fast,
             **fields,
         )
         # A host that shows the call as a task row collects the job through the task, never by waiting.
@@ -507,10 +516,12 @@ def create_server(
         if record.is_terminal and wait > 0:
             reply = await _reply(record, response_file=response_file)
         else:
+            record = job_manager.with_fast_request(record)
             reply = record.to_receipt(
                 timeout_seconds=req.timeout_seconds,
                 next_call=_next_call(record.job_id, cap, response_file=response_file),
             )
+            _add_warnings(reply, record)
         # The note says the job is still running, so it goes only on a wait that ended before the job did.
         if wait_note and not record.is_terminal:
             reply["wait_note"] = wait_note

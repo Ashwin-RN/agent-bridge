@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from agent_bridge.config import BackendName, EffortLevel, ExecutionMode, QuotaPool, classify_quota_pool
-from agent_bridge.status_text import format_job_line
+from agent_bridge.status_text import SEP, format_job_line
 
 # A job reply holds this much of the reply text unless the caller asks for more, up to the maximum.
 DEFAULT_RESPONSE_CHARS = 20_000
@@ -62,6 +62,7 @@ class RunRequest:
     prior_quota_pool: QuotaPool | None = None
     prior_model: str | None = None
     resume_notice: str | None = None
+    fast: bool = False
 
 
 @dataclass(slots=True)
@@ -147,6 +148,7 @@ class JobRecord:
     last_activity_at: float | None = None
     model_source: Literal["observed", "requested", "default"] | None = None
     response_chars: int | None = None
+    fast: bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -167,12 +169,15 @@ class JobRecord:
 
     def line_fields(self) -> dict[str, Any]:
         """What the status line is built from. A finished job's activity is its status, so it is left out."""
+        effort = self.effort
+        if self.fast and self.backend == "codex":
+            effort = f"{effort}{SEP}fast" if effort else "fast"
         return {
             "backend": self.backend,
             "model": self.model,
             "requested_model": self.requested_model,
             "model_source": self.model_source,
-            "effort": self.effort,
+            "effort": effort,
             "status": self.status,
             "created_at": self.created_at,
             "started_at": self.started_at,
