@@ -71,6 +71,30 @@ def test_normalize_usage_preserves_provider_metrics() -> None:
     assert codex_meta["cached_input_tokens"] == 500
 
 
+def test_normalize_usage_counts_boolean_token_counters() -> None:
+    raw = {"input_tokens": True, "output_tokens": 4}
+    for backend in ("neon", "codex", "claude"):
+        norm, _ = normalize_usage(backend, raw)
+        assert norm == {
+            "input_tokens": 1,
+            "output_tokens": 4,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 5,
+        }
+    mixed, _ = normalize_usage(
+        "neon",
+        {"input_tokens": False, "output_tokens": 2.9, "cache_read_tokens": "7", "thinking_tokens": None},
+    )
+    assert mixed == {
+        "input_tokens": 0,
+        "output_tokens": 2,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 2,
+    }
+
+
 def test_sum_agy_step_usages_and_delta() -> None:
     step_total = sum_agy_step_usages(
         [

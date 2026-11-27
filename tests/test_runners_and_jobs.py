@@ -3719,3 +3719,13 @@ print(json.dumps({"event": "result", "result": {"conversation_id": cid, "status"
     assert "command" in (rec.error or "")
     assert rec.session_id == "conv-denied"
     await manager.shutdown()
+
+
+def test_missing_backend_error_lists_agy_pool_shortcuts(tmp_path: Path) -> None:
+    manager = JobManager(_make_settings(tmp_path))
+    with pytest.raises(ValueError) as exc_info:
+        manager.prepare_request(backend=None, prompt="continue", resume_from="raw-session-123")
+    assert (
+        str(exc_info.value)
+        == "backend is required ('neon', 'agy-claude', 'agy-opus', 'agy-gpt', 'codex', or 'claude')."
+    )

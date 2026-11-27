@@ -446,7 +446,7 @@ def build_quota_advisory(
             pool_entry["shared_with_own_use"] = True
         pools_info.append(pool_entry)
 
-    for adapter in registry.dashboard_backends():
+    for adapter in registry.advisory_backends():
         reading = quota_by_backend.get(adapter.name)
         if not isinstance(reading, dict) or reading.get("status") != "ok":
             continue

@@ -50,11 +50,25 @@ class BackendRegistry:
     def backend_names(self) -> tuple[str, ...]:
         return tuple(self._adapters.keys())
 
+    def selectable_backend_names(self) -> tuple[str, ...]:
+        names: list[str] = []
+        for adapter in self._adapters.values():
+            names.extend(adapter.selectable_names())
+        return tuple(names)
+
     def dashboard_backends(self) -> tuple[BackendAdapter, ...]:
         return tuple(
             sorted(
                 self._adapters.values(),
                 key=lambda adapter: adapter.dashboard_order,
+            )
+        )
+
+    def advisory_backends(self) -> tuple[BackendAdapter, ...]:
+        return tuple(
+            sorted(
+                self._adapters.values(),
+                key=lambda adapter: adapter.advisory_order,
             )
         )
 

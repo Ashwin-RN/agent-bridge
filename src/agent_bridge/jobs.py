@@ -460,7 +460,13 @@ class JobManager:
         elif inferred_backend is not None:
             resolved_backend = inferred_backend
         else:
-            available = ", ".join(repr(n) for n in self.registry.backend_names())
+            names = [repr(n) for n in self.registry.selectable_backend_names()]
+            if len(names) > 2:
+                available = ", ".join(names[:-1]) + f", or {names[-1]}"
+            elif len(names) == 2:
+                available = f"{names[0]} or {names[1]}"
+            else:
+                available = names[0] if names else ""
             raise ValueError(f"backend is required ({available}).")
 
         adapter = self.registry.get(resolved_backend)

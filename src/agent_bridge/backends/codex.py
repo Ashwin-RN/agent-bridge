@@ -1128,6 +1128,8 @@ class CodexAdapter(BackendAdapter):
     cli_name = "codex"
     aliases = ("gpt", "openai")
     dashboard_order = 10
+    advisory_order = 10
+    default_model_placeholder = "codex-default"
     missing_terminal_event_name = "turn.completed"
     capabilities = Capabilities(
         resume=True,

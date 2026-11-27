@@ -1507,6 +1507,7 @@ class AgyAdapter(BackendAdapter):
         "agy-gpt",
         "agy_gpt",
     )
+    featured_aliases = ("agy-claude", "agy-opus", "agy-gpt")
     alias_model_hints = {
         "agy-claude": "claude-sonnet-high",
         "agy_claude": "claude-sonnet-high",
@@ -1518,6 +1519,7 @@ class AgyAdapter(BackendAdapter):
         "agy_gpt": "gpt-oss",
     }
     dashboard_order = 20
+    advisory_order = 30
     missing_terminal_event_name = "a result event with a status"
     capabilities = Capabilities(
         resume=True,

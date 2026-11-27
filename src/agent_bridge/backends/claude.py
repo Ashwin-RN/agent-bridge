@@ -1062,6 +1062,7 @@ class ClaudeAdapter(BackendAdapter):
     cli_name = "claude"
     aliases = ("claude-code", "claude_code", "anthropic")
     dashboard_order = 30
+    advisory_order = 20
     missing_terminal_event_name = "result"
     capabilities = Capabilities(
         resume=True,

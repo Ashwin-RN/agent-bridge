@@ -94,7 +94,8 @@ def model_label(job: Mapping[str, Any]) -> str:
     adapter = get_adapter_optional(backend)
     reported = sanitize(job.get("model"))
     model = reported or sanitize(job.get("requested_model"))
-    if model == f"{backend}-default":
+    placeholder = adapter.default_model_placeholder if adapter is not None else None
+    if placeholder and model == placeholder:
         model = ""
     source = sanitize(job.get("model_source")).lower()
     if source not in {"observed", "requested", "default"}:

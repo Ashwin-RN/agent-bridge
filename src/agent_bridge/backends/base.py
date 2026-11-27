@@ -27,7 +27,7 @@ logger = logging.getLogger("agent_bridge.backends.base")
 
 def to_int(raw: Mapping[str, Any], key: str) -> int:
     val = raw.get(key)
-    return int(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else 0
+    return int(val) if isinstance(val, (int, float)) else 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,10 +117,13 @@ class BackendAdapter(ABC):
     name: str
     cli_name: str
     aliases: tuple[str, ...] = ()
+    featured_aliases: tuple[str, ...] = ()
     alias_model_hints: Mapping[str, str] = {}
     capabilities: Capabilities = Capabilities()
     quota_pools: tuple[QuotaPoolSpec, ...] = ()
     dashboard_order: int = 100
+    advisory_order: int = 100
+    default_model_placeholder: str | None = None
     missing_terminal_event_name: str = "a terminal event"
 
     @property
@@ -128,6 +131,10 @@ class BackendAdapter(ABC):
         return f"{self.name}'s default model"
 
     # --- Aliases and quota pools ---
+
+    def selectable_names(self) -> tuple[str, ...]:
+        """Canonical name followed by any featured aliases offered when a backend is required."""
+        return (self.name, *self.featured_aliases)
 
     def all_alias_keys(self) -> tuple[str, ...]:
         """Every lowercase name/alias accepted for this backend, canonical name first."""
