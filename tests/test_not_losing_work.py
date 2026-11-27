@@ -773,6 +773,37 @@ async def test_a_final_write_that_never_lands_gets_one_attempt_at_shutdown_and_i
     assert manager.store.get_job(rec.job_id).status == "running"  # left for the next window to recover
 
 
+async def test_a_final_write_held_up_by_a_lock_gets_one_last_attempt_at_shutdown_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    settings = _settings(tmp_path)
+    manager = JobManager(settings, codex_runner=StubCodexRunner(settings, _quick_codex(tmp_path)))
+    manager._finalize_retry_seconds = 0.3  # run() answers from memory soon; the write keeps being retried
+    lock_waits: list[float] = []
+    flushing = False
+
+    def finalize_job(record: JobRecord, **kwargs: object) -> str:
+        if flushing:
+            lock_waits.append(float(kwargs["lock_timeout"]))  # type: ignore[arg-type]
+        raise sqlite3.OperationalError("database is locked")  # another writer holds the database
+
+    monkeypatch.setattr(manager.store, "finalize_job", finalize_job)
+    rec = await manager.run(manager.prepare_request(backend="codex", prompt="go"))
+    assert rec.status == "completed"
+    flushing = True
+    with caplog.at_level(logging.WARNING, logger="agent_bridge.jobs"):
+        started = time.monotonic()
+        await manager.shutdown(flush_timeout=20)
+        took = time.monotonic() - started
+    assert took < 10  # not the whole flush timeout
+    # At most the attempt already under way when shutdown began, then the one last attempt, which may
+    # wait a few seconds for the lock.
+    assert 1 <= len(lock_waits) <= 2 and lock_waits[-1] == manager._shutdown_write_lock_seconds
+    assert "at shutdown either" in caplog.text and f"could not be stored ({rec.job_id})" in caplog.text
+
+
 async def test_a_turn_revealing_a_session_another_live_job_holds_is_stopped_and_does_not_take_it(
     tmp_path: Path,
 ) -> None:

@@ -228,6 +228,8 @@ class JobManager:
         self._finalize_error_backoff: tuple[float, float] = (0.5, 30.0)
         # Set at shutdown, so that every result not yet stored is tried once more without waiting.
         self._flush_final_writes = asyncio.Event()
+        # That one last attempt may wait this long for another writer's lock, within the shutdown flush.
+        self._shutdown_write_lock_seconds: float = 3.0
         # Tasks the manager owns rather than the request that started them, such as a cancel that must
         # finish after its caller has gone. Kept here until they end; shutdown waits for them.
         self._owned_tasks: set[asyncio.Task[Any]] = set()
@@ -976,7 +978,9 @@ class JobManager:
                 while True:
                     at_shutdown = self._flush_final_writes.is_set()
                     committed, error = await _try_commit_once(
-                        lock_timeout=0.35 if first_attempt else 0.8
+                        lock_timeout=self._shutdown_write_lock_seconds
+                        if at_shutdown
+                        else (0.35 if first_attempt else 0.8)
                     )
                     if committed:
                         if failures:
@@ -997,18 +1001,19 @@ class JobManager:
                     self._terminal_uncommitted[record.job_id] = record
                     self._local_jobs[record.job_id] = record
                     first_attempt = False
+                    if at_shutdown:
+                        # The one last attempt shutdown asked for, whatever stopped it, a lock included, so a
+                        # writer that holds the database cannot use up the whole flush. Shutdown names the job.
+                        logger.warning(
+                            "Could not store the result of job %s at shutdown either (%s).", record.job_id, error
+                        )
+                        return False
                     if error == "lock":
                         await asyncio.sleep(delay)
                         delay = min(0.4, delay * 1.5)
                         continue
                     failures += 1
                     stalled.set()
-                    if at_shutdown:
-                        # The one last attempt shutdown asked for. Shutdown names the job that is left.
-                        logger.warning(
-                            "Could not store the result of job %s at shutdown either (%s).", record.job_id, error
-                        )
-                        return False
                     if failures & (failures - 1) == 0:  # the 1st, 2nd, 4th, 8th... failure
                         logger.warning(
                             "Could not store the result of job %s (%s; failed write %d). It is kept in memory, "
