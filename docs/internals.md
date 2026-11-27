@@ -110,8 +110,10 @@ The test suite uses stand-ins for the CLIs, a throwaway state folder, and spends
 | `server.py` | The five MCP tools |
 | `dashboard.py` | The usage dashboard: its figures and its text view |
 | `jobs.py` | Requests, queueing, sessions, waiting and cancelling |
-| `runners.py` | The `agy` and `codex` command lines, worktrees, retries |
-| `claude_runner.py` | The `claude -p` command line and its output |
+| `backends/base.py`, `backends/registry.py` | What a backend adapter states (names, pools, defaults, capability flags, command line, output reduction, usage mapping, quota reading, health) and the registry core code asks |
+| `backends/agy.py`, `backends/codex.py`, `backends/claude.py` | One adapter per CLI: everything specific to that backend |
+| `runners.py` | What every backend shares: the child environment, retries, failure classes, Git worktrees. Also re-exports the moved names |
+| `claude_runner.py` | Re-exports only; the code is in `backends/claude.py` |
 | `nesting.py` | Nesting detection, process identity, and child-environment filtering |
 | `process_control.py` | Starting and stopping subprocess trees |
 | `model_resolver.py` | Model shortcuts and the `agy` model list |
