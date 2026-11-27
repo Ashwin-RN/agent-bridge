@@ -7,7 +7,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -282,6 +282,9 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         error=row["error"],
         stderr_tail=row["stderr_tail"],
         last_activity=row["last_activity"],
+        last_activity_at=row["last_activity_at"] if "last_activity_at" in keys else None,
+        model_source=row["model_source"] if "model_source" in keys else None,
+        response_chars=row["response_chars"] if "response_chars" in keys else None,
         provider_invoked=bool(row["provider_invoked"]) if "provider_invoked" in keys else (row["started_at"] is not None),
         attempts=attempts_val,
     )
@@ -472,13 +475,14 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
     else:
         rec.duration_seconds = 0.0
     rec.last_activity = "owner_exited"
+    rec.last_activity_at = now
     rec.usage_status = "missing"
 
     cur.execute(
         """
         UPDATE jobs SET
             status = ?, failure_reason = ?, provider_state = ?, retry_guidance = ?,
-            error = ?, finished_at = ?, duration_seconds = ?, last_activity = ?,
+            error = ?, finished_at = ?, duration_seconds = ?, last_activity = ?, last_activity_at = ?,
             usage_status = ?
         WHERE job_id = ? AND status IN ('queued', 'running')
         """,
@@ -491,6 +495,7 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
             rec.finished_at,
             rec.duration_seconds,
             rec.last_activity,
+            rec.last_activity_at,
             rec.usage_status,
             rec.job_id,
         ),
@@ -736,6 +741,12 @@ class BridgeStore:
                 cur.execute("UPDATE jobs SET provider_invoked = 1 WHERE started_at IS NOT NULL")
             if "cleanup_seconds" not in job_cols:
                 cur.execute("ALTER TABLE jobs ADD COLUMN cleanup_seconds REAL")
+            if "last_activity_at" not in job_cols:
+                cur.execute("ALTER TABLE jobs ADD COLUMN last_activity_at REAL")
+            if "model_source" not in job_cols:
+                cur.execute("ALTER TABLE jobs ADD COLUMN model_source TEXT")
+            if "response_chars" not in job_cols:
+                cur.execute("ALTER TABLE jobs ADD COLUMN response_chars INTEGER")
 
             # Always backfill any NULL quota_pool rows atomically (recovers interrupted prior migrations too).
             if cur.execute("SELECT 1 FROM jobs WHERE quota_pool IS NULL LIMIT 1").fetchone() is not None:
@@ -1547,6 +1558,8 @@ class BridgeStore:
             record.model or record.requested_model,
         )
         record.quota_pool = pool
+        if record.last_activity is not None and record.last_activity_at is None:
+            record.last_activity_at = time.time()
         with self._tx(write=True) as cur:
             cur.execute(
                 """
@@ -1558,10 +1571,10 @@ class BridgeStore:
                     failure_reason, provider_state, retry_guidance, created_at,
                     started_at, finished_at, duration_seconds, response, usage_json,
                     provider_metrics_json, usage_status, exit_code, error, stderr_tail,
-                    last_activity, provider_invoked
+                    last_activity, provider_invoked, last_activity_at, model_source
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1604,6 +1617,8 @@ class BridgeStore:
                     record.stderr_tail,
                     record.last_activity,
                     1 if record.provider_invoked else 0,
+                    record.last_activity_at,
+                    record.model_source,
                 ),
             )
             cur.execute(
@@ -1621,12 +1636,14 @@ class BridgeStore:
         started_at: float | None = None,
         session_id: str | None = None,
         model: str | None = None,
+        model_source: str | None = None,
         quota_pool: str | None = None,
         effective_cwd: str | None = None,
         worktree_path: str | None = None,
         worktree_branch: str | None = None,
         worktree_commit: str | None = None,
         last_activity: str | None = None,
+        last_activity_at: float | None = None,
         provider_invoked: bool | None = None,
         lock_timeout: float = 2.0,
         is_pid_alive_fn: Callable[[int], bool] | None = None,
@@ -1646,6 +1663,9 @@ class BridgeStore:
         if model is not None:
             sets.append("model = ?")
             vals.append(model)
+        if model is not None or model_source is not None:
+            sets.append("model_source = ?")
+            vals.append(model_source)
         if quota_pool is not None:
             sets.append("quota_pool = ?")
             vals.append(quota_pool)
@@ -1662,8 +1682,8 @@ class BridgeStore:
             sets.append("worktree_commit = ?")
             vals.append(worktree_commit)
         if last_activity is not None:
-            sets.append("last_activity = ?")
-            vals.append(last_activity)
+            sets.extend(("last_activity = ?", "last_activity_at = ?"))
+            vals.extend((last_activity, last_activity_at if last_activity_at is not None else time.time()))
         if provider_invoked is not None:
             sets.append("provider_invoked = ?")
             vals.append(1 if provider_invoked else 0)
@@ -1854,7 +1874,7 @@ class BridgeStore:
                     retry_guidance = ?, started_at = ?, finished_at = ?, duration_seconds = ?,
                     cleanup_seconds = ?, response = ?, usage_json = ?, provider_metrics_json = ?,
                     usage_status = ?, exit_code = ?, error = ?, stderr_tail = ?, last_activity = ?,
-                    provider_invoked = ?
+                    provider_invoked = ?, last_activity_at = ?, model_source = ?, response_chars = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -1886,6 +1906,10 @@ class BridgeStore:
                     record.stderr_tail,
                     record.last_activity,
                     1 if invoked else 0,
+                    (record.last_activity_at if record.last_activity_at is not None else now)
+                    if record.last_activity is not None else None,
+                    record.model_source,
+                    len(record.response),
                     record.job_id,
                 ),
             )
@@ -2037,8 +2061,14 @@ class BridgeStore:
             )
 
     def get_job(self, job_id: str) -> JobRecord | None:
-        with self._tx(write=False) as cur:
-            row = cur.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return self.peek_job(job_id)
+
+    def peek_job(self, job_id: str) -> JobRecord | None:
+        """Read the committed row through a connection opened read-only."""
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             return _row_to_job(row) if row is not None else None
 
     def list_jobs(

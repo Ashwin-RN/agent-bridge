@@ -47,7 +47,7 @@ from agent_bridge.quota import (
     merge_claude_quota,
     without_passed_windows,
 )
-from agent_bridge.runners import CodexRunner, NeonRunner, prepare_job_worktree
+from agent_bridge.runners import CodexRunner, ModelSource, NeonRunner, prepare_job_worktree
 
 ALL_BACKENDS: tuple[str, ...] = ("neon", "codex", "claude")
 # Backends whose edit jobs can run in a Git worktree the bridge makes for them.
@@ -599,6 +599,7 @@ class JobManager:
             if request.prompt.strip()
             else f"[review:{request.review_scope}]"
         )
+        created_at = time.time()
         record = JobRecord(
             job_id=job_id,
             owner_id=self.owner_id,
@@ -609,6 +610,7 @@ class JobManager:
             mode=request.mode,
             requested_model=request.model,
             model=request.model,
+            model_source="requested" if request.model else None,
             effort=request.effort,
             prompt_preview=_preview(preview_source),
             label=request.label,
@@ -620,7 +622,9 @@ class JobManager:
             requested_session_id=request.session_id,
             session_id=request.session_id,
             status="queued",
+            created_at=created_at,
             last_activity="queued",
+            last_activity_at=created_at,
         )
         event = asyncio.Event()
         tracker = ProcessTracker()
@@ -773,12 +777,14 @@ class JobManager:
             if other_job_id != last_holder:
                 last_holder = other_job_id
                 record.last_activity = f"waiting for session turn ({other_job_id})"
+                record.last_activity_at = time.time()
                 try:
                     await self._db(
                         self.store.update_job_progress,
                         record.job_id,
                         owner_id=self.owner_id,
                         last_activity=record.last_activity,
+                        last_activity_at=record.last_activity_at,
                         lock_timeout=0.5,
                     )
                 except Exception:
@@ -872,6 +878,7 @@ class JobManager:
                 request.model = str(prior_m)
                 record.requested_model = request.model
                 record.model = request.model
+                record.model_source = "requested"
                 record.quota_pool = classify_quota_pool(record.backend, request.model)
         if not request.prior_quota_pool and ctx.get("quota_pool"):
             request.prior_quota_pool = ctx["quota_pool"]
@@ -883,6 +890,9 @@ class JobManager:
                 record.job_id,
                 owner_id=self.owner_id,
                 effective_cwd=record.effective_cwd,
+                model=record.model,
+                model_source=record.model_source,
+                quota_pool=record.quota_pool,
                 worktree_path=record.worktree_path,
                 worktree_branch=record.worktree_branch,
                 worktree_commit=record.worktree_commit,
@@ -946,6 +956,8 @@ class JobManager:
         where this window's readers see it, and the session claim stays held.
         """
         # Mark finalizing immediately so `cancel()` and `shutdown()` wait for this commit instead of cancelling it!
+        record.last_activity_at = record.finished_at
+        record.response_chars = len(record.response)
         self._finalizing_records[record.job_id] = record
         stalled = asyncio.Event()  # set once a write has failed with something other than a lock
 
@@ -1191,15 +1203,20 @@ class JobManager:
                 )
             )
 
-        def on_model(model: str) -> None:
-            if record.model != model:
-                record.model = model
-                record.quota_pool = classify_quota_pool(record.backend, model)
-                _schedule_progress(lock_timeout=0.5, model=model, quota_pool=record.quota_pool)
+        def on_model(model: str | None, source: ModelSource) -> None:
+            if (model is not None and record.model != model) or record.model_source != source:
+                if model is not None:
+                    record.model = model
+                record.model_source = source
+                record.quota_pool = classify_quota_pool(record.backend, record.model)
+                _schedule_progress(
+                    lock_timeout=0.5, model=record.model, model_source=source, quota_pool=record.quota_pool,
+                )
 
         def on_activity(activity: str) -> None:
             record.last_activity = activity
-            _schedule_progress(lock_timeout=0.3, last_activity=activity)
+            record.last_activity_at = time.time()
+            _schedule_progress(lock_timeout=0.3, last_activity=activity, last_activity_at=record.last_activity_at)
 
         async def on_provider_start() -> None:
             if not record.provider_invoked:
@@ -1311,12 +1328,15 @@ class JobManager:
                 request.worktree_commit = wt_c
             if planned.get("git_common_dir"):
                 request.git_common_dir = planned["git_common_dir"]
+            record.last_activity = f"creating git worktree ({wt_b or wt_p or eff})"
+            record.last_activity_at = time.time()
             _schedule_progress(
                 lock_timeout=1.5,
                 worktree_path=record.worktree_path,
                 worktree_branch=record.worktree_branch,
                 worktree_commit=record.worktree_commit,
-                last_activity=f"creating git worktree ({wt_b or wt_p or eff})",
+                last_activity=record.last_activity,
+                last_activity_at=record.last_activity_at,
             )
 
         acquired_sem: asyncio.Semaphore | None = None
@@ -1353,15 +1373,16 @@ class JobManager:
                 status="running",
                 started_at=started_ts,
                 last_activity=starting_activity,
+                last_activity_at=started_ts,
             )
             record.status = "running"
             record.started_at = started_ts
             record.last_activity = starting_activity
+            record.last_activity_at = started_ts
 
             # 3. Pre-assign a dedicated Git worktree BEFORE launch and persist planned path before invoking Git.
             if request.backend in WORKTREE_BACKENDS and request.worktree:
-                record.last_activity = "preparing git worktree"
-                _schedule_progress(lock_timeout=0.5, last_activity=record.last_activity)
+                on_activity("preparing git worktree")
                 wt_info = await prepare_job_worktree(
                     job_id=record.job_id,
                     cwd=request.cwd,
@@ -1382,6 +1403,7 @@ class JobManager:
                 record.worktree_path = request.worktree_path
                 record.worktree_branch = request.worktree_branch
                 record.worktree_commit = request.worktree_commit
+                on_activity(f"worktree ready ({record.worktree_branch or record.worktree_path})")
                 try:
                     await self._db(
                         self.store.update_job_progress,
@@ -1391,7 +1413,6 @@ class JobManager:
                         worktree_path=record.worktree_path,
                         worktree_branch=record.worktree_branch,
                         worktree_commit=record.worktree_commit,
-                        last_activity=f"worktree ready ({record.worktree_branch or record.worktree_path})",
                         lock_timeout=1.5,
                     )
                 except Exception:
@@ -1670,8 +1691,9 @@ class JobManager:
             record.status = result.status
             record.response = result.response
             _prepare_session_for_finalization(result.session_id)
-            if result.model:
+            if result.model and result.model != record.model:
                 record.model = result.model
+                record.model_source = None
             record.quota_pool = classify_quota_pool(
                 record.backend,
                 record.model or record.requested_model,
@@ -1859,6 +1881,13 @@ class JobManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._cancel_jobs_owned(job_ids)
             raise
+
+    def peek(self, job_id: str) -> JobRecord | None:
+        """Read a local live record or the stored row without running recovery."""
+        local = self._terminal_uncommitted.get(job_id) or self._local_jobs.get(job_id)
+        if local is not None and local.owner_id == self.owner_id:
+            return self._visible_record(local)
+        return self.store.peek_job(job_id)
 
     def get(self, job_id: str) -> JobRecord:
         uncommitted = self._terminal_uncommitted.get(job_id)

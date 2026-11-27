@@ -140,6 +140,9 @@ class JobRecord:
     last_activity: str | None = None
     provider_invoked: bool = False
     attempts: list[dict[str, Any]] | None = None
+    last_activity_at: float | None = None
+    model_source: Literal["observed", "requested", "default"] | None = None
+    response_chars: int | None = None
 
     @property
     def is_terminal(self) -> bool:

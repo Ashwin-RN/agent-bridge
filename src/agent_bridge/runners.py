@@ -16,7 +16,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agent_bridge.config import Settings, classify_quota_pool, read_codex_local_defaults
 from agent_bridge.model_resolver import (
@@ -67,7 +67,8 @@ TRANSIENT_RETRY_MIN_REMAINING_SECONDS = 12.0
 
 OnSessionCallback = Callable[[str], None]
 OnActivityCallback = Callable[[str], None]
-OnModelCallback = Callable[[str], None]
+ModelSource = Literal["observed", "requested", "default"]
+OnModelCallback = Callable[[str | None, ModelSource], None]
 OnProviderStartCallback = Callable[[], Awaitable[None] | None]
 OnAttemptCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 OnWorktreePlannedCallback = Callable[[dict[str, str | None]], None]
@@ -1096,6 +1097,8 @@ class NeonRunner:
     ) -> RunResult:
         started = time.monotonic()
         remaining = deadline - started
+        if on_model:
+            on_model(resolved_model, "requested" if resolved_model else "default")
         if remaining <= 0.05:
             status, reason, pstate, guidance = classify_failure(
                 backend="neon",
@@ -1127,8 +1130,6 @@ class NeonRunner:
             extra_dirs=extra_dirs,
             remaining_seconds=remaining,
         )
-        if on_model and resolved_model:
-            on_model(resolved_model)
         if on_activity:
             on_activity(f"running agy ({resolved_model or 'agy-default'})")
 
@@ -1230,7 +1231,7 @@ class NeonRunner:
                     if isinstance(im, str) and im:
                         actual_model = im
                         if on_model:
-                            on_model(im)
+                            on_model(im, "observed")
                     pm = init_obj.get("permission_mode")
                     if isinstance(pm, str) and pm:
                         init_permission_mode = pm
@@ -1823,6 +1824,8 @@ class NeonRunner:
                         allow_cross_pool_fallback=request.allow_cross_pool_fallback,
                     )
                 except ModelPoolUnavailableError as exc:
+                    if on_model and request.model and request.model != result.model:
+                        on_model(request.model, "requested")
                     return RunResult(
                         status="failed",
                         session_id=result.session_id or request.session_id,
@@ -1854,6 +1857,8 @@ class NeonRunner:
                         different_model = None
 
                 if different_model is None and not request.allow_cross_pool_fallback:
+                    if on_model and resolution.resolved and resolution.resolved != result.model:
+                        on_model(resolution.resolved, "requested")
                     return RunResult(
                         status="failed",
                         session_id=result.session_id or request.session_id,
@@ -2094,6 +2099,8 @@ class CodexRunner:
         local_defaults = read_codex_local_defaults()
         reported_model = effective_model or local_defaults.get("model") or "codex-default"
         reported_effort = effective_effort or local_defaults.get("model_reasoning_effort")
+        if on_model:
+            on_model(reported_model, "requested" if effective_model else "default")
 
         remaining = deadline - started
         if remaining <= 0.05:
@@ -2143,8 +2150,6 @@ class CodexRunner:
             effective_model=effective_model,
             effective_effort=effective_effort,
         )
-        if on_model:
-            on_model(reported_model)
         if on_activity:
             on_activity(f"running codex ({reported_model})")
 
