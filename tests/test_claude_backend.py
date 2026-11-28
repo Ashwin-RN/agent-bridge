@@ -460,13 +460,13 @@ async def test_cancel_while_the_quota_reading_is_stored_still_leaves_a_finished_
     release = asyncio.Event()
     committed_when_entered: list[str | None] = []
 
-    async def slow_remember(_metrics: Any) -> None:
+    async def slow_remember(_adapter: Any, _metrics: Any) -> None:
         stored = manager.store.list_jobs(limit=5)
         committed_when_entered.append(stored[0].status if stored else None)
         entered.set()
         await release.wait()
 
-    manager._remember_claude_rate_limit = slow_remember  # type: ignore[method-assign]
+    manager._remember_job_quota = slow_remember  # type: ignore[method-assign]
     started = await manager.start_async(manager.prepare_request(backend="claude", prompt="quota"))
     await asyncio.wait_for(entered.wait(), timeout=30)
     # The terminal row was already in the database when the quota step began.

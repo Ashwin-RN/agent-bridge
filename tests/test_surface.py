@@ -406,7 +406,7 @@ async def test_codex_fast_cli_override(tmp_path: Path, form: str) -> None:
 
 
 async def test_codex_fast_is_opt_in_on_each_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("agent_bridge.runners.read_codex_local_defaults", lambda: {})
+    monkeypatch.setattr("agent_bridge.backends.codex.read_codex_local_defaults", lambda: {})
     mcp, manager = _bridge(tmp_path)
     args = {"backend": "codex", "prompt": "ARGV", "wait_seconds": 30}
     try:

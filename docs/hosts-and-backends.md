@@ -141,20 +141,22 @@ None of the five has a documented command that prints the remaining quota. Each 
 
 ### What a new backend costs in this codebase
 
-From adding Claude, the places a backend touches:
+A backend is one adapter: a subclass of `BackendAdapter` (`src/agent_bridge/backends/base.py`) in its own module under `src/agent_bridge/backends/`, plus one `registry.register(...)` line in `build_default_registry` (`backends/registry.py`). Core code (`jobs.py`, `server.py`, `storage.py`, `quota.py`, `dashboard.py`) asks the registry instead of branching on a backend's name.
 
-| File | What to add |
+| The adapter states | With |
 |---|---|
-| `config.py` | The backend and pool names, aliases, defaults, three settings (`*_MODEL`, `*_EFFORT`, `*_BIN`) |
-| A runner module | Find the binary, build the command line, parse the output, classify failures. `claude_runner.py` is about 600 lines, half of it shared shape with `CodexRunner` |
-| `usage.py` | Turn the CLI's token fields into the bridge's five |
-| `jobs.py` | `_runner_for`, whether worktrees are allowed, the quota source |
-| `storage.py` | The SQL that guesses a pool when a row has none |
-| `quota.py` | A reading for the pool, or "unknown" |
-| `server.py` | The health probe in `backends`, the instructions text |
-| Tests | A stand-in script for the CLI, and one test per behaviour |
+| Its name, aliases and the pool each draws on | `name`, `cli_name`, `aliases`, `alias_model_hints`, `quota_pools` |
+| Defaults and how a requested model resolves | `defaults`, `resolve_model_and_effort` |
+| What it can do | `capabilities`: resume, worktree edits, built-in review, a model catalogue, a fast tier, extra directories |
+| How to find and check its binary | `resolve_command`, `check_health` |
+| The command line for a new run, a resume and a review | `build_command` |
+| How its output becomes a result | `parse_stream`, which must say whether a terminal event was seen |
+| How its token fields map onto the bridge's five | `normalize_usage` |
+| A quota reading, if it has one | `read_quota`; without it the pool shows "no quota read-out" |
 
-No table changes were needed for Claude and none would be for these: backend and pool are plain text columns.
+`tests/test_fake_backend.py` is the worked example: a fourth backend defined in the test alone, whose job runs through `run` and `jobs`, is listed by `backends`, and is counted in `usage`, the quota view and the dashboard.
+
+Still outside the adapter: the tool descriptions and server instructions name the three CLIs in prose; `config.py` holds each built-in's settings (`*_MODEL`, `*_EFFORT`, `*_BIN`); `JobManager` keeps the `neon_runner`, `codex_runner` and `claude_runner` keywords for the tests that pass stand-ins; the quota advice in `quota.py` takes the Codex and Claude default-model labels by name; and the SQL in `storage.py` that guesses a pool for an old row with none knows `neon`. No table change is needed: backend and pool are plain text columns.
 
 Before the code, two things per tool, in this order: read its terms for scripted use on the sign-in you mean to use, then run it by hand once in each mode and keep the output. For Claude that hand run found three things no document had: the output carries the plan limits, `auto` mode works headless on a plan, and `auto` allowed a `git push` the prompt asked for.
 

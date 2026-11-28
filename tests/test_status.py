@@ -127,6 +127,24 @@ def test_neon_and_claude_models_are_shown_plain() -> None:
     assert "requested" not in neon + claude
 
 
+def test_legacy_claude_default_model_without_source_is_preserved() -> None:
+    line = format_job_line(
+        _job(backend="claude", model="claude-default", requested_model=None, model_source=None),
+        now=NOW,
+    )
+    assert line == "claude · claude-default · xhigh · running 2m10s · reading jobs.py"
+    neon_line = format_job_line(
+        _job(backend="neon", model="neon-default", requested_model=None, model_source=None),
+        now=NOW,
+    )
+    assert neon_line == "neon · neon-default · xhigh · running 2m10s · reading jobs.py"
+    explicit_default = format_job_line(
+        _job(backend="claude", model="claude-default", requested_model=None, model_source="default"),
+        now=NOW,
+    )
+    assert explicit_default == "claude · Claude's default model · xhigh · running 2m10s · reading jobs.py"
+
+
 def test_model_source_overrides_the_backend_rule() -> None:
     assert format_job_line(_job(model_source="observed"), now=NOW).startswith("codex · gpt-6.2-sol ·")
     assert "requested claude-x" in format_job_line(

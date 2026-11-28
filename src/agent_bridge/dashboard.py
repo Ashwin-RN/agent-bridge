@@ -41,10 +41,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from agent_bridge.backends.claude import CLAUDE_NO_READING, CLAUDE_SHARED_NOTE
+from agent_bridge.backends.registry import get_adapter_optional, get_default_registry
 from agent_bridge.quota import build_quota_advisory
 
-BACKENDS: tuple[str, ...] = ("codex", "neon", "claude")
-QUOTA_POOLS: tuple[str, ...] = ("codex", "agy_gemini", "agy_claude_gpt", "claude")
 NAMED_PERIODS: tuple[str, ...] = ("today", "7d", "30d", "all", "session")
 TOKEN_FIELDS: tuple[str, ...] = (
     "input_tokens",
@@ -87,31 +87,34 @@ TOKEN_NOTE = (
     "cached_tokens can exceed total_tokens."
 )
 
-POOL_LABELS: dict[str, str] = {
-    "codex": "Codex",
-    "agy_gemini": "Antigravity Gemini",
-    "agy_claude_gpt": "Antigravity Claude+GPT",
-    "claude": "Claude plan",
-}
-# Which backend's reading holds each pool.
-_POOL_BACKEND: dict[str, str] = {
-    "codex": "codex",
-    "agy_gemini": "neon",
-    "agy_claude_gpt": "neon",
-    "claude": "claude",
-}
+def _backends() -> tuple[str, ...]:
+    return tuple(a.name for a in get_default_registry().dashboard_backends())
+
+
+def _quota_pools() -> tuple[str, ...]:
+    return tuple(spec.pool for spec in get_default_registry().quota_pools())
+
+
+def _pool_labels() -> dict[str, str]:
+    return {spec.pool: spec.dashboard_label for spec in get_default_registry().quota_pools()}
+
+
+def __getattr__(name: str) -> Any:
+    if name == "BACKENDS":
+        return _backends()
+    if name == "QUOTA_POOLS":
+        return _quota_pools()
+    if name == "POOL_LABELS":
+        return _pool_labels()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 QUOTA_SOURCE = (
     "Read from each CLI, not from the bridge's records. Each pool carries the time it was read. The "
     "Claude plan has no live read-out: its reading is what the Claude jobs run through the bridge "
     "reported, each window kept until its own reset, and its time is that of its oldest figure."
 )
-CLAUDE_NO_READING = "Claude Code prints none; it shows after a Claude job runs through the bridge"
 NO_PLAN_WINDOW = "the reading holds no 5h or weekly window"
-_AGY_POOLS: frozenset[str] = frozenset({"agy_gemini", "agy_claude_gpt"})
-CLAUDE_SHARED_NOTE = (
-    "Claude plan: as its bridge jobs reported it, at the read time or later. Your own Claude Code and "
-    "claude.ai use draw on it too."
-)
 BAR_WIDTH = 10
 REASON_LIMIT = 70
 
@@ -278,19 +281,15 @@ def build_quota_section(readings: dict[str, Any], *, now_ts: float) -> dict[str,
 
     Every pool is listed in a fixed order. One with no usable reading has status `unknown` and a reason.
     """
+    registry = get_default_registry()
+    pool_specs = registry.quota_pools()
     windows_by_pool: dict[str, list[dict[str, Any]]] = {}
-    for backend in ("codex", "claude"):
-        reading = readings.get(backend)
+    for adapter in registry.adapters():
+        reading = readings.get(adapter.name)
         if isinstance(reading, dict) and reading.get("status") == "ok":
-            windows_by_pool[backend] = [w for w in reading.get("windows") or [] if isinstance(w, dict)]
-    neon = readings.get("neon")
-    if isinstance(neon, dict) and neon.get("status") == "ok":
-        for group in neon.get("groups") or []:
-            # Only Antigravity's own pools, and every group of a pool: one group cannot drop another.
-            if isinstance(group, dict) and group.get("pool") in _AGY_POOLS:
-                windows_by_pool.setdefault(str(group["pool"]), []).extend(
-                    w for w in group.get("windows") or [] if isinstance(w, dict)
-                )
+            extracted, _ = adapter.extract_quota_windows(reading)
+            for pool_name, wins in extracted.items():
+                windows_by_pool.setdefault(pool_name, []).extend(wins)
 
     try:
         priorities = {p["pool"]: p["priority"] for p in build_quota_advisory(readings)["pools"]}
@@ -299,10 +298,10 @@ def build_quota_section(readings: dict[str, Any], *, now_ts: float) -> dict[str,
 
     pools: list[dict[str, Any]] = []
     notes: list[str] = []
-    for pool in QUOTA_POOLS:
-        label = POOL_LABELS[pool]
-        backend = _POOL_BACKEND[pool]
-        reading = readings.get(backend)
+    for spec in pool_specs:
+        pool = spec.pool
+        label = spec.dashboard_label
+        reading = readings.get(spec.backend)
         reading = reading if isinstance(reading, dict) else {}
         entry: dict[str, Any] = {"pool": pool, "label": label}
 
@@ -314,8 +313,8 @@ def build_quota_section(readings: dict[str, Any], *, now_ts: float) -> dict[str,
                 reason = NO_PLAN_WINDOW  # such as a limit on one model only
             elif reading.get("error"):
                 reason = _short_reason(reading["error"])
-            elif backend == "claude":
-                reason = CLAUDE_NO_READING
+            elif spec.no_reading_reason:
+                reason = spec.no_reading_reason
             elif reading.get("status") == "ok":
                 reason = "the CLI reported no window for this pool"
             else:
@@ -333,7 +332,7 @@ def build_quota_section(readings: dict[str, Any], *, now_ts: float) -> dict[str,
             status="ok",
             as_of=_as_of(read_at, now_ts=now_ts),
             read_at=read_at,
-            source="last_claude_job" if backend == "claude" else ("cached" if reading.get("cached") else "live"),
+            source=spec.default_source or ("cached" if reading.get("cached") else "live"),
             five_hour=five,
             weekly=week,
             priority=priority,
@@ -363,8 +362,8 @@ def build_quota_section(readings: dict[str, Any], *, now_ts: float) -> dict[str,
                 if w is not None
             )
             notes.append(f"{label}: running low ({left} left).")
-        if backend == "claude":
-            notes.append(CLAUDE_SHARED_NOTE)
+        if spec.shared_note:
+            notes.append(spec.shared_note)
 
     return {"source": QUOTA_SOURCE, "pools": pools, "notes": notes}
 
@@ -381,9 +380,10 @@ def build_dashboard(
 
     `quota` is the readings from `JobManager.get_quota`. Without it the view has no quota section.
     """
+    registry = get_default_registry()
     total = _bucket()
-    by_backend: dict[str, dict[str, Any]] = {name: _bucket() for name in BACKENDS}
-    by_pool: dict[str, dict[str, Any]] = {name: _bucket() for name in QUOTA_POOLS}
+    by_backend: dict[str, dict[str, Any]] = {a.name: _bucket() for a in registry.dashboard_backends()}
+    by_pool: dict[str, dict[str, Any]] = {spec.pool: _bucket() for spec in registry.quota_pools()}
     by_model: dict[str, dict[str, Any]] = {}
     this_session = _bucket()
     other_sessions = _bucket()
@@ -451,7 +451,8 @@ def build_dashboard(
                 # The launch is recorded before the CLI starts, and the bridge saw the job stop.
                 never_started[job_id] = None
 
-        if backend == "claude" and (counted or usage_status == "partial"):
+        adapter = get_adapter_optional(backend)
+        if adapter is not None and adapter.capabilities.tracks_native_subagents and (counted or usage_status == "partial"):
             metrics = _metrics(row["provider_metrics_json"])
             spawned = metrics.get("native_subagents")
             if isinstance(spawned, int) and not isinstance(spawned, bool):
@@ -694,9 +695,10 @@ def _used_lines(d: dict[str, Any]) -> list[str]:
             return [name, _num(b["runs"]), _num(b["tokens"]["total_tokens"]), _duration(b["duration_seconds"])]
 
         models = d["by_model"]
+        pool_labels = _pool_labels()
         rows: list[list[str]] = []
         for pool, bucket in d["by_quota_pool"].items():
-            rows.append(cells(POOL_LABELS.get(pool, pool), bucket))
+            rows.append(cells(pool_labels.get(pool, pool), bucket))
             rows += [
                 cells("  " + key.split(":", 1)[-1], b) for key, b in models.items() if b.get("quota_pool") == pool
             ]

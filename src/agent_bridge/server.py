@@ -25,11 +25,12 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from agent_bridge import host_limits
-from agent_bridge.config import EffortLevel, Settings, normalize_backend
+from agent_bridge.backends.base import BackendAdapter, unhealthy_payload
+from agent_bridge.backends.registry import get_adapter, get_adapter_optional
+from agent_bridge.config import EffortLevel, Settings
 from agent_bridge.hosts import Host
-from agent_bridge.jobs import ALL_BACKENDS, JobManager, _JOB_ID_RE
+from agent_bridge.jobs import JobManager, _JOB_ID_RE
 from agent_bridge.mcp_tasks import TASK_CALL, JobTasks, JobView, pump_progress
-from agent_bridge.model_resolver import ModelPoolUnavailableError
 from agent_bridge.models import DEFAULT_RESPONSE_CHARS, JobRecord
 from agent_bridge.nesting import UNKNOWN_NESTING, NestedBridgeError, Nesting, detect_nesting
 from agent_bridge.quota import build_quota_view
@@ -198,9 +199,10 @@ def _review_request(
     if scope == "commit" and not (review.commit and review.commit.strip()):
         raise ValueError("review.commit (a SHA) is required when review.scope='commit'.")
     focus = "\n\n".join(p.strip() for p in (review.focus, prompt) if p and p.strip())
-    name = normalize_backend(backend)
+    adapter = get_adapter(backend)
+    name = adapter.name
     out: dict[str, Any] = {"label": label or f"{name}-review-{scope}"}
-    if name == "codex" and not focus:
+    if adapter.capabilities.builtin_review and not focus:
         out.update(prompt="", review_scope=scope, review_base=base, review_commit=review.commit)
     else:
         out["prompt"] = _build_review_prompt(scope, base=base, commit=review.commit, focus=focus or None)
@@ -350,7 +352,9 @@ def create_server(
             raise NestedBridgeError(nest.refusal(tool))
 
     def _add_warnings(reply: dict[str, Any], record: JobRecord, warning: str | None = None) -> None:
-        fast_warning = f"{record.backend} has no fast tier." if record.fast and record.backend != "codex" else None
+        adapter = get_adapter_optional(record.backend)
+        has_fast = adapter.capabilities.fast_tier if adapter is not None else False
+        fast_warning = f"{record.backend} has no fast tier." if record.fast and not has_fast else None
         warnings = [message for message in (reply.get("warning"), warning, fast_warning) if message]
         if warnings:
             reply["warning"] = " ".join(warnings)
@@ -661,7 +665,8 @@ def create_server(
         out = _usage_summary_reply(summary, verbose=verbose)
         if quota:
             # Every pool, whatever the filters: a pool left unread would read as one that failed.
-            out["quota"] = build_quota_view(await job_manager.get_quota(list(ALL_BACKENDS)))
+            quota_backends = [a.name for a in job_manager.registry.adapters() if a.quota_pools]
+            out["quota"] = build_quota_view(await job_manager.get_quota(quota_backends))
         return out
 
     @mcp.tool(
@@ -671,83 +676,19 @@ def create_server(
     )
     @_reported
     async def backends(ctx: Context, refresh_models: bool = False) -> dict[str, Any]:
-        def _unhealthy(exc: Exception) -> dict[str, Any]:
-            return {
-                "command_found": False,
-                "healthy": False,
-                "available": False,
-                "command": None,
-                "version": None,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+        adapters = job_manager.registry.adapters()
 
-        async def _probe_neon() -> dict[str, Any]:
+        async def _probe(adapter: BackendAdapter) -> tuple[str, dict[str, Any]]:
+            runner = job_manager.runner_for(adapter.name)
             try:
-                neon_health = await job_manager.neon_runner.check_health()
+                info = await adapter.probe_backend(runner, cfg, refresh_models=refresh_models)
             except Exception as exc:
-                neon_health = _unhealthy(exc)
-            info: dict[str, Any] = {
-                "backend": "neon",
-                "cli": "agy",
-                "default_intent": cfg.default_neon_model,
-                **neon_health,
-            }
-            catalog = job_manager.neon_runner.catalog
-            if neon_health.get("healthy"):
-                try:
-                    models = await job_manager.neon_runner.list_models(refresh=refresh_models)
-                except Exception as exc:
-                    models = []
-                    info["catalog_error"] = f"{type(exc).__name__}: {exc}"
-                info.update(catalog.status_info())
-                info["models"] = models
-                info["quota_pools"] = catalog.group_models_by_quota_pool()
-                info["resolved_shortcuts"] = catalog.summarize_latest_aliases()
-                try:
-                    default_res = await catalog.resolve(None, default_intent=cfg.default_neon_model)
-                    info["resolved_default_model"] = default_res.resolved
-                except ModelPoolUnavailableError as exc:
-                    info["resolved_default_model"] = None
-                    info["catalog_error"] = str(exc)
-                    info["available"] = False
-                except Exception as exc:
-                    info["resolved_default_model"] = None
-                    info["catalog_error"] = f"{type(exc).__name__}: {exc}"
-                    info["available"] = False
-            else:
-                info.update(catalog.status_info())
-            return info
+                info = {"backend": adapter.name, "cli": adapter.cli_name, **unhealthy_payload(exc)}
+            return adapter.name, info
 
-        async def _probe_codex() -> dict[str, Any]:
-            try:
-                codex_health = await job_manager.codex_runner.check_health()
-            except Exception as exc:
-                codex_health = _unhealthy(exc)
-            return {
-                "backend": "codex",
-                "cli": "codex",
-                "default_model": cfg.default_codex_model,
-                "default_effort": cfg.default_codex_effort,
-                **codex_health,
-            }
-
-        async def _probe_claude() -> dict[str, Any]:
-            try:
-                claude_health = await job_manager.claude_runner.check_health()
-            except Exception as exc:
-                claude_health = _unhealthy(exc)
-            return {
-                "backend": "claude",
-                "cli": "claude",
-                "quota_pool": "claude",
-                "default_model": cfg.default_claude_model,
-                "default_effort": cfg.default_claude_effort,
-                "model_names": ["sonnet", "opus", "haiku", "fable", "<full model id>"],
-                **claude_health,
-            }
-
-        neon_info, codex_info, claude_info, (host, cap, _) = await asyncio.gather(
-            _probe_neon(), _probe_codex(), _probe_claude(), _host_details(ctx),
+        *probed, (host, cap, _) = await asyncio.gather(
+            *(_probe(adapter) for adapter in adapters),
+            _host_details(ctx),
         )
         return {
             "host": host.name if host is not None else None,
@@ -757,7 +698,7 @@ def create_server(
             "max_concurrent_jobs_per_process": cfg.max_concurrent_jobs,
             "db_path": str(job_manager.store.db_path),
             "nesting": job_manager.nesting.to_dict(),
-            "backends": {"neon": neon_info, "codex": codex_info, "claude": claude_info},
+            "backends": dict(probed),
         }
 
     return mcp, job_manager

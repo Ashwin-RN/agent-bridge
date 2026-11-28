@@ -20,7 +20,8 @@ from mcp_types import CallToolResult, Request, Result
 from pydantic import ConfigDict, TypeAdapter
 
 from agent_bridge import server as server_mod
-from agent_bridge.jobs import AGY_REMOTE_TURN_CANCEL_ERROR, JobManager
+from agent_bridge.backends.agy import AGY_REMOTE_TURN_CANCEL_ERROR
+from agent_bridge.jobs import JobManager
 from agent_bridge.nesting import NOT_NESTED
 from agent_bridge.process_control import is_pid_alive
 from agent_bridge.server import create_server

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from agent_bridge import process_control as process_control_module
 from agent_bridge import quota as quota_module
 from agent_bridge.quota import (
     CLAUDE_QUOTA_NOTE,
@@ -408,7 +409,7 @@ async def test_fetch_codex_quota_timeout_reports_wait_duration(monkeypatch: pyte
     async def _fake_spawn(*_args: Any, **_kwargs: Any) -> tuple[_FakeProc, _FakeManaged]:
         return _FakeProc(), _FakeManaged()
 
-    monkeypatch.setattr(quota_module, "spawn_managed_process", _fake_spawn)
+    monkeypatch.setattr(process_control_module, "spawn_managed_process", _fake_spawn)
 
     res = await fetch_codex_quota(["nonexistent-codex"], timeout_seconds=0.1)
     assert terminated is True
@@ -416,3 +417,74 @@ async def test_fetch_codex_quota_timeout_reports_wait_duration(monkeypatch: pyte
     assert res["error"] != "TimeoutError: "
     assert "0.1s" in res["error"]
     assert "timed out" in res["error"].lower()
+
+
+def test_advisory_tie_order_matches_legacy_pool_order() -> None:
+    same_reset = _iso_offset(days=3)
+    readings = {
+        "claude": {
+            "backend": "claude",
+            "pool": "claude",
+            "status": "ok",
+            "fetched_at": _iso_offset(minutes=-1),
+            "windows": [
+                {"id": "seven_day", "window": "weekly", "remaining_percent": 55.0, "reset_time": same_reset},
+            ],
+        },
+        "neon": {
+            "backend": "neon",
+            "status": "ok",
+            "fetched_at": _iso_offset(minutes=-1),
+            "groups": [
+                {
+                    "name": "Gemini Models",
+                    "windows": [
+                        {"id": "gemini-weekly", "window": "weekly", "remaining_percent": 55.0, "reset_time": same_reset},
+                    ],
+                },
+            ],
+        },
+    }
+    adv = build_quota_advisory(readings, now_utc=NOW_DT)
+    assert adv["summary"] == "Best available pool: agy_gemini (55.0% effective remaining). Next reset: claude weekly in 3d."
+    assert [r["pool"] for r in adv["upcoming_resets"]] == ["claude", "agy_gemini"]
+    assert [p["pool"] for p in adv["pools"]] == ["claude", "agy_gemini"]
+    assert adv["recommended_order"] == ["agy_gemini"]
+
+    expiring_reset = _iso_offset(hours=12)
+    expiring_readings = {
+        "codex": {
+            "backend": "codex",
+            "status": "ok",
+            "fetched_at": _iso_offset(minutes=-1),
+            "windows": [
+                {"window": "weekly", "remaining_percent": 55.0, "reset_time": expiring_reset},
+            ],
+        },
+        "claude": {
+            "backend": "claude",
+            "pool": "claude",
+            "status": "ok",
+            "fetched_at": _iso_offset(minutes=-1),
+            "windows": [
+                {"id": "seven_day", "window": "weekly", "remaining_percent": 55.0, "reset_time": expiring_reset},
+            ],
+        },
+        "neon": {
+            "backend": "neon",
+            "status": "ok",
+            "fetched_at": _iso_offset(minutes=-1),
+            "groups": [
+                {
+                    "name": "Gemini Models",
+                    "windows": [
+                        {"id": "gemini-weekly", "window": "weekly", "remaining_percent": 55.0, "reset_time": expiring_reset},
+                    ],
+                },
+            ],
+        },
+    }
+    exp_adv = build_quota_advisory(expiring_readings, now_utc=NOW_DT)
+    assert exp_adv["recommended_order"] == ["codex", "agy_gemini"]
+    assert [r["pool"] for r in exp_adv["upcoming_resets"]] == ["codex", "claude", "agy_gemini"]
+    assert [a.split(":")[0] for a in exp_adv["expiring_weekly_alerts"]] == ["codex", "agy_gemini"]

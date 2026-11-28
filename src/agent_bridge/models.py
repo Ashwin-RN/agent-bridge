@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from agent_bridge.backends.registry import get_adapter_optional
 from agent_bridge.config import BackendName, EffortLevel, ExecutionMode, QuotaPool, classify_quota_pool
 from agent_bridge.status_text import SEP, format_job_line
 
@@ -170,7 +171,8 @@ class JobRecord:
     def line_fields(self) -> dict[str, Any]:
         """What the status line is built from. A finished job's activity is its status, so it is left out."""
         effort = self.effort
-        if self.fast and self.backend == "codex":
+        adapter = get_adapter_optional(self.backend)
+        if self.fast and adapter is not None and adapter.capabilities.fast_tier:
             effort = f"{effort}{SEP}fast" if effort else "fast"
         return {
             "backend": self.backend,
@@ -197,7 +199,9 @@ class JobRecord:
             return self.model_source
         if self.model_value() is None:
             return "default"
-        return "requested" if self.backend == "codex" or not self.model else "observed"
+        adapter = get_adapter_optional(self.backend)
+        reports_observed = adapter.capabilities.reports_observed_model if adapter is not None else True
+        return "requested" if (not reports_observed) or not self.model else "observed"
 
     def to_summary(self, *, now: float | None = None) -> dict[str, Any]:
         """One entry of a job list: the line, the ids, and why it failed when it did."""
