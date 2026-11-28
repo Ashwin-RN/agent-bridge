@@ -87,7 +87,7 @@ Two skills ship in `skills/`:
 
 `skills/bridge-usage/SKILL.md` works in Claude Code, Codex and Antigravity. The bridge works out every figure; the skill only picks the period and shows `text` unchanged, so the host's model has nothing to add up or round.
 
-`agent-bridge install` offers to install `bridge-usage` automatically. For manual installation, see [Install the skills](install.md#install-the-skills).
+`agent-bridge install` offers to install both skills. For manual installation, see [Install the skills](install.md#install-the-skills).
 
 | Host | Type |
 |---|---|

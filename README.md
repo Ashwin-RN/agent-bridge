@@ -25,46 +25,78 @@ What you can do with it:
 
 | Thing | Why |
 |---|---|
-| Python 3.12+ and [`uv`](https://docs.astral.sh/uv/) | To install and run the bridge |
-| A host (Claude Code, Codex, Antigravity or another stdio MCP client) | The CLI that calls the bridge |
-| `codex` CLI, installed and signed in | For the `codex` backend |
-| `agy` CLI 1.5.7 or newer, installed and signed in | For Gemini, Claude and GPT models on Antigravity (1.5.7+ lets headless shell commands run in `agy`'s sandbox) |
-| `claude` CLI (Claude Code) 2.1.259 or newer, installed and signed in | For the `claude` backend (see [Claude as a backend](docs/backends-and-models.md#claude-as-a-backend)) |
-| `git` | Only for worktree edits and code review |
+| [`uv`](https://docs.astral.sh/uv/getting-started/installation/) | Installs and runs the bridge. It fetches Python 3.12 itself if the machine has none |
+| `git` | To clone the repository; also for worktree edits and code review |
+| A host: Claude Code, Codex, Antigravity or another stdio MCP client | The CLI that calls the bridge |
+| `codex` CLI, signed in | The `codex` backend |
+| `agy` CLI 1.5.7 or newer, signed in | Gemini, Claude and GPT models on Antigravity |
+| `claude` CLI (Claude Code) 2.1.259 or newer, signed in | The `claude` backend (see [Claude as a backend](docs/backends-and-models.md#claude-as-a-backend)) |
 
 You need at least one of `codex`, `agy` and `claude` besides your host. A missing CLI shows `command_found: false` in `backends` and its jobs fail; everything else works. The same CLI can be the host in one window and a backend in another.
 
-Check what is installed:
-
-```
-uv --version
-claude --version
-codex --version
-agy --version
-```
+Developed and tested on Windows 11. macOS and Linux are written for but not yet run: see [known limits](docs/known-limits.md).
 
 ## Install
 
+Every step is per machine. Nothing here needs an API key.
+
+1. **Install `uv`** from its [install page](https://docs.astral.sh/uv/getting-started/installation/).
+
+2. **Install each CLI you want, and sign in to it once in a terminal.** Start the CLI and follow its sign-in prompt; a job on a CLI that is not signed in fails with `auth_error`. Then check they are on `PATH`:
+
+   ```
+   uv --version
+   git --version
+   claude --version
+   codex --version
+   agy --version
+   ```
+
+3. **Get the bridge and run its installer:**
+
+   ```
+   git clone https://github.com/Ashwin-RN/agent-bridge.git
+   cd agent-bridge
+   uv sync
+   uv run agent-bridge install
+   ```
+
+   Keep the folder: the hosts start the bridge from the Python inside its `.venv`.
+
+   `install` finds the host CLIs on the machine, shows a diff for each file it would change and asks before each write. It registers the bridge, raises each host's tool-call limit, offers the status line and the two skills (`bridge-usage`, `bridge-routing`), and backs up every file it changes. `uv run agent-bridge install --print` shows all of it and writes nothing.
+
+4. **Add the suggested lines to your global instructions file.** `install` ends by printing the lines in [`skills/host-instructions.md`](skills/host-instructions.md). Paste them into `CLAUDE.md` (Claude Code) or `AGENTS.md` (Codex, Antigravity) so the host reads the quota and loads `bridge-routing` before it delegates. The installer never edits that file.
+
+5. **Restart every host window**, or reconnect `agent-bridge` in it.
+
+6. **Check the setup:** `uv run agent-bridge doctor`. It only reads, and gives a fix for anything it flags: backend versions, registrations, timeouts, approvals, the skills and the state database.
+
+Registering by hand, what `install` writes per host, and hosts beyond Claude Code, Codex and Antigravity are in [docs/install.md](docs/install.md).
+
+### Update
+
 ```
-git clone https://github.com/Ashwin-RN/agent-bridge.git
-cd agent-bridge
+git pull
 uv sync
 uv run agent-bridge install
 ```
 
-`agent-bridge install` finds the host CLIs on your machine, shows a unified diff for each file it would change, asks before each write, saves a timestamped backup and writes atomically. It refuses symlinked configs and JSON it would alter, preserves an existing `env` block and any higher timeout, warns on throwaway interpreter paths, and offers the status line and `bridge-usage` skill.
+Then restart every host window together: windows left open keep running the old code. The database in `~/.agent-bridge` is brought up to date by the bridge itself. Details are in [Update an existing install](docs/install.md#update-an-existing-install).
 
-Restart each host (or reconnect `agent-bridge` in it) once the installer finishes.
+### A second machine
 
-- Run `uv run agent-bridge install --print` to inspect every diff and command without writing anything.
-- Run `uv run agent-bridge doctor` to check backend versions, host registrations, timeouts, approvals, the skill and the state database.
-- See [docs/install.md](docs/install.md) for registering by hand, for what `install` writes per host, for skills (`bridge-usage` and `bridge-routing`), and for hosts beyond Claude Code, Codex and Antigravity.
+Repeat Install there. What carries over and what does not:
+
+| | |
+|---|---|
+| Subscription quota | Shared: it belongs to your accounts, so every machine draws on the same windows |
+| Job history, replies and quota readings | Per machine, in `~/.agent-bridge` |
+| Host registrations, skills, instruction lines | Per machine: `install` sets them up again |
+| CLI sign-ins | Per machine |
 
 ## Check it works
 
-See that the host has it: `claude mcp get agent-bridge`, `codex mcp list` or `agy mcp list`.
-
-Then ask the host:
+In a restarted host window, ask:
 
 > Call backends on agent-bridge and tell me which backends are healthy.
 
@@ -109,7 +141,7 @@ A Codex model reads `requested` because the Codex CLI does not report which mode
 
 | Page | Covers |
 |---|---|
-| [docs/install.md](docs/install.md) | `agent-bridge install`, manual registration, other hosts, skills, short instructions snippet, update and uninstall |
+| [docs/install.md](docs/install.md) | `agent-bridge install`, manual registration, other hosts, skills, the suggested instruction lines, update and uninstall |
 | [docs/backends-and-models.md](docs/backends-and-models.md) | Backend names, `agy` model shortcuts, Codex and Claude defaults and plan rules |
 | [docs/tools.md](docs/tools.md) | The five MCP tools, arguments, reply shapes, paging, failure reasons and retries |
 | [docs/safety.md](docs/safety.md) | What a subagent can touch, child environment filtering, edits in a Git worktree, and nesting prevention |
