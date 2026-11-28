@@ -1012,3 +1012,20 @@ def test_doctor_relative_state_dir_uses_read_only_query_guard(
         env={}, path_lookup=BACKENDS.get, runner=_versions(VERSIONS), out=lambda line: None,
     ) == 0
     assert queries[0].lower().replace(" ", "") == "pragmaquery_only=on"
+
+
+def test_install_suggests_the_host_instructions_and_writes_them_nowhere(run: Run, home: Path) -> None:
+    assert run.install("--host", "claude-code", "--yes", "--no-status-line") == 0
+    text = run.text
+    assert "Suggested: add these lines to your global instructions file" in text
+    assert "`CLAUDE.md`" in text and "`AGENTS.md`" in text
+    for line in install_cmd.packaged_host_instructions().splitlines():
+        assert line in run.lines
+    marker = "Before delegating, load the `bridge-routing` skill"
+    holders = [p for p in home.rglob("*") if p.is_file() and marker in p.read_text(encoding="utf-8", errors="replace")]
+    assert holders == []
+
+
+def test_install_with_no_instructions_leaves_the_suggestion_out(run: Run) -> None:
+    assert run.install("--host", "claude-code", "--yes", "--no-status-line", "--no-instructions") == 0
+    assert "Suggested: add these lines" not in run.text

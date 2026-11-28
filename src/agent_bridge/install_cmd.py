@@ -628,6 +628,20 @@ def packaged_skill(name: str) -> bytes:
     return checkout.read_bytes()
 
 
+def packaged_host_instructions() -> str:
+    """The lines install suggests for a host's global instructions file. Install never writes them."""
+    from importlib import resources
+
+    try:
+        resource = resources.files("agent_bridge") / "skills" / "host-instructions.md"
+        if resource.is_file():
+            return resource.read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError):
+        pass
+    checkout = Path(__file__).resolve().parents[2] / "skills" / "host-instructions.md"
+    return checkout.read_text(encoding="utf-8")
+
+
 # --------------------------------------------------------------------------------------------
 # A plan: the edits for one host, built from what is on disk now.
 
@@ -1204,6 +1218,10 @@ def _install_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approve", action="store_true", help="also pre-approve the bridge's tools where the host does not need it for headless runs")
     parser.add_argument("--no-status-line", dest="status_line", action="store_false", help="do not offer the status line")
     parser.add_argument("--no-skill", dest="skill", action="store_false", help="do not offer the skills")
+    parser.add_argument(
+        "--no-instructions", dest="instructions", action="store_false",
+        help="do not print the suggested lines for the global instructions file",
+    )
     parser.add_argument("--home", type=Path, help="(for tests) treat DIR as the home folder; the real one is never read or written, and no host command is run")
     return parser
 
@@ -1291,6 +1309,14 @@ def run_install(
                 out(f"  {title}: {item}")
         if not any((report.done, report.already, report.declined, report.printed, report.failed)):
             out("  nothing to do")
+    if args.instructions and reports:
+        out("")
+        out(
+            "Suggested: add these lines to your global instructions file (`CLAUDE.md` for Claude Code,"
+            " `AGENTS.md` for Codex and Antigravity). The installer does not edit that file."
+        )
+        for line in packaged_host_instructions().splitlines():
+            out(line)
     if any(r.done for r in reports):
         out(f"\nOne step left: {LAST_STEP}.")
     elif reports and not opts.print_only:
