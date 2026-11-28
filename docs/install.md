@@ -34,7 +34,8 @@ Useful options:
 | `--yes`, `-y` | Accept every change without asking |
 | `--approve` | Also pre-approve the bridge's tools on hosts that do not need it for headless runs |
 | `--no-status-line` | Do not offer the status line |
-| `--no-skill` | Do not offer the usage dashboard skill |
+| `--no-skill` | Do not offer the two skills |
+| `--no-instructions` | Do not print the suggested lines for the global instructions file |
 
 After installing, restart each host or reconnect `agent-bridge` in it.
 
@@ -142,7 +143,7 @@ Two skills ship in `skills/`:
 - `bridge-usage`: the quota and usage dashboard.
 - `bridge-routing`: which backend and model to pick, and how to brief and collect a job.
 
-`agent-bridge install` offers to install `skills/bridge-usage/SKILL.md` into each host's skills folder unless `--no-skill` is passed. See [Quota and usage](quota-and-usage.md#the-usage-dashboard-skill) for how to run `bridge-usage`.
+`agent-bridge install` offers to install both into each host's skills folder, each as its own confirmed write, unless `--no-skill` is passed. See [Quota and usage](quota-and-usage.md#the-usage-dashboard-skill) for how to run `bridge-usage`.
 
 To install a skill by hand, copy its folder from `skills/` into the skills folder of each host you use. Install `bridge-usage` after updating the bridge: until the bridge in that host has `usage`, the skill says the bridge is out of date and stops.
 
@@ -172,13 +173,9 @@ Make the parent folder first if it does not exist. A host that was running picks
 
 ## Optional instructions snippet
 
-The server's own instructions already cover the basics of the five tools. If you want a short pointer in your host's global instructions file (`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex and Antigravity), add these lines:
+The server's own instructions already cover the basics of the five tools. The lines in [`skills/host-instructions.md`](../skills/host-instructions.md) add the routing habits: load `bridge-routing` before delegating, read the quota before a fan-out, and how to collect a job.
 
-```markdown
-- `agent-bridge` MCP is connected for delegating to the other coding CLIs on this machine.
-- Call `usage(quota=True)` before a fan-out to see which pools have room.
-- Load the `bridge-routing` skill for which backend and model to use.
-```
+`agent-bridge install` prints those lines at the end of its run and suggests adding them to your host's global instructions file (`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex and Antigravity). It never edits that file: paste them yourself, and adjust them to your own rules. `--no-instructions` leaves the suggestion out.
 
 ## Seeing jobs in the host
 
