@@ -82,26 +82,6 @@ EFFORT_ALIASES: dict[str, EffortLevel] = {
     "max": "xhigh",
 }
 
-QUOTA_POOL_ALIASES: dict[str, QuotaPool] = {
-    "agy_gemini": "agy_gemini",
-    "agy-gemini": "agy_gemini",
-    "gemini": "agy_gemini",
-    "neon": "agy_gemini",
-    "agy_claude_gpt": "agy_claude_gpt",
-    "agy-claude-gpt": "agy_claude_gpt",
-    "agy_3p": "agy_claude_gpt",
-    "agy-3p": "agy_claude_gpt",
-    "3p": "agy_claude_gpt",
-    "agy-claude": "agy_claude_gpt",
-    "agy-gpt": "agy_claude_gpt",
-    "claude_gpt": "agy_claude_gpt",
-    "codex": "codex",
-    "claude": "claude",
-    "claude-code": "claude",
-    "claude_code": "claude",
-    "anthropic": "claude",
-}
-
 _AGY_THIRD_PARTY_MODEL_RE = re.compile(
     r"(?:^|-)(claude|opus|sonnet|haiku|gpt|oss)(?:-|$)",
     re.I,
@@ -134,17 +114,6 @@ def resolve_backend_and_model_hint(
         return resolved_backend, model.strip()
     hinted = BACKEND_DEFAULT_MODEL_HINTS.get(key)
     return resolved_backend, hinted
-
-
-def normalize_quota_pool(value: str | None) -> QuotaPool | None:
-    if value is None or not value.strip():
-        return None
-    key = value.strip().lower()
-    if key not in QUOTA_POOL_ALIASES:
-        raise ValueError(
-            f"Unknown quota_pool {value!r}. Expected one of: agy_gemini, agy_claude_gpt, codex, claude."
-        )
-    return QUOTA_POOL_ALIASES[key]
 
 
 def classify_quota_pool(backend: str, model: str | None = None) -> QuotaPool:
@@ -201,6 +170,19 @@ def split_claude_model_and_effort(model: str | None) -> tuple[str | None, Effort
     return raw, None
 
 
+STATE_DB_FILENAME = "bridge.db"
+
+
+def state_dir_from_env() -> Path:
+    """The bridge's state folder: `AGENT_BRIDGE_STATE_DIR` if set, else `~/.agent-bridge`.
+
+    The one rule for every reader of the state folder (the server and `agent-bridge status`).
+    It reads no other variable and never raises on a value it does not recognise.
+    """
+    raw = os.environ.get("AGENT_BRIDGE_STATE_DIR", "").strip()
+    return Path(raw).expanduser() if raw else Path.home() / ".agent-bridge"
+
+
 def clamp_timeout(timeout_seconds: int | None, default: int) -> int:
     value = default if timeout_seconds is None else int(timeout_seconds)
     return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, value))
@@ -250,6 +232,11 @@ class Settings:
     # "plan": leave API credentials out of a Claude job's environment, so it runs on the signed-in plan.
     # "inherit": pass the environment on as it is.
     claude_auth: str = "plan"
+    # "trim": leave variables whose names look like credentials out of a Codex or agy job's environment.
+    # "inherit": pass the environment on as it is.
+    child_env: str = "trim"
+    # Exact variable names exempted from trimming, using Windows' uppercase environment keys there.
+    child_env_keep: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -295,18 +282,24 @@ class Settings:
                 f"Unknown AGENT_BRIDGE_CLAUDE_AUTH {raw_claude_auth!r}. Expected 'plan' or 'inherit'."
             )
 
+        raw_child_env = os.environ.get("AGENT_BRIDGE_CHILD_ENV", "").strip().lower() or "trim"
+        if raw_child_env not in {"trim", "inherit"}:
+            raise ValueError(
+                f"Unknown AGENT_BRIDGE_CHILD_ENV {raw_child_env!r}. Expected 'trim' or 'inherit'."
+            )
+        child_env_keep = frozenset(
+            name.upper() if os.name == "nt" else name
+            for part in os.environ.get("AGENT_BRIDGE_CHILD_ENV_KEEP", "").split(",")
+            if (name := part.strip())
+        )
+
         default_timeout = int(os.environ.get("AGENT_BRIDGE_DEFAULT_TIMEOUT", "300"))
         max_concurrent = max(1, int(os.environ.get("AGENT_BRIDGE_MAX_CONCURRENT", "8")))
         max_stored = max(20, int(os.environ.get("AGENT_BRIDGE_MAX_STORED_JOBS", "500")))
         models_ttl = float(os.environ.get("AGENT_BRIDGE_MODELS_TTL_SECONDS", "900"))
         quota_ttl = float(os.environ.get("AGENT_BRIDGE_QUOTA_TTL_SECONDS", "120"))
         owner_stale = float(os.environ.get("AGENT_BRIDGE_OWNER_STALE_SECONDS", "30"))
-        state_dir_raw = os.environ.get("AGENT_BRIDGE_STATE_DIR", "").strip()
-        state_dir = (
-            Path(state_dir_raw).expanduser()
-            if state_dir_raw
-            else Path.home() / ".agent-bridge"
-        )
+        state_dir = state_dir_from_env()
         agy_bin = os.environ.get("AGENT_BRIDGE_AGY_BIN", "").strip() or None
         codex_bin = os.environ.get("AGENT_BRIDGE_CODEX_BIN", "").strip() or None
         claude_bin = os.environ.get("AGENT_BRIDGE_CLAUDE_BIN", "").strip() or None
@@ -335,4 +328,6 @@ class Settings:
             default_claude_effort=default_claude_effort,
             claude_bin=claude_bin,
             claude_auth=raw_claude_auth,
+            child_env=raw_child_env,
+            child_env_keep=child_env_keep,
         )

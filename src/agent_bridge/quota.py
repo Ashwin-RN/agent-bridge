@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -14,6 +15,17 @@ from typing import Any
 from agent_bridge.process_control import ManagedProcess, communicate_managed, spawn_managed_process
 
 logger = logging.getLogger("agent_bridge.quota")
+
+_QUOTA_VIEW_POOLS: tuple[tuple[str, str, str], ...] = (
+    ("codex", "codex", "Codex CLI"),
+    ("agy_gemini", "neon", "Antigravity Gemini"),
+    ("agy_claude_gpt", "neon", "Antigravity Claude+GPT"),
+    ("claude", "claude", "Claude Code"),
+)
+_AGY_POOLS: frozenset[str] = frozenset({"agy_gemini", "agy_claude_gpt"})
+_FIVE_HOUR_MAX_MINS = 6 * 60
+_WEEKLY_MIN_MINS = 6 * 1440
+_REASON_LIMIT = 160
 
 
 def _iso_now() -> str:
@@ -44,13 +56,13 @@ def _parse_iso_utc(raw: str | None) -> datetime | None:
 
 
 def _window_label(mins: int | float | None) -> str:
-    if isinstance(mins, bool) or not isinstance(mins, (int, float)) or mins <= 0:
+    if isinstance(mins, bool) or not isinstance(mins, (int, float)) or not math.isfinite(mins) or mins <= 0:
         return "unknown"
-    m = int(mins)
-    if m == 300:
+    if mins <= _FIVE_HOUR_MAX_MINS:
         return "5h"
-    if m == 10080:
+    if mins >= _WEEKLY_MIN_MINS:
         return "weekly"
+    m = int(mins)
     if m % 1440 == 0:
         return f"{m // 1440}d"
     if m % 60 == 0:
@@ -84,6 +96,12 @@ def _canonical_window_kind(label: str | None, bucket_id: str | None = None) -> s
         return "weekly"
     if "5h" in combined or "five hour" in combined or "5-hour" in combined:
         return "5h"
+    dur = _window_duration_seconds(label)
+    if dur is not None and dur > 0:
+        if dur <= _FIVE_HOUR_MAX_MINS * 60:
+            return "5h"
+        if dur >= _WEEKLY_MIN_MINS * 60:
+            return "weekly"
     return (label or "unknown").strip().lower()
 
 
@@ -103,20 +121,30 @@ def _format_duration_human(seconds: int) -> str:
 
 
 def _as_number(val: Any) -> float | None:
-    if isinstance(val, bool) or not isinstance(val, (int, float)):
+    if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
         return None
     return float(val)
 
 
-def _infer_agy_group_pool(group_name: str, buckets: list[dict[str, Any]]) -> str:
+def _infer_agy_group_pool(group_name: str, buckets: list[dict[str, Any]]) -> str | None:
     low = group_name.lower()
     if any(tok in low for tok in ("claude", "gpt", "3p", "third")):
         return "agy_claude_gpt"
     for b in buckets:
+        if not isinstance(b, dict):
+            continue
         bid = str(b.get("id") or "").lower()
         if bid.startswith("3p-"):
             return "agy_claude_gpt"
-    return "agy_gemini"
+    if "gemini" in low:
+        return "agy_gemini"
+    for b in buckets:
+        if not isinstance(b, dict):
+            continue
+        bid = str(b.get("id") or "").lower()
+        if bid == "gemini" or bid.startswith("gemini-") or bid.startswith("1p-"):
+            return "agy_gemini"
+    return None
 
 
 def _extract_models_from_description(description: str | None) -> list[str]:
@@ -177,7 +205,7 @@ def _enrich_window(
         if rem_pct <= 2.0:
             signal = "exhausted"
         elif kind == "weekly" and (
-            (resets_in_sec <= 24 * 3_600 and rem_pct >= 10.0)
+            (resets_in_sec <= 24 * 3_600 and rem_pct >= 20.0)
             or (
                 (resets_in_sec <= 42 * 3_600 or (time_rem_pct is not None and time_rem_pct <= 25.0))
                 and rem_pct >= 20.0
@@ -358,7 +386,7 @@ def build_quota_advisory(
             priority = "stale"
             rec = (
                 f"Quota reading for {label} is stale (a reset timestamp has already passed). "
-                "Re-run get_usage(include_quota=True, refresh_quota=True) for fresh post-reset capacity."
+                "Call usage(quota=True) again for fresh post-reset capacity."
             )
         elif rate_limit_reached or w5_sig == "exhausted" or wk_sig == "exhausted":
             priority = "avoid"
@@ -472,21 +500,31 @@ def build_quota_advisory(
     neon_q = quota_by_backend.get("neon")
     if isinstance(neon_q, dict) and neon_q.get("status") == "ok":
         enriched_neon = enrich_quota_reading(neon_q, now_utc=now)
+        agy_grouped: dict[str, dict[str, Any]] = {}
         for group in enriched_neon.get("groups") or []:
             if not isinstance(group, dict):
                 continue
-            pool_name = str(group.get("pool") or "agy_gemini")
-            group_models = (
-                (neon_pool_models or {}).get(pool_name)
-                or group.get("models")
-                or []
+            pool_name = group.get("pool")
+            if pool_name not in _AGY_POOLS:
+                continue
+            bucket = agy_grouped.setdefault(
+                str(pool_name),
+                {
+                    "label": str(group.get("name") or pool_name),
+                    "windows": [],
+                    "models": list((neon_pool_models or {}).get(str(pool_name)) or []),
+                },
             )
+            bucket["windows"].extend(w for w in group.get("windows") or [] if isinstance(w, dict))
+            if not bucket["models"] and group.get("models"):
+                bucket["models"] = list(group["models"])
+        for pool_name, bucket in agy_grouped.items():
             _summarize_pool(
                 pool=pool_name,
                 backend="neon",
-                label=str(group.get("name") or pool_name),
-                windows=group.get("windows") or [],
-                models=list(group_models),
+                label=bucket["label"],
+                windows=bucket["windows"],
+                models=bucket["models"],
             )
 
     priority_rank = {
@@ -540,7 +578,7 @@ def build_quota_advisory(
         stale_names = ", ".join(p["pool"] for p in stale_pools)
         summary_text = (
             f"No fresh eligible pools ({stale_names} reading(s) passed reset time); "
-            "refresh with get_usage(include_quota=True, refresh_quota=True)."
+            "call usage(quota=True) again."
         )
     elif pools_sorted:
         summary_text = (
@@ -556,6 +594,315 @@ def build_quota_advisory(
         "recommended_order": recommended_order,
         "upcoming_resets": upcoming_resets,
         "summary": summary_text,
+    }
+
+
+def _clean_pct(val: float) -> int | float:
+    rounded = round(val, 1)
+    return int(rounded) if rounded.is_integer() else rounded
+
+
+def _short_reason(text: Any) -> str:
+    line = " ".join(str(text or "").split())
+    if len(line) <= _REASON_LIMIT:
+        return line
+    return line[: _REASON_LIMIT - 3].rstrip() + "..."
+
+
+def _oldest_iso(times: list[Any]) -> str | None:
+    parsed: list[tuple[datetime, str]] = []
+    for raw in times:
+        if not isinstance(raw, str):
+            continue
+        dt = _parse_iso_utc(raw)
+        if dt is not None:
+            parsed.append((dt, raw.strip()))
+    return min(parsed, key=lambda item: item[0])[1] if parsed else None
+
+
+def _view_window(win: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(win, dict):
+        return None
+    rem = _as_number(win.get("remaining_percent"))
+    if rem is None:
+        return None
+    sig = win.get("signal")
+    reset_raw = win.get("reset_time")
+    reset_iso = reset_raw.strip() if isinstance(reset_raw, str) and _parse_iso_utc(reset_raw) is not None else None
+    if win.get("stale_reset") or sig == "stale_reset":
+        state = "stale"
+    elif sig == "idle_full":
+        state = "not_started"
+    elif sig == "exhausted":
+        state = "exhausted"
+    elif sig == "expiring_soon_use_it":
+        state = "expiring"
+    elif sig == "low":
+        state = "low"
+    else:
+        state = "ok"
+    has_countdown = (
+        reset_iso is not None
+        and state not in {"stale", "not_started"}
+        and isinstance(win.get("resets_in_seconds"), int)
+        and int(win["resets_in_seconds"]) > 0
+    )
+    return {
+        "left_percent": _clean_pct(rem),
+        "resets_in": win.get("resets_in") if has_countdown else None,
+        "reset_time": reset_iso,
+        "state": state,
+    }
+
+
+def _pct_summary(vw_5h: dict[str, Any] | None, vw_wk: dict[str, Any] | None) -> str:
+    parts: list[str] = []
+    if vw_wk is not None:
+        parts.append(f"weekly {vw_wk['left_percent']}%")
+    if vw_5h is not None:
+        parts.append(f"5h {vw_5h['left_percent']}%")
+    return ", ".join(parts)
+
+
+def build_quota_view(quota: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    """Build one compact quota view with every pool listed once in fixed order."""
+    now_utc = datetime.fromtimestamp(float(now), tz=timezone.utc) if now is not None else datetime.now(timezone.utc)
+    readings = quota if isinstance(quota, dict) else {}
+
+    raw_windows_by_pool: dict[str, list[dict[str, Any]]] = {}
+    unrecognised_agy_groups: list[str] = []
+
+    for backend in ("codex", "claude"):
+        reading = readings.get(backend)
+        if isinstance(reading, dict) and reading.get("status") == "ok":
+            raw_windows_by_pool[backend] = [w for w in reading.get("windows") or [] if isinstance(w, dict)]
+
+    neon_reading = readings.get("neon")
+    if isinstance(neon_reading, dict) and neon_reading.get("status") == "ok":
+        for group in neon_reading.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            gname = str(group.get("name") or "unnamed")
+            gwins = [w for w in group.get("windows") or [] if isinstance(w, dict)]
+            explicit_pool = group.get("pool")
+            if explicit_pool in _AGY_POOLS:
+                resolved_pool: str | None = str(explicit_pool)
+            elif explicit_pool is None or explicit_pool == "":
+                resolved_pool = _infer_agy_group_pool(gname, gwins)
+            else:
+                resolved_pool = None
+            if resolved_pool in _AGY_POOLS:
+                raw_windows_by_pool.setdefault(resolved_pool, []).extend(gwins)
+            else:
+                unrecognised_agy_groups.append(gname)
+
+    pools_out: list[dict[str, Any]] = []
+    unread: list[dict[str, str]] = []
+    failed_unread_names: list[str] = []
+    used_read_times: list[Any] = []
+    sort_meta: dict[str, tuple[str, float, float]] = {}
+
+    for pool, backend, label in _QUOTA_VIEW_POOLS:
+        reading = readings.get(backend)
+        reading_dict = reading if isinstance(reading, dict) else {}
+        pool_raw_wins = raw_windows_by_pool.get(pool)
+        enriched_wins = [_enrich_window(w, now_utc=now_utc) for w in (pool_raw_wins or [])]
+
+        win_5h = next(
+            (w for w in enriched_wins if w.get("window_kind") == "5h" and _as_number(w.get("remaining_percent")) is not None),
+            None,
+        )
+        win_wk = next(
+            (
+                w
+                for w in enriched_wins
+                if w.get("window_kind") == "weekly" and _as_number(w.get("remaining_percent")) is not None
+            ),
+            None,
+        )
+        vw_5h = _view_window(win_5h)
+        vw_wk = _view_window(win_wk)
+
+        if vw_5h is None and vw_wk is None:
+            if pool == "claude" and not reading_dict.get("error") and reading_dict.get("status") != "ok":
+                reason = "no reading: no Claude job has reported one"
+                failed = False
+            elif reading_dict.get("error"):
+                reason = _short_reason(reading_dict["error"])
+                failed = True
+            elif pool_raw_wins is not None:
+                reason = "reading holds no 5h or weekly window"
+                failed = True
+            elif reading_dict.get("status") == "ok":
+                source_label = "Antigravity" if backend == "neon" else label
+                reason = f"{source_label} reported no window for this pool"
+                failed = True
+            elif not reading_dict:
+                reason = "no reading provided"
+                failed = True
+            else:
+                reason = "could not be read"
+                failed = True
+
+            pools_out.append(
+                {
+                    "pool": pool,
+                    "backend": backend,
+                    "label": label,
+                    "five_hour": None,
+                    "weekly": None,
+                    "priority": "unknown",
+                    "note": reason,
+                }
+            )
+            unread.append({"pool": pool, "reason": reason})
+            if failed:
+                failed_unread_names.append(pool)
+            continue
+
+        for src_win in (win_5h, win_wk):
+            if src_win is not None:
+                used_read_times.append(src_win.get("fetched_at") or reading_dict.get("fetched_at"))
+
+        w5_sig = win_5h.get("signal") if win_5h else None
+        wk_sig = win_wk.get("signal") if win_wk else None
+        w5_rem = _as_number(win_5h.get("remaining_percent")) if win_5h else None
+        wk_rem = _as_number(win_wk.get("remaining_percent")) if win_wk else None
+        rem_vals = [v for v in (w5_rem, wk_rem) if v is not None]
+        eff_rem = round(min(rem_vals), 1) if rem_vals else 0.0
+        has_stale = any(w is not None and w["state"] == "stale" for w in (vw_5h, vw_wk))
+        rate_limit_reached = bool(reading_dict.get("rate_limit_reached"))
+        w5_state = vw_5h["state"] if vw_5h else None
+        wk_state = vw_wk["state"] if vw_wk else None
+        shared = pool == "claude"
+
+        if has_stale:
+            priority = "stale"
+            note = "reset time has passed; refresh quota"
+        elif rate_limit_reached or w5_state == "exhausted" or wk_state == "exhausted":
+            priority = "avoid"
+            blocked = vw_wk if wk_state == "exhausted" else vw_5h
+            if blocked and blocked.get("resets_in"):
+                note = f"exhausted, resets in {blocked['resets_in']}"
+            elif rate_limit_reached:
+                note = "rate limit reached"
+            else:
+                note = "exhausted"
+        elif shared:
+            if wk_sig in {"low", "burning_fast"} or w5_sig == "low":
+                priority = "conserve"
+                note = f"running low ({_pct_summary(vw_5h, vw_wk)}); shared with your own Claude sessions"
+            elif wk_sig == "expiring_soon_use_it" or w5_sig == "expiring_soon_use_it":
+                priority = "normal"
+                note = f"{_pct_summary(vw_5h, vw_wk)} left; shared with your own Claude sessions"
+            elif eff_rem >= 70.0 or wk_sig == "ahead_of_pace":
+                priority = "high"
+                note = f"healthy headroom ({_pct_summary(vw_5h, vw_wk)}); shared with your own Claude sessions"
+            else:
+                priority = "normal"
+                note = f"moderate headroom ({_pct_summary(vw_5h, vw_wk)}); shared with your own Claude sessions"
+        elif (
+            wk_sig == "expiring_soon_use_it"
+            and wk_rem is not None
+            and wk_rem >= 20.0
+            and (w5_rem is None or w5_rem > 5.0)
+            and vw_wk is not None
+        ):
+            priority = "use_before_reset"
+            resets_part = f", resets in {vw_wk['resets_in']}" if vw_wk.get("resets_in") else ""
+            note = f"{vw_wk['left_percent']}% of the week unused{resets_part}"
+        elif w5_sig == "expiring_soon_use_it" and wk_sig not in {"low", "burning_fast"} and vw_5h is not None:
+            priority = "high"
+            resets_part = f", resets in {vw_5h['resets_in']}" if vw_5h.get("resets_in") else ""
+            note = f"{vw_5h['left_percent']}% of 5h window unused{resets_part}"
+        elif (wk_sig == "idle_full" or vw_wk is None) and (w5_sig == "idle_full" or vw_5h is None):
+            priority = "high"
+            note = "untouched (100% left; timer starts on first use)"
+        elif wk_sig in {"low", "burning_fast"} or w5_sig == "low":
+            priority = "conserve"
+            note = f"running low ({_pct_summary(vw_5h, vw_wk)})"
+        elif eff_rem >= 70.0 or wk_sig == "ahead_of_pace":
+            priority = "high"
+            note = f"healthy headroom ({_pct_summary(vw_5h, vw_wk)})"
+        else:
+            priority = "normal"
+            note = f"moderate headroom ({_pct_summary(vw_5h, vw_wk)})"
+
+        pools_out.append(
+            {
+                "pool": pool,
+                "backend": backend,
+                "label": label,
+                "five_hour": vw_5h,
+                "weekly": vw_wk,
+                "priority": priority,
+                "note": note,
+            }
+        )
+        wk_secs_raw = win_wk.get("resets_in_seconds") if win_wk else None
+        wk_secs = float(wk_secs_raw) if isinstance(wk_secs_raw, int) and wk_secs_raw > 0 else float(10**9)
+        sort_meta[pool] = (priority, eff_rem, wk_secs)
+
+    for gname in unrecognised_agy_groups:
+        unread.append({"pool": "agy_unknown", "reason": f"unrecognised Antigravity group: {gname}"})
+        failed_unread_names.append(f"agy_unknown ({gname})")
+
+    priority_rank = {
+        "use_before_reset": 0,
+        "high": 1,
+        "normal": 2,
+        "conserve": 3,
+    }
+
+    routable = [
+        p
+        for p in pools_out
+        if p["pool"] != "claude" and p["priority"] not in {"avoid", "stale", "unknown"}
+    ]
+
+    def _order_key(p: dict[str, Any]) -> tuple[int, float, float]:
+        prio, eff, wk_secs = sort_meta[p["pool"]]
+        rank = priority_rank.get(prio, 3)
+        if rank == 0:
+            return (rank, wk_secs, -eff)
+        return (rank, -eff, wk_secs)
+
+    routable_sorted = sorted(routable, key=_order_key)
+    order = [p["pool"] for p in routable_sorted]
+
+    stale_names = [p["pool"] for p in pools_out if p["priority"] == "stale"]
+    avoid_names = [p["pool"] for p in pools_out if p["priority"] == "avoid"]
+    claude_entry = next(p for p in pools_out if p["pool"] == "claude")
+
+    if routable_sorted:
+        top = routable_sorted[0]
+        if top["priority"] == "use_before_reset" and top["weekly"] is not None:
+            wk = top["weekly"]
+            resets_part = f", resets in {wk['resets_in']}" if wk.get("resets_in") else ""
+            headline = f"Use {top['pool']} first ({wk['left_percent']}% weekly unused{resets_part})"
+        else:
+            _, top_eff, _ = sort_meta[top["pool"]]
+            headline = f"Route to {top['pool']} first ({_clean_pct(top_eff)}% left)"
+    elif claude_entry["priority"] not in {"avoid", "stale", "unknown"}:
+        headline = "No routable pool available; only claude has room (shared with your own sessions)"
+    elif stale_names:
+        headline = f"No fresh usable pools ({', '.join(stale_names)} stale); refresh quota"
+    elif avoid_names:
+        headline = "No usable pools available; all read pools are exhausted"
+    else:
+        headline = "No quota readings available"
+
+    if failed_unread_names:
+        summary = f"{headline}; could not read {', '.join(failed_unread_names)}."
+    else:
+        summary = f"{headline}."
+
+    return {
+        "read_at": _oldest_iso(used_read_times),
+        "pools": pools_out,
+        "order": order,
+        "unread": unread,
+        "summary": summary,
     }
 
 
@@ -855,7 +1202,7 @@ async def fetch_codex_quota(codex_cmd: list[str], *, timeout_seconds: float = 12
                     "pool": "codex",
                     "status": "unknown",
                     "fetched_at": ts,
-                    "error": f"Timed out reading Codex rate limits after {timeout_seconds:.0f}s.",
+                    "error": f"Timed out reading Codex rate limits after {timeout_seconds:g}s.",
                 }
             raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
             if not raw_line:
@@ -885,6 +1232,14 @@ async def fetch_codex_quota(codex_cmd: list[str], *, timeout_seconds: float = 12
             "status": "unknown",
             "fetched_at": ts,
             "error": "Codex app-server closed before returning rate limits.",
+        }
+    except TimeoutError:
+        return {
+            "backend": "codex",
+            "pool": "codex",
+            "status": "unknown",
+            "fetched_at": ts,
+            "error": f"Timed out reading Codex rate limits after {timeout_seconds:g}s.",
         }
     except Exception as exc:
         return {
@@ -960,6 +1315,14 @@ async def fetch_neon_quota(agy_cmd: list[str], *, timeout_seconds: float = 15.0)
             }
 
         return parse_neon_usage_envelope(envelope, fetched_at=ts)
+    except TimeoutError as exc:
+        msg = str(exc).strip() or f"Timed out reading agy /usage after {timeout_seconds:g}s."
+        return {
+            "backend": "neon",
+            "status": "unknown",
+            "fetched_at": ts,
+            "error": msg,
+        }
     except Exception as exc:
         return {
             "backend": "neon",

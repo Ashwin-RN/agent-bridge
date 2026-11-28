@@ -16,7 +16,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agent_bridge.config import Settings, classify_quota_pool, read_codex_local_defaults
 from agent_bridge.model_resolver import (
@@ -27,7 +27,7 @@ from agent_bridge.model_resolver import (
     is_newer_codex_model_in_same_family,
 )
 from agent_bridge.models import JobStatus, ProviderState, RunCancelled, RunRequest, RunResult, UsageStatus
-from agent_bridge.nesting import subagent_env
+from agent_bridge.nesting import credential_env_names, subagent_env
 from agent_bridge.process_control import (
     ManagedProcess,
     ProcessContainmentError,
@@ -50,16 +50,53 @@ AGY_READ_ONLY_GUARD = (
     "that changes anything. Put your whole answer in your final reply, and end it with one line saying "
     "whether you changed any file.\n\n"
 )
+# A run that exits 0 but whose output stops before the CLI's final event was cut short (a crash, a
+# killed pipe, or a CLI upgrade that changed the stream). It is a failure, as `claude` already treats it.
+CLI_OUTPUT_CUT_SHORT_ERROR = (
+    "the CLI's output ended without its final event ({event}), so the run may have been cut short; "
+    "any partial reply is kept"
+)
+CLI_OUTPUT_CUT_SHORT_GUIDANCE = (
+    "The CLI exited cleanly, but its output stopped before its final event. Read response and "
+    "stderr_tail, check the CLI's version with backends, and for edit tasks inspect git status/diff "
+    "before retrying."
+)
 STDERR_TAIL_MAX_CHARS = 4_000
 TRANSIENT_RETRY_BACKOFF_SECONDS = 2.0
 TRANSIENT_RETRY_MIN_REMAINING_SECONDS = 12.0
 
 OnSessionCallback = Callable[[str], None]
 OnActivityCallback = Callable[[str], None]
-OnModelCallback = Callable[[str], None]
+ModelSource = Literal["observed", "requested", "default"]
+OnModelCallback = Callable[[str | None, ModelSource], None]
 OnProviderStartCallback = Callable[[], Awaitable[None] | None]
 OnAttemptCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 OnWorktreePlannedCallback = Callable[[dict[str, str | None]], None]
+
+
+def job_env(settings: Settings, request: RunRequest, *, cli: str) -> dict[str, str]:
+    """Build a marked Codex or agy environment, filtering by variable name in trim mode.
+
+    The filter logs exclusions and explicit exceptions by name. It does not inspect values such as
+    URLs. Claude jobs have their own environment handling in `ClaudeRunner`.
+    """
+    candidates = credential_env_names(os.environ) if settings.child_env != "inherit" else []
+    kept = [name for name in candidates if name in settings.child_env_keep]
+    dropped = [name for name in candidates if name not in settings.child_env_keep]
+    if kept:
+        logger.info(
+            "Kept in %s job %s's environment via AGENT_BRIDGE_CHILD_ENV_KEEP: %s.",
+            cli, request.job_id, ", ".join(kept),
+        )
+    if dropped:
+        logger.info(
+            "Left out of %s job %s's environment, as their names look like credentials: %s. "
+            "AGENT_BRIDGE_CHILD_ENV_KEEP exempts named variables; AGENT_BRIDGE_CHILD_ENV=inherit passes them all on.",
+            cli,
+            request.job_id,
+            ", ".join(dropped),
+        )
+    return subagent_env(job_id=request.job_id, owner_id=request.owner_id, drop=dropped)
 
 
 async def _maybe_await(cb: Callable[..., Any] | None, *args: Any) -> None:
@@ -277,6 +314,14 @@ def _repo_worktree_lock(repo_root_key: str) -> asyncio.Lock:
     return lock
 
 
+def agy_reports_turn_still_running(exit_code: int | None, text: str) -> bool:
+    """Whether `agy` said its turn may still be going on at the server: exit code 3, or words to that effect.
+
+    Stopping the local CLI does not stop that turn, so a job that saw this keeps `possibly_running`.
+    """
+    return exit_code == 3 or any(p.search(text) for p in _AGY_TIMEOUT_PATTERNS)
+
+
 def classify_failure(
     *,
     backend: str,
@@ -293,9 +338,7 @@ def classify_failure(
 
     # Preserve Antigravity's remote in-progress signal EVEN when our local deadline also fired
     # and the local CLI process was verified stopped (killing the CLI does not stop the remote turn!).
-    if backend == "neon" and (
-        exit_code == 3 or any(p.search(combined) for p in _AGY_TIMEOUT_PATTERNS)
-    ):
+    if backend == "neon" and agy_reports_turn_still_running(exit_code, combined):
         return (
             "timed_out",
             "provider_timeout_still_running",
@@ -332,7 +375,7 @@ def classify_failure(
             "failed",
             "quota_exceeded",
             local_state,
-            "Subscription quota or rate limit reached. Call get_usage(include_quota=True) to check reset "
+            "Subscription quota or rate limit reached. Call usage(quota=True) to check reset "
             "times or delegate to another backend.",
         )
 
@@ -341,7 +384,7 @@ def classify_failure(
             "failed",
             "model_unavailable",
             local_state,
-            "Requested model was rejected by the CLI. Refresh models via list_backends(refresh_models=True) "
+            "Requested model was rejected by the CLI. Refresh models via backends(refresh_models=True) "
             "or use a versionless shortcut.",
         )
 
@@ -465,14 +508,31 @@ def resolve_codex_command(configured: str | None = None) -> list[str]:
     return [str(found_path)]
 
 
+def _agy_result_envelope(obj: Any) -> dict[str, Any] | None:
+    if not isinstance(obj, dict):
+        return None
+    event = obj.get("event")
+    result = obj.get("result")
+    if event == "result" and isinstance(result, dict):
+        return result
+    cid = obj.get("conversation_id")
+    has_response = "response" in obj
+    has_status = "status" in obj
+    if event in (None, "result") and (
+        (has_response and has_status) or (isinstance(cid, str) and cid and (has_response or has_status))
+    ):
+        return obj
+    return None
+
+
 def parse_agy_json_output(stdout_text: str) -> dict[str, Any] | None:
     """Parse single-envelope `agy --output-format json` stdout, tolerating leading non-JSON lines."""
     stripped = stdout_text.strip()
     if not stripped:
         return None
     try:
-        parsed = json.loads(stripped)
-        if isinstance(parsed, dict):
+        parsed = _agy_result_envelope(json.loads(stripped))
+        if parsed is not None:
             return parsed
     except json.JSONDecodeError:
         pass
@@ -482,20 +542,29 @@ def parse_agy_json_output(stdout_text: str) -> dict[str, Any] | None:
         if not line or not line.startswith("{"):
             continue
         try:
-            parsed = json.loads(line)
-            if isinstance(parsed, dict):
+            parsed = _agy_result_envelope(json.loads(line))
+            if parsed is not None:
                 return parsed
         except json.JSONDecodeError:
             continue
     return None
 
 
+def _plain_stdout_reply(lines: list[str]) -> str:
+    return "\n".join(line.rstrip("\r\n") for line in lines if not line.lstrip().startswith("{")).strip()
+
+
 def parse_codex_jsonl_events(lines: list[str]) -> dict[str, Any]:
-    """Parse Codex `--json` JSONL events into session_id, response, usage, and errors."""
+    """Parse Codex `--json` JSONL events into session_id, response, usage, and errors.
+
+    `turn_completed` says whether the stream reached its final `turn.completed` event. A `turn.failed`
+    with no message is still an error.
+    """
     session_id: str | None = None
     messages: list[str] = []
     usage: dict[str, Any] | None = None
     errors: list[str] = []
+    turn_completed = False
 
     for raw in lines:
         line = raw.strip()
@@ -520,6 +589,7 @@ def parse_codex_jsonl_events(lines: list[str]) -> dict[str, Any]:
                 if isinstance(text, str) and text.strip():
                     messages.append(text.strip())
         elif etype == "turn.completed":
+            turn_completed = True
             raw_usage = event.get("usage")
             if isinstance(raw_usage, dict):
                 usage = raw_usage
@@ -529,12 +599,15 @@ def parse_codex_jsonl_events(lines: list[str]) -> dict[str, Any]:
                 msg = event["error"].get("message")
             if isinstance(msg, str) and msg.strip():
                 errors.append(msg.strip())
+            elif etype == "turn.failed":
+                errors.append("codex reported that the turn failed, and gave no message")
 
     return {
         "session_id": session_id,
         "response": "\n\n".join(messages).strip(),
         "usage": usage,
         "errors": errors,
+        "turn_completed": turn_completed,
     }
 
 
@@ -1028,6 +1101,8 @@ class NeonRunner:
     ) -> RunResult:
         started = time.monotonic()
         remaining = deadline - started
+        if on_model:
+            on_model(resolved_model, "requested" if resolved_model else "default")
         if remaining <= 0.05:
             status, reason, pstate, guidance = classify_failure(
                 backend="neon",
@@ -1059,15 +1134,13 @@ class NeonRunner:
             extra_dirs=extra_dirs,
             remaining_seconds=remaining,
         )
-        if on_model and resolved_model:
-            on_model(resolved_model)
         if on_activity:
             on_activity(f"running agy ({resolved_model or 'agy-default'})")
 
         # Commit launch intent in SQLite BEFORE spawning the provider subprocess!
         await _maybe_await(on_provider_start)
 
-        env = subagent_env(job_id=request.job_id, owner_id=request.owner_id)
+        env = job_env(self._settings, request, cli="agy")
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1162,7 +1235,7 @@ class NeonRunner:
                     if isinstance(im, str) and im:
                         actual_model = im
                         if on_model:
-                            on_model(im)
+                            on_model(im, "observed")
                     pm = init_obj.get("permission_mode")
                     if isinstance(pm, str) and pm:
                         init_permission_mode = pm
@@ -1187,18 +1260,15 @@ class NeonRunner:
                         idx = su.get("step_index")
                         key = int(idx) if isinstance(idx, int) else len(step_usages_by_index)
                         step_usages_by_index[key] = su["usage"]
-            elif ev_type == "result":
-                res_obj = obj.get("result")
-                if isinstance(res_obj, dict):
-                    result_envelope = res_obj
-                    cid = res_obj.get("conversation_id")
-                    if isinstance(cid, str) and cid:
-                        session_id = cid
-                        if on_session:
-                            on_session(cid)
-            elif "conversation_id" in obj and ("response" in obj or "status" in obj):
-                plain_envelope = obj
-                cid = obj.get("conversation_id")
+            else:
+                envelope = _agy_result_envelope(obj)
+                if envelope is None:
+                    return
+                if ev_type == "result":
+                    result_envelope = envelope
+                else:
+                    plain_envelope = envelope
+                cid = envelope.get("conversation_id")
                 if isinstance(cid, str) and cid:
                     session_id = cid
                     if on_session:
@@ -1274,11 +1344,15 @@ class NeonRunner:
         if envelope is None:
             envelope = parse_agy_json_output("".join(stdout_lines))
 
-        raw_status = str(envelope.get("status", "")).upper() if isinstance(envelope, dict) else ""
+        raw_status = str(envelope.get("status") or "").strip().upper() if isinstance(envelope, dict) else ""
+        # A clean exit without a recognized result envelope carrying its status is an incomplete stream.
+        final_event_missing = (
+            (not timed_out_locally) and (not cancelled) and proc.returncode == 0 and not raw_status
+        )
         turn_completed_cleanly = (
             (not timed_out_locally)
             and (
-                (not cancelled and proc.returncode == 0 and raw_status in {"", "SUCCESS", "OK"})
+                (not cancelled and proc.returncode == 0 and raw_status in {"SUCCESS", "OK"})
                 or (cancelled and raw_status in {"SUCCESS", "OK"})
             )
         )
@@ -1340,9 +1414,13 @@ class NeonRunner:
                 usage_status = "partial"
 
         if cancelled:
+            # The timeout path honours agy's word that its turn goes on at the server; so does a cancel.
+            env_error = str(envelope.get("error") or "") if isinstance(envelope, dict) else ""
+            remote_running = agy_reports_turn_still_running(proc.returncode, f"{env_error}\n{stderr_text}")
             raise RunCancelled(
                 RunResult(status="cancelled", session_id=session_id, usage=usage,
-                          provider_metrics=provider_metrics, usage_status=usage_status)
+                          provider_metrics=provider_metrics, usage_status=usage_status,
+                          provider_state="possibly_running" if remote_running else None)
             )
 
         # Only publish a new cumulative checkpoint when this turn completed cleanly with valid,
@@ -1417,6 +1495,35 @@ class NeonRunner:
                 failure_reason=reason,
                 provider_state=pstate,
                 retry_guidance=guidance,
+                stderr_tail=stderr_tail,
+                provider_invoked=True,
+            )
+
+        if final_event_missing:
+            # Set directly, not through classify_failure, which would read the reply's own prose.
+            env_response = str(envelope.get("response") or "").strip() if isinstance(envelope, dict) else ""
+            return RunResult(
+                status="failed",
+                response=env_response or partial_text or _plain_stdout_reply(stdout_lines),
+                session_id=session_id,
+                model=actual_model,
+                effort=request.effort,
+                model_notice=combined_notice,
+                effective_cwd=request.cwd,
+                duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
+                usage=usage,
+                provider_metrics=provider_metrics,
+                usage_status=usage_status,
+                cumulative_usage=None,
+                num_turns=None,
+                observed_num_turns=num_turns,
+                observed_turn_progress=observed_progress,
+                exit_code=0,
+                error=CLI_OUTPUT_CUT_SHORT_ERROR.format(event="a result event with a status"),
+                failure_reason="cli_error",
+                provider_state="stopped" if process_stopped else "possibly_running",
+                retry_guidance=CLI_OUTPUT_CUT_SHORT_GUIDANCE,
                 stderr_tail=stderr_tail,
                 provider_invoked=True,
             )
@@ -1673,7 +1780,7 @@ class NeonRunner:
                     failure_reason="model_unavailable",
                     provider_state="stopped",
                     retry_guidance=(
-                        "Refresh models via list_backends(refresh_models=True), select a model in an "
+                        "Refresh models via backends(refresh_models=True), select a model in an "
                         "available quota pool, or pass allow_cross_pool_fallback=True."
                     ),
                     provider_invoked=False,
@@ -1721,6 +1828,8 @@ class NeonRunner:
                         allow_cross_pool_fallback=request.allow_cross_pool_fallback,
                     )
                 except ModelPoolUnavailableError as exc:
+                    if on_model and request.model and request.model != result.model:
+                        on_model(request.model, "requested")
                     return RunResult(
                         status="failed",
                         session_id=result.session_id or request.session_id,
@@ -1736,7 +1845,7 @@ class NeonRunner:
                         failure_reason="model_unavailable",
                         provider_state="stopped",
                         retry_guidance=(
-                            "Refresh models via list_backends(refresh_models=True), select a model in an "
+                            "Refresh models via backends(refresh_models=True), select a model in an "
                             "available quota pool, or pass allow_cross_pool_fallback=True."
                         ),
                         provider_invoked=result.provider_invoked,
@@ -1752,6 +1861,8 @@ class NeonRunner:
                         different_model = None
 
                 if different_model is None and not request.allow_cross_pool_fallback:
+                    if on_model and resolution.resolved and resolution.resolved != result.model:
+                        on_model(resolution.resolved, "requested")
                     return RunResult(
                         status="failed",
                         session_id=result.session_id or request.session_id,
@@ -1772,7 +1883,7 @@ class NeonRunner:
                         failure_reason="model_unavailable",
                         provider_state=result.provider_state,
                         retry_guidance=(
-                            "Refresh models via list_backends(refresh_models=True), select another model in "
+                            "Refresh models via backends(refresh_models=True), select another model in "
                             f"quota pool {requested_pool!r}, or pass allow_cross_pool_fallback=True."
                         ),
                         stderr_tail=result.stderr_tail,
@@ -1923,6 +2034,8 @@ class CodexRunner:
             ]
             if effective_effort:
                 args.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
+            if request.fast:
+                args.extend(["-c", 'service_tier="fast"'])
             if request.review_scope == "uncommitted":
                 args.append("--uncommitted")
             elif request.review_scope == "base" and request.review_base:
@@ -1945,6 +2058,8 @@ class CodexRunner:
             ]
             if effective_effort:
                 args.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
+            if request.fast:
+                args.extend(["-c", 'service_tier="fast"'])
             if effective_model:
                 args.extend(["-m", effective_model])
             args.extend([request.session_id, "-"])
@@ -1962,6 +2077,8 @@ class CodexRunner:
         ]
         if effective_effort:
             args.extend(["-c", f'model_reasoning_effort="{effective_effort}"'])
+        if request.fast:
+            args.extend(["-c", 'service_tier="fast"'])
         if effective_model:
             args.extend(["-m", effective_model])
 
@@ -1992,6 +2109,8 @@ class CodexRunner:
         local_defaults = read_codex_local_defaults()
         reported_model = effective_model or local_defaults.get("model") or "codex-default"
         reported_effort = effective_effort or local_defaults.get("model_reasoning_effort")
+        if on_model:
+            on_model(reported_model, "requested" if effective_model else "default")
 
         remaining = deadline - started
         if remaining <= 0.05:
@@ -2041,15 +2160,13 @@ class CodexRunner:
             effective_model=effective_model,
             effective_effort=effective_effort,
         )
-        if on_model:
-            on_model(reported_model)
         if on_activity:
             on_activity(f"running codex ({reported_model})")
 
         # Commit launch intent in SQLite BEFORE spawning the provider subprocess!
         await _maybe_await(on_provider_start)
 
-        env = subagent_env(job_id=request.job_id, owner_id=request.owner_id)
+        env = job_env(self._settings, request, cli="codex")
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2218,8 +2335,25 @@ class CodexRunner:
         session_id = parsed["session_id"] or request.session_id
         response = parsed["response"]
         errors = parsed["errors"]
+        if proc.returncode == 0 and not errors and not response:
+            response = _plain_stdout_reply(stdout_lines)
+        # `codex exec review` can finish with a reply in plain text and no turn.completed event.
+        builtin_review = request.review_scope is not None and not request.prompt.strip() and bool(response)
+        final_event_missing = (
+            (not timed_out_locally)
+            and (not cancelled)
+            and proc.returncode == 0
+            and (not errors)
+            and (not parsed["turn_completed"])
+            and (not builtin_review)
+        )
         # Codex emits the usage on turn.completed, so a count from that event is final.
-        turn_completed_cleanly = (not timed_out_locally) and (proc.returncode == 0 or cancelled) and (not errors)
+        turn_completed_cleanly = (
+            (not timed_out_locally)
+            and (proc.returncode == 0 or cancelled)
+            and (not errors)
+            and (not final_event_missing)
+        )
 
         usage, provider_metrics = normalize_usage("codex", parsed["usage"])
         if usage is not None:
@@ -2284,14 +2418,35 @@ class CodexRunner:
                 provider_invoked=True,
             )
 
+        if final_event_missing:
+            # Set directly, not through classify_failure: stderr prose must not turn this into a
+            # transient error that is retried by itself.
+            return RunResult(
+                status="failed",
+                response=response,
+                session_id=session_id,
+                model=reported_model,
+                effort=reported_effort,
+                model_notice=model_notice,
+                effective_cwd=effective_cwd,
+                worktree_path=wt_path,
+                worktree_branch=wt_branch,
+                worktree_commit=wt_commit,
+                duration_seconds=elapsed,
+                cleanup_seconds=cleanup_secs,
+                usage=usage,
+                provider_metrics=provider_metrics,
+                usage_status=usage_status,
+                exit_code=0,
+                error=CLI_OUTPUT_CUT_SHORT_ERROR.format(event="turn.completed"),
+                failure_reason="cli_error",
+                provider_state="stopped" if process_stopped else "possibly_running",
+                retry_guidance=CLI_OUTPUT_CUT_SHORT_GUIDANCE,
+                stderr_tail=stderr_tail,
+                provider_invoked=True,
+            )
+
         if turn_completed_cleanly:
-            if not response:
-                non_json = "\n".join(
-                    ln.strip()
-                    for ln in stdout_lines
-                    if ln.strip() and not ln.strip().startswith("{")
-                ).strip()
-                response = non_json
             return RunResult(
                 status="completed",
                 response=response,

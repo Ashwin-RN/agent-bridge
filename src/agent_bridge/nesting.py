@@ -86,12 +86,40 @@ class Nesting:
             f"{NESTED_ERROR_CODE}: this agent-bridge was started inside {where} (detected by {self.via}). "
             f"A subagent may not start further bridge jobs, so `{tool}` is refused. "
             "Do the work yourself, or report back to the session that started you. "
-            "check_jobs, get_usage and list_backends still work."
+            "jobs, cancel, usage and backends still work."
         )
 
 
 NOT_NESTED = Nesting(nested=False)
 UNKNOWN_NESTING = Nesting(nested=None)
+
+
+# A Codex or agy job is not given variables whose names look like credentials (AGENT_BRIDGE_CHILD_ENV=trim).
+CREDENTIAL_NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", re.IGNORECASE)
+# What a subagent's own tools need to work, though the name matches: handles that point at an agent or a
+# keyring (git over SSH, a keyring-backed credential helper), and settings that hold no secret. Git's
+# GIT_CONFIG_KEY_<n> names a config key; without it, while GIT_CONFIG_COUNT is set, every git command fails.
+CHILD_ENV_KEEP: frozenset[str] = frozenset({
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "GPG_AGENT_INFO",
+    "GNOME_KEYRING_CONTROL",
+    "GNOME_KEYRING_PID",
+    "GCM_CREDENTIAL_STORE",
+})
+_CHILD_ENV_KEEP_RE = re.compile(r"GIT_CONFIG_KEY_\d+", re.IGNORECASE)
+
+
+def credential_env_names(env: Mapping[str, str]) -> list[str]:
+    """The names in `env` that a trimmed job environment leaves out, sorted."""
+    return sorted(
+        name
+        for name in env
+        if CREDENTIAL_NAME_RE.search(name)
+        and name.upper() not in CHILD_ENV_KEEP
+        and not _CHILD_ENV_KEEP_RE.fullmatch(name)
+        and name not in (ENV_PARENT_JOB, ENV_PARENT_OWNER)
+    )
 
 
 def subagent_env(
@@ -158,6 +186,12 @@ def _windows_process_table() -> dict[int, int]:
 
 def _windows_start_time(pid: int) -> float | None:
     """Wall-clock creation time of a process, or None when it cannot be opened."""
+    ticks = _windows_creation_ticks(pid)
+    return None if ticks is None else (ticks - 116_444_736_000_000_000) / 10_000_000.0
+
+
+def _windows_creation_ticks(pid: int) -> int | None:
+    """A process's creation time as the kernel keeps it (100 ns FILETIME ticks), or None."""
     import ctypes
     from ctypes import wintypes
 
@@ -179,9 +213,7 @@ def _windows_start_time(pid: int) -> float | None:
         ):
             return None
         ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
-        if ticks <= 0:
-            return None
-        return (ticks - 116_444_736_000_000_000) / 10_000_000.0
+        return ticks if ticks > 0 else None
     finally:
         k32.CloseHandle(handle)
 
@@ -287,6 +319,11 @@ def _process_command_line(pid: int) -> list[str] | None:
         return None
 
 
+def process_command_line(pid: int) -> list[str] | None:
+    """Return a process's argument vector, or None when it cannot be read."""
+    return _process_command_line(pid)
+
+
 def _is_bridge_command(argv: list[str]) -> bool:
     if not argv:
         return False
@@ -369,6 +406,44 @@ def _linux_boot_time() -> float | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def linux_process_identity(stat_text: str, boot_id: str) -> str | None:
+    """`linux:<boot id>:<start ticks>` from `/proc/<pid>/stat` and `/proc/sys/kernel/random/boot_id`.
+
+    The start ticks count from boot and the boot id names the boot, so neither moves when the wall clock
+    is set; `btime` in `/proc/stat` does, and is not used.
+    """
+    parsed = parse_proc_stat(stat_text)
+    boot = boot_id.strip()
+    if parsed is None or not boot:
+        return None
+    return f"linux:{boot}:{parsed[1]}"
+
+
+def process_identity(pid: int, *, platform: str | None = None) -> str | None:
+    """A token that names process `pid` itself, so that a later process given the same pid differs.
+
+    Windows: `win:<creation FILETIME ticks>`. Linux: see `linux_process_identity`. Both are read from
+    the kernel and compared exactly; nothing in them follows the wall clock. Elsewhere there is no such
+    token without reading the clock, so this is None, and the caller relies on the pid alone.
+    """
+    plat = sys.platform if platform is None else platform
+    try:
+        if pid <= 0:
+            return None
+        if plat == "win32":
+            ticks = _windows_creation_ticks(pid)
+            return f"win:{ticks}" if ticks is not None else None
+        if plat.startswith("linux") and os.path.isdir("/proc/self"):
+            with open(f"/proc/{int(pid)}/stat", encoding="utf-8", errors="replace") as fh:
+                stat_text = fh.read()
+            with open("/proc/sys/kernel/random/boot_id", encoding="utf-8", errors="replace") as fh:
+                boot_id = fh.read()
+            return linux_process_identity(stat_text, boot_id)
+        return None
+    except Exception:
+        return None
 
 
 def _posix_ancestors(pid: int) -> list[tuple[int, float | None]] | None:

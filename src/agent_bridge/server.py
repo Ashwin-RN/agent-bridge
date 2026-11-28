@@ -1,6 +1,9 @@
 """Fast, lightweight stdio MCP server exposing Neon (`agy`), Codex (`codex`) and Claude (`claude`) subagents.
 
 Any MCP client can be the host: Claude Code, Codex, Antigravity or another. Nothing here assumes which.
+
+Five tools: `run` starts one job and answers at once, `jobs` reads, waits for and pages jobs, `cancel`
+stops one, `usage` reports what was run and what quota is left, `backends` checks the CLIs.
 """
 
 from __future__ import annotations
@@ -9,137 +12,129 @@ import asyncio
 import functools
 import logging
 import sys
+import tempfile
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any, Literal, TypeVar
+from pathlib import Path
+from typing import Annotated, Any, Literal, TypeVar
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from agent_bridge import host_limits
 from agent_bridge.config import EffortLevel, Settings, normalize_backend
-from agent_bridge.jobs import JobManager
+from agent_bridge.hosts import Host
+from agent_bridge.jobs import ALL_BACKENDS, JobManager, _JOB_ID_RE
+from agent_bridge.mcp_tasks import TASK_CALL, JobTasks, JobView, pump_progress
 from agent_bridge.model_resolver import ModelPoolUnavailableError
+from agent_bridge.models import DEFAULT_RESPONSE_CHARS, JobRecord
 from agent_bridge.nesting import UNKNOWN_NESTING, NestedBridgeError, Nesting, detect_nesting
-from agent_bridge.storage import UsagePeriod
+from agent_bridge.quota import build_quota_view
+from agent_bridge.status_text import format_summary_line
 
-DashboardPeriod = Literal["today", "7d", "30d", "all", "session"]
+UsagePeriodName = Literal["today", "7d", "30d", "all", "session"]
+ResponseFile = Annotated[bool, Field(description="Save the finished reply to a file and return a preview.")]
+
+# The longest a call may wait, whatever it asks for. Hosts cut tool calls at 60 to 180 seconds.
+MAX_WAIT_SECONDS = 300
+# The suggested wait when the host has no known cap.
+FALLBACK_NEXT_WAIT_SECONDS = 50
+# How often a waiting call reports progress, and re-reads a job another window runs.
+PROGRESS_INTERVAL_SECONDS = 5.0
 
 SERVER_INSTRUCTIONS = """
-`agent-bridge` lets you delegate tasks, reviews, and parallel work to other AI coding CLIs on this
-machine, whichever CLI you are yourself. It covers FOUR independent subscription quota pools over
-three local CLIs:
+agent-bridge runs the other AI coding CLIs on this machine as subagent jobs, whichever CLI you \
+are: `codex`, `neon` (agy; also `agy-claude`, `agy-opus`, `agy-gpt`), `claude`. `run` starts one \
+job and returns at once; `jobs` collects replies, or lists jobs; `cancel` stops a job; `usage` \
+shows what ran, and with quota=True what quota is left: call that before a fan-out; `backends` \
+checks the CLIs. Default mode is read_only. `completed` only means a job ended: read its \
+`response`.
 
-1. `codex` (OpenAI Codex CLI — `codex` pool) — defaults to `gpt-6.2-sol` at `high` reasoning
-   effort (seamlessly rides newer versions / falls back if retired). Override per call with `effort`
-   (`low` | `medium` | `high` | `xhigh`). Great for focused code reviews, targeted edits, test
-   generation, and isolated pre-assigned Git worktree edits (`mode="edit"`, `worktree=True`).
-2. `neon` / `agy` Gemini Models (`agy_gemini` pool) — versionless shortcuts auto-upgrade while
-   preserving effort tier. Use **Hydrogen** (`hydrogen-medium` / `hydrogen-high`) for codebase
-   exploration and research, and **Neon** (`neon-medium` / `neon-high`) for builds, architecture,
-   and reviews based on task complexity (`flash` for quick lightweight checks).
-3. `agy-claude` / `agy-opus` / `agy-gpt` (`agy_claude_gpt` pool inside `agy`) — SEPARATE 5h +
-   weekly quota pool from both Gemini Models and the Claude plan below. Use
-   `backend="agy-claude"` (Sonnet), `backend="agy-opus"` (Opus), or `backend="agy-gpt"` (GPT-OSS),
-   or pass `model="claude-sonnet-high" | "claude-opus-high" | "gpt-oss"` on `backend="neon"`.
-4. `claude` (Claude Code CLI — `claude` pool) — the user's own Claude plan, the same limits their
-   Claude Code and claude.ai use draw on. Defaults to `sonnet` at `high`; pass `model="opus"`,
-   `"haiku"`, `"fable"` or a full model id. `read_only` runs cannot write or run changing commands;
-   `mode="edit"` accepts edits and supports `worktree=True`. Claude subagents get no MCP servers.
-
-If you are one of these CLIs yourself, your own native subagents are usually the better way to reach
-your own models; use the bridge for the others.
-
-Smart Quota & Weekly-Reset Routing:
-- Before substantial fan-out or heavy tasks, call `get_usage(compact=True, cwd=..., include_quota=True)`
-  to check all pools (`by_quota_pool`), exact reset countdowns of all involved models
-  (`quota_advisory.upcoming_resets`), and `quota_advisory.expiring_weekly_alerts` / `recommended_order`.
-  The `claude` pool has no live read-out: its reading is what the last Claude job reported.
-- If a pool has an `expiring_weekly_alerts` entry (`priority="use_before_reset"`), prioritize routing
-  eligible work there so unused weekly quota is leveraged before it resets!
-- Pass `cwd` on new jobs; omit `cwd` on `resume_from` so the bridge inherits the session's recorded
-  working directory / worktree (pass `relocate_cwd=True` only to intentionally move a resumed session).
-- Default `mode` is `"read_only"`. For multi-minute work prefer `start_agent` or
-  `run_parallel(wait=False)` (or a bounded `wait_seconds`), then poll via `check_jobs`.
-- Turns on the same `session_id` serialize atomically across windows via SQLite; pass `job_id` or
-  `session_id` into `resume_from` to continue a conversation (model intent, effort, worktree, and
-  `parent_run` are inherited automatically unless overridden).
-- Treat `status="completed"` as a lifecycle status and still verify that `response` contains the
-  requested deliverable.
-- To show the user what is left of each subscription and what the bridge has run, call
-  `usage_dashboard` and show its `text` unchanged.
-- A subagent started by the bridge may not start bridge jobs itself: there the job-starting tools
-  fail with `nested_bridge`.
+- Fan out by calling `run` once per job, in parallel, routed by the `order` of `usage(quota=True)`.
+- Collect a job with the call in its receipt's `next`: `jobs(job_ids=[...], wait_seconds=...)`. A \
+long reply comes in pages; call again with the `next_offset` it gives. `response_file=True` keeps a \
+long reply out of the conversation.
+- `resume_from` takes a job_id or session_id and inherits cwd, worktree, model, effort and \
+parent_run. Pass `cwd` on new jobs only.
+- `mode="edit"` lets a job change files; `worktree=True` (codex, claude) gives it its own Git worktree.
+- To show the user the quota and what the bridge ran, call `usage(view="dashboard")` and show its \
+`text` unchanged.
+- A job the bridge started cannot start bridge jobs: there `run` is refused with `nested_bridge`.
 """.strip()
 
 NESTED_INSTRUCTIONS = """
-`agent-bridge` is running INSIDE one of its own jobs: you are a subagent that another session started
-through the bridge. `run_agent`, `start_agent`, `run_parallel` and `review_code` are refused here with
-`nested_bridge`. Do the work yourself and put the answer in your reply. `check_jobs`, `get_usage`,
-`usage_dashboard` and `list_backends` still work.
+agent-bridge is running inside one of its own jobs: you are a subagent that another session started \
+through the bridge. `run` is refused here with `nested_bridge`: do the work yourself and put the \
+answer in your reply. `jobs`, `cancel`, `usage` and `backends` still work.
 """.strip()
 
+RUN_DESCRIPTION = (
+    "Start ONE subagent job and return a receipt at once; collect its reply with `jobs`. For several "
+    "jobs, call `run` once per job, in parallel. `wait_seconds` (max 300) waits that long first: a job "
+    "that ends in time is returned in full, one still running gets a receipt. `review` makes it a "
+    "read-only code review by this backend (`prompt` is then optional and added to the focus). "
+    "`resume_from` continues a session and inherits its cwd, worktree, model, effort and parent_run."
+)
+JOBS_DESCRIPTION = (
+    "With `job_ids`: each job in full, after waiting up to `wait_seconds` (max 300) for all or any of "
+    "them to end; a job still queued or running carries on. `response` is cut to `response_chars` from "
+    "`response_offset`; a cut reply gives `next_offset`. `completed` only means the job ended: read "
+    "`response`. Without `job_ids`: recent jobs, filtered by `status`, `backend`, `cwd`, `parent_run`."
+)
+CANCEL_DESCRIPTION = "Stop a queued or running job that this window started, and return it."
+USAGE_DESCRIPTION = (
+    "What the bridge ran in a period: `period`, or `since`/`until` as a date or ISO time. `quota=True` "
+    "adds what is left in each subscription pool and the order to use them in (about 10 s; read it "
+    "before a fan-out). `view=\"dashboard\"` returns `text` to show the user unchanged; `verbose` adds "
+    "its figures. `backend`, `cwd` and `parent_run` filter the summary view."
+)
+BACKENDS_DESCRIPTION = (
+    "Each CLI's health and version, backend defaults, agy's model shortcuts, the host and its wait cap "
+    "in seconds, and whether the bridge is nested. `refresh_models` reads agy's model list again."
+)
 
-class ParallelTaskSpec(BaseModel):
-    backend: str = Field(
-        description="Subagent backend: 'neon' (or 'agy'/'gemini'), 'codex' (or 'gpt') or 'claude'."
-    )
-    prompt: str = Field(description="Instructions or question for the subagent.")
-    cwd: str | None = Field(
-        default=None,
-        description="Optional per-task working directory override (falls back to top-level cwd).",
-    )
-    mode: Literal["read_only", "edit"] | None = Field(
-        default=None,
-        description="Optional per-task mode override ('read_only' or 'edit').",
-    )
-    model: str | None = Field(
-        default=None,
-        description=(
-            "Optional model ID or versionless shortcut (Neon: 'neon-medium', 'neon-high', 'flash'; "
-            "Claude: 'sonnet', 'opus', 'haiku', 'fable'). Omit for backend default."
-        ),
-    )
-    effort: EffortLevel | None = Field(
-        default=None,
-        description="Optional reasoning effort override ('low', 'medium', 'high', 'xhigh').",
-    )
-    resume_from: str | None = Field(
-        default=None,
-        description="Optional prior job_id or session_id to continue.",
-    )
-    relocate_cwd: bool = Field(
-        default=False,
-        description="Set True to intentionally move a resumed session out of its recorded worktree/cwd.",
-    )
-    worktree: bool = Field(
-        default=False,
-        description="Codex or Claude edit mode only: run in an isolated managed Git worktree.",
-    )
-    extra_dirs: list[str] | None = Field(
-        default=None,
-        description="Optional extra directories to grant read/write access to (new sessions only on Codex).",
-    )
-    label: str | None = Field(
-        default=None,
-        description="Short human-readable label for tracking this task.",
-    )
-    confirm_prior_stopped: bool = Field(
-        default=False,
-        description=(
-            "Set True only after confirming the current blocking prior turn on the same session "
-            "has finished before resuming (bound to the current blocking job_id at request time)."
-        ),
-    )
-    confirm_prior_job_id: str | None = Field(
-        default=None,
-        description="Explicit prior blocking job_id confirmed as stopped before resuming.",
-    )
-    allow_cross_pool_fallback: bool = Field(
-        default=False,
-        description="Opt in to falling back across Antigravity quota pools (e.g. Claude/GPT -> Gemini).",
-    )
+
+class Review(BaseModel):
+    """A read-only code review of a change."""
+
+    scope: Literal["uncommitted", "base", "commit"] = "uncommitted"
+    base: str | None = Field(default=None, description="Branch for scope='base' (default main).")
+    commit: str | None = Field(default=None, description="SHA for scope='commit'.")
+    focus: str | None = None
+
+
+def _read_host_limits(client_name: str | None) -> tuple[Host | None, int | None, str | None]:
+    host = host_limits.identify_host(client_name)
+    cap = host_limits.wait_cap_seconds(host)
+    if cap is None:
+        return host, None, None
+    capped, notice = host_limits.cap_wait(cap + 1, host)
+    return host, min(cap, capped), notice
+
+
+def _next_call(job_id: str, wait_cap: int | None, *, response_file: bool) -> str:
+    wait = min(MAX_WAIT_SECONDS, FALLBACK_NEXT_WAIT_SECONDS if wait_cap is None else wait_cap)
+    file_arg = ", response_file=True" if response_file else ""
+    return f"jobs(job_ids=['{job_id}'], wait_seconds={wait}{file_arg})"
+
+
+def _write_reply_file(state_dir: Path, record: JobRecord) -> str:
+    if not _JOB_ID_RE.fullmatch(record.job_id):
+        raise ValueError("Invalid job ID")
+    path = (state_dir / "replies" / f"{record.job_id}.md").absolute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = tempfile.NamedTemporaryFile(dir=path.parent, delete=False)
+    temp_path = Path(temp.name)
+    try:
+        with temp:
+            temp.write(record.response.encode("utf-8"))
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return str(path)
 
 
 def _build_review_prompt(
@@ -162,7 +157,7 @@ def _build_review_prompt(
         )
     else:
         if not commit:
-            raise ValueError("commit SHA is required when scope='commit'.")
+            raise ValueError("review.commit (a SHA) is required when review.scope='commit'.")
         scope_text = (
             f"Review the changes introduced by commit `{commit}` (inspect with `git show {commit}`)."
         )
@@ -179,6 +174,37 @@ def _build_review_prompt(
         "modify any files."
         f"{focus_block}"
     )
+
+
+def _review_request(
+    review: Review,
+    *,
+    backend: str | None,
+    prompt: str,
+    mode: str,
+    worktree: bool,
+    resume_from: str | None,
+    label: str | None,
+) -> dict[str, Any]:
+    """The request fields that make a job a review. Codex with no focus runs its built-in review."""
+    if not backend or not backend.strip():
+        raise ValueError("A review needs a backend.")
+    if mode != "read_only" or worktree:
+        raise ValueError("A review is read-only: leave mode at 'read_only' and worktree off.")
+    if resume_from and resume_from.strip():
+        raise ValueError("A review starts a new session: resume_from cannot be combined with review.")
+    scope = review.scope
+    base = (review.base or "main") if scope == "base" else review.base
+    if scope == "commit" and not (review.commit and review.commit.strip()):
+        raise ValueError("review.commit (a SHA) is required when review.scope='commit'.")
+    focus = "\n\n".join(p.strip() for p in (review.focus, prompt) if p and p.strip())
+    name = normalize_backend(backend)
+    out: dict[str, Any] = {"label": label or f"{name}-review-{scope}"}
+    if name == "codex" and not focus:
+        out.update(prompt="", review_scope=scope, review_base=base, review_commit=review.commit)
+    else:
+        out["prompt"] = _build_review_prompt(scope, base=base, commit=review.commit, focus=focus or None)
+    return out
 
 
 _ToolFn = TypeVar("_ToolFn", bound=Callable[..., Awaitable[Any]])
@@ -222,6 +248,62 @@ def _detect_nesting(job_manager: JobManager) -> Nesting:
         return marker if marker.nested else UNKNOWN_NESTING
 
 
+class _LiveLines:
+    """The status line of the jobs a call waits for, read without blocking the event loop.
+
+    A job this window runs is read from memory each time. One that another window runs is read from
+    the database in a thread every few seconds, and the last copy is used in between.
+    """
+
+    def __init__(self, manager: JobManager, job_ids: list[str]) -> None:
+        self._manager = manager
+        self._ids = list(dict.fromkeys(job_ids))
+        self._last: dict[str, JobRecord] = {}
+
+    def records(self) -> list[JobRecord]:
+        out = []
+        for job_id in self._ids:
+            rec = self._manager.peek_local(job_id)
+            if rec is not None:
+                # Kept, so that a job this window has just finished and let go of stays on the line.
+                self._last[job_id] = rec
+            else:
+                rec = self._last.get(job_id)
+            if rec is not None:
+                out.append(rec)
+        return out
+
+    def line(self) -> str:
+        recs = self.records()
+        if len(recs) == 1:
+            return recs[0].line()
+        return format_summary_line([r.line_fields() for r in recs], now=time.time())
+
+    async def refresh(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            for job_id in self._ids:
+                if self._manager.peek_local(job_id) is None:
+                    try:
+                        rec = await asyncio.to_thread(self._manager.peek, job_id)
+                    except Exception:
+                        rec = None
+                    if rec is not None:
+                        self._last[job_id] = rec
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=PROGRESS_INTERVAL_SECONDS)
+            except TimeoutError:
+                pass
+
+
+async def _report_while_waiting(ctx: Context, lines: _LiveLines, stop: asyncio.Event) -> None:
+    """Send the jobs' line as progress until `stop` is set. Returns at once if the host asked for none."""
+    refresher = asyncio.create_task(lines.refresh(stop))
+    try:
+        await pump_progress(ctx, lines.line, interval=PROGRESS_INTERVAL_SECONDS, stop=stop)
+    finally:
+        refresher.cancel()
+
+
 def create_server(
     settings: Settings | None = None,
     manager: JobManager | None = None,
@@ -235,6 +317,30 @@ def create_server(
     job_manager = manager or JobManager(cfg)
     nest = nesting if nesting is not None else _detect_nesting(job_manager)
     job_manager.nesting = nest
+    host_lookup: asyncio.Task[tuple[Host | None, int | None, str | None]] | None = None
+
+    async def _host_details(ctx: Context) -> tuple[Host | None, int | None, str | None]:
+        nonlocal host_lookup
+        if host_lookup is None:
+            try:
+                params = ctx.session.client_params
+            except ValueError:  # A direct tool call has no MCP session.
+                params = None
+            client_name = params.client_info.name if params else None
+            host_lookup = asyncio.create_task(asyncio.to_thread(_read_host_limits, client_name))
+        return await asyncio.shield(host_lookup)
+
+    async def _effective_wait(ctx: Context, wait_seconds: int) -> tuple[int, str | None]:
+        """Apply the same wait bounds to run and jobs."""
+        if wait_seconds <= 0:
+            return 0, None
+        _, cap, host_notice = await _host_details(ctx)
+        limit = MAX_WAIT_SECONDS if cap is None else min(cap, MAX_WAIT_SECONDS)
+        if wait_seconds <= limit:
+            return wait_seconds, None
+        if cap is not None and cap <= MAX_WAIT_SECONDS and host_notice:
+            return limit, host_notice
+        return limit, f"Wait capped at {limit} s."
 
     def _refuse_if_nested(tool: str) -> None:
         nest = job_manager.nesting
@@ -243,257 +349,257 @@ def create_server(
         if nest.nested:
             raise NestedBridgeError(nest.refusal(tool))
 
+    def _add_warnings(reply: dict[str, Any], record: JobRecord, warning: str | None = None) -> None:
+        fast_warning = f"{record.backend} has no fast tier." if record.fast and record.backend != "codex" else None
+        warnings = [message for message in (reply.get("warning"), warning, fast_warning) if message]
+        if warnings:
+            reply["warning"] = " ".join(warnings)
+
+    async def _reply(
+        record: JobRecord,
+        *,
+        response_offset: int = 0,
+        response_chars: int = DEFAULT_RESPONSE_CHARS,
+        response_file: bool = False,
+        verbose: bool = False,
+    ) -> dict[str, Any]:
+        """The one full reply about a job: a waited `run`, `jobs`, `cancel` and a finished task row."""
+        record = job_manager.with_fast_request(record)
+        path = None
+        warning = None
+        if response_file and record.is_terminal and record.response:
+            try:
+                path = await asyncio.to_thread(_write_reply_file, job_manager.settings.state_dir, record)
+            except (OSError, ValueError):
+                warning = "Could not write reply file. Returning the paged reply."
+        reply = record.to_detail(
+            response_offset=response_offset, response_chars=response_chars, response_file=path, verbose=verbose,
+        )
+        _add_warnings(reply, record, warning)
+        return reply
+
+    def _start_progress(ctx: Context, job_ids: list[str], stop: asyncio.Event) -> asyncio.Task[None]:
+        return asyncio.create_task(_report_while_waiting(ctx, _LiveLines(job_manager, job_ids), stop))
+
+    # --- MCP tasks: a host that declares the extension gets each `run` as a task row ---
+
+    task_reply_files: set[str] = set()
+
+    def _job_id_from_result(result: Any) -> str | None:
+        data = result.get("structuredContent") if isinstance(result, dict) else getattr(
+            result, "structured_content", None
+        )
+        job_id = data.get("job_id") if isinstance(data, dict) else None
+        return job_id if isinstance(job_id, str) else None
+
+    async def _task_view(job_id: str) -> JobView | None:
+        record = job_manager.peek_local(job_id)
+        if record is None:
+            record = await asyncio.to_thread(job_manager.peek, job_id)
+        if record is None:
+            return None
+        record = job_manager.with_fast_request(record)
+        updated = record.finished_at or record.last_activity_at or record.started_at or record.created_at
+        detail = await _reply(record, response_file=job_id in task_reply_files) if record.is_terminal else None
+        line = record.line() if detail is None else detail["line"]
+        if detail is not None and record.status == "cancelled" and record.provider_state == "possibly_running":
+            line += " · The provider turn may still be running."
+            if record.retry_guidance:
+                line += f" {record.retry_guidance}"
+            detail["line"] = line
+        return JobView(
+            status=record.status,
+            line=line,
+            created_at=record.created_at,
+            updated_at=updated,
+            detail=detail,
+        )
+
+    job_tasks = JobTasks({"run"}, _job_id_from_result, _task_view, job_manager.cancel)
+
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            await job_manager.shutdown()
+            try:
+                await job_tasks.aclose()
+            finally:
+                await job_manager.shutdown()
 
     mcp = MCPServer(
         name="agent-bridge",
         title="Agent Bridge (Neon, Codex & Claude Subagents)",
         description=(
-            "Delegate tasks, parallel work, and code reviews to Antigravity (Neon), Codex CLI "
-            "and Claude Code subagents from any MCP host, with shared SQLite state, dynamic models, "
-            "and usage/quota visibility."
+            "Delegate tasks and code reviews to Antigravity (Neon), Codex CLI and Claude Code subagents "
+            "from any MCP host, with shared SQLite state, dynamic models, and usage/quota visibility."
         ),
         instructions=NESTED_INSTRUCTIONS if nest.nested else SERVER_INSTRUCTIONS,
         lifespan=lifespan,
+        extensions=[job_tasks],
     )
 
+    # Not marked read-only: a job may edit, and a review on `agy` is read-only by its prompt, not a sandbox.
     @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=False,
-            openWorldHint=True,
-        )
+        name="run",
+        description=RUN_DESCRIPTION,
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
     )
     @_reported
-    async def run_agent(
-        backend: str,
-        prompt: str,
+    async def run(
+        ctx: Context,
+        backend: Annotated[
+            str | None,
+            Field(description="codex, neon (agy), agy-claude, agy-opus, agy-gpt or claude. "
+                  "May be left out with resume_from."),
+        ] = None,
+        prompt: str = "",
         cwd: str | None = None,
         mode: Literal["read_only", "edit"] = "read_only",
-        model: str | None = None,
+        model: Annotated[
+            str | None,
+            Field(description="Model id or shortcut (neon: neon-high, hydrogen-medium, flash; claude: "
+                  "sonnet, opus, haiku, fable). Default: the backend's."),
+        ] = None,
         effort: EffortLevel | None = None,
-        resume_from: str | None = None,
-        relocate_cwd: bool = False,
-        worktree: bool = False,
+        timeout_seconds: Annotated[int | None, Field(description="The job's own deadline.")] = None,
+        wait_seconds: Annotated[int, Field(description="Wait up to this long before answering (max 300).")] = 0,
+        response_file: ResponseFile = False,
+        resume_from: Annotated[str | None, Field(description="A prior job_id or session_id.")] = None,
+        worktree: Annotated[bool, Field(description="codex/claude edit jobs: own Git worktree.")] = False,
         extra_dirs: list[str] | None = None,
-        timeout_seconds: int | None = None,
-        wait_seconds: int | None = None,
         label: str | None = None,
-        parent_run: str | None = None,
-        confirm_prior_stopped: bool = False,
-        confirm_prior_job_id: str | None = None,
-        allow_cross_pool_fallback: bool = False,
+        parent_run: Annotated[str | None, Field(description="Groups jobs for jobs and usage.")] = None,
+        review: Review | None = None,
+        relocate_cwd: Annotated[bool, Field(description="Move a resumed session to cwd.")] = False,
+        confirm_prior_job_id: Annotated[
+            str | None,
+            Field(description="The prior turn's job_id, once you know it stopped, to resume after it."),
+        ] = None,
+        allow_cross_pool_fallback: Annotated[
+            bool, Field(description="Let agy fall back to its other quota pool.")
+        ] = False,
+        fast: Annotated[bool, Field(description="Use Codex's faster tier at about twice the quota.")] = False,
     ) -> dict[str, Any]:
-        """Run a Neon (`agy`), Codex (`codex`) or Claude (`claude`) subagent synchronously and return its response.
-
-        - `timeout_seconds`: overall job deadline (defaults to `AGENT_BRIDGE_DEFAULT_TIMEOUT`).
-        - `wait_seconds`: optional shorter MCP wait window; if it expires while the job is still
-          running, returns the live `job_id` so you can poll via `check_jobs` without stopping the job.
-        - `effort`: optional reasoning effort override (`low`, `medium`, `high`, `xhigh`).
-        - `resume_from`: prior `job_id` or `session_id` to continue (inherits worktree/cwd, model intent,
-          effort, and `parent_run` unless overridden; turns on the same session serialize).
-        - `relocate_cwd`: set `True` only to intentionally move a resumed session out of its recorded worktree.
-        - `confirm_prior_job_id` / `confirm_prior_stopped`: confirm the specific prior blocking turn
-          has stopped before resuming a session whose prior turn ended `possibly_running` / `unknown`.
-        - `allow_cross_pool_fallback`: opt in (`True`) to allow falling back across Antigravity quota pools.
-        """
-        _refuse_if_nested("run_agent")
-        req = await job_manager.prepare_request_async(
-            backend=backend,
-            prompt=prompt,
-            cwd=cwd,
-            mode=mode,
-            model=model,
-            effort=effort,
-            resume_from=resume_from,
-            relocate_cwd=relocate_cwd,
-            worktree=worktree,
-            extra_dirs=extra_dirs,
-            timeout_seconds=timeout_seconds,
-            label=label,
-            parent_run=parent_run,
-            confirm_prior_stopped=confirm_prior_stopped,
-            confirm_prior_job_id=confirm_prior_job_id,
-            allow_cross_pool_fallback=allow_cross_pool_fallback,
-        )
-        record = await job_manager.run(req, wait_seconds=wait_seconds)
-        detail = record.to_detail()
-        detail["session_usage"] = await job_manager.session_compact_summary_async()
-        return detail
-
-    @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=False,
-            openWorldHint=True,
-        )
-    )
-    @_reported
-    async def start_agent(
-        backend: str,
-        prompt: str,
-        cwd: str | None = None,
-        mode: Literal["read_only", "edit"] = "read_only",
-        model: str | None = None,
-        effort: EffortLevel | None = None,
-        resume_from: str | None = None,
-        relocate_cwd: bool = False,
-        worktree: bool = False,
-        extra_dirs: list[str] | None = None,
-        timeout_seconds: int | None = None,
-        label: str | None = None,
-        parent_run: str | None = None,
-        confirm_prior_stopped: bool = False,
-        confirm_prior_job_id: str | None = None,
-        allow_cross_pool_fallback: bool = False,
-    ) -> dict[str, Any]:
-        """Launch a Neon, Codex or Claude subagent in the background and immediately return its `job_id`.
-
-        Use `check_jobs(job_ids=[job_id], wait_seconds=60)` to collect results or monitor progress.
-        """
-        _refuse_if_nested("start_agent")
-        req = await job_manager.prepare_request_async(
-            backend=backend,
-            prompt=prompt,
-            cwd=cwd,
-            mode=mode,
-            model=model,
-            effort=effort,
-            resume_from=resume_from,
-            relocate_cwd=relocate_cwd,
-            worktree=worktree,
-            extra_dirs=extra_dirs,
-            timeout_seconds=timeout_seconds,
-            label=label,
-            parent_run=parent_run,
-            confirm_prior_stopped=confirm_prior_stopped,
-            confirm_prior_job_id=confirm_prior_job_id,
-            allow_cross_pool_fallback=allow_cross_pool_fallback,
-        )
-        record = await job_manager.start_async(req)
-        return {
-            "job_id": record.job_id,
-            "owner_id": record.owner_id,
-            "backend": record.backend,
-            "requested_model": record.requested_model,
-            "effort": record.effort,
-            "mode": record.mode,
-            "cwd": record.cwd,
-            "status": record.status,
-            "label": record.label,
-            "parent_run": record.parent_run,
-            "session_id": record.session_id,
-            "timeout_seconds": req.timeout_seconds,
-            "hint": f"Call check_jobs(job_ids=['{record.job_id}'], wait_seconds=60) to wait for results.",
-        }
-
-    @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=False,
-            openWorldHint=True,
-        )
-    )
-    @_reported
-    async def run_parallel(
-        tasks: list[ParallelTaskSpec],
-        cwd: str | None = None,
-        mode: Literal["read_only", "edit"] = "read_only",
-        wait: bool = True,
-        timeout_seconds: int | None = None,
-        wait_seconds: int | None = None,
-        parent_run: str | None = None,
-    ) -> dict[str, Any]:
-        """Run multiple Neon, Codex and/or Claude subagent tasks concurrently in one call.
-
-        Set `wait=True` (default) to wait for all tasks (up to `wait_seconds` or `timeout_seconds`),
-        or `wait=False` to start them in the background and return their `job_ids` immediately.
-        """
-        _refuse_if_nested("run_parallel")
-        if not tasks:
-            raise ValueError("tasks must contain at least one task.")
-        if len(tasks) > 10:
-            raise ValueError("At most 10 parallel tasks may be launched in a single call.")
-
-        requests = [
-            await job_manager.prepare_request_async(
-                backend=spec.backend,
-                prompt=spec.prompt,
-                cwd=spec.cwd or cwd,
-                mode=spec.mode or mode,
-                model=spec.model,
-                effort=spec.effort,
-                resume_from=spec.resume_from,
-                relocate_cwd=spec.relocate_cwd,
-                worktree=spec.worktree,
-                extra_dirs=spec.extra_dirs,
-                timeout_seconds=timeout_seconds,
-                label=spec.label,
-                parent_run=parent_run,
-                confirm_prior_stopped=spec.confirm_prior_stopped,
-                confirm_prior_job_id=spec.confirm_prior_job_id,
-                allow_cross_pool_fallback=spec.allow_cross_pool_fallback,
+        _refuse_if_nested("run")
+        fields: dict[str, Any] = {"prompt": prompt, "label": label}
+        if review is not None:
+            fields = _review_request(
+                review, backend=backend, prompt=prompt, mode=mode, worktree=worktree,
+                resume_from=resume_from, label=label,
             )
-            for spec in tasks
-        ]
-        effective_wait = wait_seconds if wait_seconds is not None else (
-            requests[0].timeout_seconds if wait else 0
+        req = await job_manager.prepare_request_async(
+            backend=backend,
+            cwd=cwd,
+            mode=mode,
+            model=model,
+            effort=effort,
+            resume_from=resume_from,
+            relocate_cwd=relocate_cwd,
+            worktree=worktree,
+            extra_dirs=extra_dirs,
+            timeout_seconds=timeout_seconds,
+            parent_run=parent_run,
+            confirm_prior_job_id=confirm_prior_job_id,
+            allow_cross_pool_fallback=allow_cross_pool_fallback,
+            fast=fast,
+            **fields,
         )
-        records = await job_manager.run_parallel(
-            requests,
-            wait=wait,
-            wait_seconds=effective_wait,
-        )
-        return {
-            "count": len(records),
-            "all_done": all(r.is_terminal for r in records),
-            "results": [r.to_detail() if wait else r.to_summary() for r in records],
-            "session_usage": await job_manager.session_compact_summary_async(),
-        }
+        # A host that shows the call as a task row collects the job through the task, never by waiting.
+        as_task = TASK_CALL.get()
+        wait, wait_note = (0, None) if as_task else await _effective_wait(ctx, wait_seconds)
+        _, cap, _ = (None, None, None) if as_task else await _host_details(ctx)
+        stop = asyncio.Event()
+        progress: list[asyncio.Task[None]] = []
+
+        def _started(record: JobRecord) -> None:
+            if wait > 0:
+                progress.append(_start_progress(ctx, [record.job_id], stop))
+
+        try:
+            record = await job_manager.run(req, wait_seconds=wait, on_started=_started)
+        finally:
+            stop.set()
+            for task in progress:
+                task.cancel()
+        if as_task and response_file:
+            task_reply_files.add(record.job_id)
+        if record.is_terminal and wait > 0:
+            reply = await _reply(record, response_file=response_file)
+        else:
+            record = job_manager.with_fast_request(record)
+            reply = record.to_receipt(
+                timeout_seconds=req.timeout_seconds,
+                next_call=_next_call(record.job_id, cap, response_file=response_file),
+            )
+            _add_warnings(reply, record)
+        # The note says the job is still running, so it goes only on a wait that ended before the job did.
+        if wait_note and not record.is_terminal:
+            reply["wait_note"] = wait_note
+        return reply
 
     @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            openWorldHint=False,
-        )
+        name="jobs",
+        description=JOBS_DESCRIPTION,
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     )
     @_reported
-    async def check_jobs(
+    async def jobs(
+        ctx: Context,
         job_ids: list[str] | None = None,
         wait_seconds: int = 0,
         wait_mode: Literal["all", "any"] = "all",
+        response_offset: int = 0,
+        response_chars: Annotated[int, Field(description="Max 100000.")] = DEFAULT_RESPONSE_CHARS,
+        response_file: ResponseFile = False,
+        verbose: Annotated[bool, Field(description="Add provider metrics and attempts.")] = False,
         status: str | None = None,
         backend: str | None = None,
         cwd: str | None = None,
         parent_run: str | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
-        """Inspect background or recent subagent jobs across windows, or wait for specific jobs.
-
-        - If `job_ids` is provided: waits up to `wait_seconds` (capped at 300s) for `'all'` or
-          `'any'` of those jobs to reach a terminal state, then returns full details. A wait ending
-          with `'queued'` or `'running'` leaves the job active.
-        - If `job_ids` is omitted: returns a compact summary list of recent jobs.
-        """
         if job_ids:
-            bounded_wait = max(0, min(int(wait_seconds), 300))
-            records = await job_manager.wait_for(
-                job_ids,
-                wait_seconds=bounded_wait,
-                wait_mode=wait_mode,
-            )
-            return {
+            if response_offset < 0:
+                raise ValueError("response_offset cannot be negative.")
+            wait, wait_note = await _effective_wait(ctx, wait_seconds)
+            missing: list[str] = []
+            stop = asyncio.Event()
+            progress = _start_progress(ctx, job_ids, stop) if wait > 0 else None
+            try:
+                records = await job_manager.wait_for(
+                    job_ids, wait_seconds=wait, wait_mode=wait_mode, missing=missing,
+                )
+            finally:
+                stop.set()
+                if progress is not None:
+                    progress.cancel()
+            details = {
+                r.job_id: await _reply(
+                    r, response_offset=response_offset, response_chars=response_chars,
+                    response_file=response_file, verbose=verbose,
+                )
+                for r in records
+            }
+            reply = {
+                "jobs": [
+                    details[jid]
+                    if jid in details
+                    else {
+                        "job_id": jid,
+                        "status": "not_found",
+                        "error": f"No job {jid!r} was found. It may have been removed from the stored "
+                        "history, or the id is mistyped.",
+                    }
+                    for jid in job_ids
+                ],
                 "all_done": all(r.is_terminal for r in records),
                 "any_done": any(r.is_terminal for r in records),
-                "jobs": [r.to_detail() for r in records],
-                "session_usage": await job_manager.session_compact_summary_async(),
             }
+            waited_out = reply["any_done"] if wait_mode == "any" else reply["all_done"]
+            if wait_note and not waited_out:
+                reply["wait_note"] = wait_note
+            return reply
 
         summaries = await job_manager.list_jobs_async(
             limit=limit,
@@ -502,236 +608,103 @@ def create_server(
             cwd=cwd,
             parent_run=parent_run,
         )
-        return {
-            "count": len(summaries),
-            "jobs": summaries,
-            "session_usage": await job_manager.session_compact_summary_async(),
-        }
+        return {"count": len(summaries), "jobs": summaries}
 
     @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=False,
-            openWorldHint=False,
-        )
+        name="cancel",
+        description=CANCEL_DESCRIPTION,
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     )
     @_reported
-    async def cancel_job(job_id: str) -> dict[str, Any]:
-        """Cancel a running or queued background subagent job owned by this bridge process."""
+    async def cancel(job_id: str) -> dict[str, Any]:
         record = await job_manager.cancel(job_id)
-        return record.to_detail()
+        return await _reply(record)
 
     @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            openWorldHint=True,
-        )
+        name="usage",
+        description=USAGE_DESCRIPTION,
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
     )
     @_reported
-    async def review_code(
-        cwd: str | None = None,
-        backends: list[str] | None = None,
-        scope: Literal["uncommitted", "base", "commit"] = "uncommitted",
-        base: str | None = None,
-        commit: str | None = None,
-        focus: str | None = None,
-        neon_model: str | None = None,
-        codex_model: str | None = None,
-        effort: EffortLevel | None = None,
-        wait: bool = True,
-        timeout_seconds: int | None = None,
-        wait_seconds: int | None = None,
-        parent_run: str | None = None,
-        claude_model: str | None = None,
-    ) -> dict[str, Any]:
-        """Run a read-only code review using Neon, Codex, Claude, or several in parallel.
-
-        - `backends`: defaults to `["neon", "codex"]` for dual-model review; add `"claude"` to include it.
-        - `scope`: `'uncommitted'` (default), `'base'` (with `base="main"`), or `'commit'` (with `commit="<sha>"`).
-        - `effort`: optional reasoning effort override applied to selected backends.
-        """
-        _refuse_if_nested("review_code")
-        models_by_backend = {"neon": neon_model, "codex": codex_model, "claude": claude_model}
-        selected = backends if backends else ["neon", "codex"]
-        normalized_backends = []
-        for b in selected:
-            nb = normalize_backend(b)
-            if nb not in normalized_backends:
-                normalized_backends.append(nb)
-
-        if scope == "base" and not base:
-            base = "main"
-        if scope == "commit" and not commit:
-            raise ValueError("commit SHA is required when scope='commit'.")
-
-        prompt_for_custom = _build_review_prompt(scope, base=base, commit=commit, focus=focus)
-        requests = []
-        for backend in normalized_backends:
-            if backend == "codex" and not (focus and focus.strip()):
-                req = await job_manager.prepare_request_async(
-                    backend="codex",
-                    prompt="",
-                    cwd=cwd,
-                    mode="read_only",
-                    model=codex_model,
-                    effort=effort,
-                    timeout_seconds=timeout_seconds,
-                    label=f"codex-review-{scope}",
-                    parent_run=parent_run,
-                    review_scope=scope,
-                    review_base=base,
-                    review_commit=commit,
-                )
-            else:
-                req = await job_manager.prepare_request_async(
-                    backend=backend,
-                    prompt=prompt_for_custom,
-                    cwd=cwd,
-                    mode="read_only",
-                    model=models_by_backend.get(backend),
-                    effort=effort,
-                    timeout_seconds=timeout_seconds,
-                    label=f"{backend}-review-{scope}",
-                    parent_run=parent_run,
-                )
-            requests.append(req)
-
-        effective_wait = wait_seconds if wait_seconds is not None else (
-            requests[0].timeout_seconds if wait else 0
-        )
-        records = await job_manager.run_parallel(
-            requests,
-            wait=wait,
-            wait_seconds=effective_wait,
-        )
-        return {
-            "scope": scope,
-            "base": base,
-            "commit": commit,
-            "all_done": all(r.is_terminal for r in records),
-            "reviews": [r.to_detail() if wait else r.to_summary() for r in records],
-            "session_usage": await job_manager.session_compact_summary_async(),
-        }
-
-    @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            openWorldHint=True,
-        )
-    )
-    @_reported
-    async def get_usage(
-        period: UsagePeriod = "today",
-        backend: str | None = None,
-        quota_pool: str | None = None,
-        cwd: str | None = None,
-        parent_run: str | None = None,
-        include_quota: bool = False,
-        refresh_quota: bool = False,
-        compact: bool = False,
-        recent_limit: int = 10,
-    ) -> dict[str, Any]:
-        """Inspect usage across all quota pools, in-flight load, coverage, and weekly-reset-aware quota.
-
-        - `period`: `'session'`, `'today'`, `'7d'`, `'30d'`, or `'all'`.
-        - `quota_pool`: optional pool filter (`'agy_gemini'`, `'agy_claude_gpt'`, `'codex'`, or `'claude'`).
-        - `cwd` / `parent_run`: optional filters for project-scoped or workflow-scoped planning.
-        - `compact=True`: concise planning view (per-backend & per-quota-pool runs, in-flight, duration, coverage).
-        - `include_quota=True`: opt-in cached live quota lookup + `quota_advisory` with weekly-reset alerts,
-          upcoming reset times across all involved models, and smart pool `recommended_order`.
-        """
-        return await job_manager.get_usage_summary(
-            period=period,
-            backend=backend,
-            quota_pool=quota_pool,
-            cwd=cwd,
-            parent_run=parent_run,
-            include_quota=include_quota,
-            refresh_quota=refresh_quota,
-            compact=compact,
-            recent_limit=recent_limit,
-        )
-
-    @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            openWorldHint=True,
-        )
-    )
-    @_reported
-    async def usage_dashboard(
-        period: DashboardPeriod | None = None,
+    async def usage(
+        period: UsagePeriodName | None = None,
         since: str | None = None,
         until: str | None = None,
+        backend: str | None = None,
+        cwd: str | None = None,
+        parent_run: str | None = None,
+        quota: bool = False,
+        view: Literal["summary", "dashboard"] = "summary",
+        verbose: bool = False,
     ) -> dict[str, Any]:
-        """What is left of each subscription, then what the bridge has run in a period.
+        if view == "dashboard":
+            if any(v and v.strip() for v in (backend, cwd, parent_run)):
+                raise ValueError(
+                    "The dashboard covers every job in the period: backend, cwd and parent_run filter "
+                    "view='summary' only."
+                )
+            readings: dict[str, Any] = {}
+            dashboard = await job_manager.usage_dashboard(
+                period=period, since=since, until=until, readings_out=readings,
+            )
+            out: dict[str, Any] = {"text": dashboard["text"]}
+            if verbose:
+                # The dashboard's own quota section is in `text`; `quota` only ever has the one shape.
+                out.update({k: v for k, v in dashboard.items() if k not in ("text", "quota")})
+            if quota:
+                out["quota"] = build_quota_view(readings)
+            return out
 
-        - `period`: `'today'` (the default), `'7d'`, `'30d'`, `'all'`, or `'session'` (this window only).
-        - `since` / `until`: instead of `period`, a local date (`2026-11-25`) or an ISO time. A date alone as
-          `until` takes in that whole day.
-
-        `quota` lists every pool with the 5h and weekly windows its reading holds: percent left, the
-        reset, and when it was read.
-        The readings come from each CLI, as `get_usage(include_quota=True)` reads them, and take about
-        10 seconds; a pool that could not be read says why. The period does not change them.
-
-        The rest is from the bridge's own records. Totals hold only finished runs with exact or delta
-        counts. Everything the records cannot vouch for (running jobs, partial counts, runs that left no
-        count, Claude subagents, time before the first record) is listed apart under `not_in_totals` and
-        never added in. The tool writes nothing. Show `text` to the user as it is: every figure in it is
-        already worked out.
-        """
-        return await job_manager.usage_dashboard(period=period, since=since, until=until)
+        summary = await job_manager.get_usage_summary(
+            period=period, since=since, until=until, backend=backend, cwd=cwd, parent_run=parent_run,
+        )
+        out = _usage_summary_reply(summary, verbose=verbose)
+        if quota:
+            # Every pool, whatever the filters: a pool left unread would read as one that failed.
+            out["quota"] = build_quota_view(await job_manager.get_quota(list(ALL_BACKENDS)))
+        return out
 
     @mcp.tool(
-        annotations=ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            openWorldHint=False,
-        )
+        name="backends",
+        description=BACKENDS_DESCRIPTION,
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     )
     @_reported
-    async def list_backends(
-        refresh_models: bool = False,
-        include_quota: bool = False,
-    ) -> dict[str, Any]:
-        """Check CLI discovery, health, live/cached agy pools (Gemini + Claude/GPT), Codex and Claude defaults, and optional quota."""
+    async def backends(ctx: Context, refresh_models: bool = False) -> dict[str, Any]:
+        def _unhealthy(exc: Exception) -> dict[str, Any]:
+            return {
+                "command_found": False,
+                "healthy": False,
+                "available": False,
+                "command": None,
+                "version": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
         async def _probe_neon() -> dict[str, Any]:
             try:
                 neon_health = await job_manager.neon_runner.check_health()
             except Exception as exc:
-                neon_health = {
-                    "command_found": False,
-                    "healthy": False,
-                    "available": False,
-                    "command": None,
-                    "version": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+                neon_health = _unhealthy(exc)
             info: dict[str, Any] = {
                 "backend": "neon",
                 "cli": "agy",
                 "default_intent": cfg.default_neon_model,
                 **neon_health,
             }
+            catalog = job_manager.neon_runner.catalog
             if neon_health.get("healthy"):
                 try:
                     models = await job_manager.neon_runner.list_models(refresh=refresh_models)
                 except Exception as exc:
                     models = []
                     info["catalog_error"] = f"{type(exc).__name__}: {exc}"
-                info.update(job_manager.neon_runner.catalog.status_info())
+                info.update(catalog.status_info())
                 info["models"] = models
-                info["quota_pools"] = job_manager.neon_runner.catalog.group_models_by_quota_pool()
-                info["resolved_shortcuts"] = job_manager.neon_runner.catalog.summarize_latest_aliases()
+                info["quota_pools"] = catalog.group_models_by_quota_pool()
+                info["resolved_shortcuts"] = catalog.summarize_latest_aliases()
                 try:
-                    default_res = await job_manager.neon_runner.catalog.resolve(
-                        None,
-                        default_intent=cfg.default_neon_model,
-                    )
+                    default_res = await catalog.resolve(None, default_intent=cfg.default_neon_model)
                     info["resolved_default_model"] = default_res.resolved
                 except ModelPoolUnavailableError as exc:
                     info["resolved_default_model"] = None
@@ -742,28 +715,19 @@ def create_server(
                     info["catalog_error"] = f"{type(exc).__name__}: {exc}"
                     info["available"] = False
             else:
-                info.update(job_manager.neon_runner.catalog.status_info())
+                info.update(catalog.status_info())
             return info
 
         async def _probe_codex() -> dict[str, Any]:
             try:
                 codex_health = await job_manager.codex_runner.check_health()
             except Exception as exc:
-                codex_health = {
-                    "command_found": False,
-                    "healthy": False,
-                    "available": False,
-                    "command": None,
-                    "version": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+                codex_health = _unhealthy(exc)
             return {
                 "backend": "codex",
                 "cli": "codex",
                 "default_model": cfg.default_codex_model,
                 "default_effort": cfg.default_codex_effort,
-                "configured_model_override": cfg.default_codex_model,
-                "configured_effort_override": cfg.default_codex_effort,
                 **codex_health,
             }
 
@@ -771,14 +735,7 @@ def create_server(
             try:
                 claude_health = await job_manager.claude_runner.check_health()
             except Exception as exc:
-                claude_health = {
-                    "command_found": False,
-                    "healthy": False,
-                    "available": False,
-                    "command": None,
-                    "version": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+                claude_health = _unhealthy(exc)
             return {
                 "backend": "claude",
                 "cli": "claude",
@@ -789,31 +746,65 @@ def create_server(
                 **claude_health,
             }
 
-        neon_info, codex_info, claude_info = await asyncio.gather(
-            _probe_neon(), _probe_codex(), _probe_claude()
+        neon_info, codex_info, claude_info, (host, cap, _) = await asyncio.gather(
+            _probe_neon(), _probe_codex(), _probe_claude(), _host_details(ctx),
         )
-
-        out: dict[str, Any] = {
-            "owner_id": job_manager.owner_id,
+        return {
+            "host": host.name if host is not None else None,
+            "wait_cap": cap,
             "default_cwd": str(cfg.default_cwd),
             "default_timeout_seconds": cfg.default_timeout_seconds,
             "max_concurrent_jobs_per_process": cfg.max_concurrent_jobs,
             "db_path": str(job_manager.store.db_path),
-            "session_usage": await job_manager.session_compact_summary_async(),
             "nesting": job_manager.nesting.to_dict(),
-            "backends": {
-                "neon": neon_info,
-                "codex": codex_info,
-                "claude": claude_info,
-            },
+            "backends": {"neon": neon_info, "codex": codex_info, "claude": claude_info},
         }
-        if include_quota:
-            quota = await job_manager.get_quota(["neon", "codex", "claude"], refresh=refresh_models)
-            out["quota"] = quota
-            out["quota_advisory"] = job_manager._build_quota_advisory(quota)
-        return out
 
     return mcp, job_manager
+
+
+_OUTCOMES = ("completed", "failed", "timed_out", "cancelled", "in_flight")
+
+
+def _compact_bucket(bucket: dict[str, Any], *, verbose: bool) -> dict[str, Any]:
+    """One group's figures: runs, outcomes and in-flight jobs that are not zero, time and counted tokens."""
+    tokens = bucket.get("tokens") or {}
+    coverage = bucket.get("usage_coverage") or {}
+    out: dict[str, Any] = {"runs": bucket.get("runs", 0)}
+    out.update({k: n for k in _OUTCOMES if (n := bucket.get(k))})
+    out["duration_seconds"] = bucket.get("duration_seconds", 0.0)
+    out["total_tokens"] = tokens.get("total_tokens", 0)
+    uncounted = int(coverage.get("partial") or 0) + int(coverage.get("missing") or 0)
+    if uncounted:
+        out["runs_without_full_count"] = uncounted
+    if verbose:
+        out["tokens"] = tokens
+        out["usage_coverage"] = coverage
+        if bucket.get("attempts", 0) != bucket.get("runs", 0):
+            out["attempts"] = bucket.get("attempts", 0)
+        if bucket.get("partial_total_tokens"):
+            out["partial_total_tokens"] = bucket["partial_total_tokens"]
+    return out
+
+
+def _usage_summary_reply(summary: dict[str, Any], *, verbose: bool) -> dict[str, Any]:
+    """The summary view: the period's totals, then each quota pool, each figure once."""
+    pools = summary.get("by_quota_pool") or {}
+    overview = summary.get("overview") or {}
+    totals = {
+        **overview,
+        "tokens": {
+            "total_tokens": sum(int((b.get("tokens") or {}).get("total_tokens") or 0) for b in pools.values()),
+        },
+    }
+    out: dict[str, Any] = {"scope": summary.get("scope", {})}
+    out["totals"] = _compact_bucket(totals, verbose=False)
+    out["by_quota_pool"] = {name: _compact_bucket(b, verbose=verbose) for name, b in sorted(pools.items())}
+    out["note"] = (
+        "Tokens are counted for finished runs whose CLI reported an exact or per-turn count; "
+        "runs_without_full_count says how many are left out."
+    )
+    return out
 
 
 def _configure_stderr_logging() -> None:

@@ -26,7 +26,7 @@ left out: it is not a record the bridge can add up.
 It covers jobs run through the bridge only, and says so in the view.
 
 It reads and never writes: a job left running by a closed window is found by reading the owners table,
-not by marking the job, which `get_usage` still does, and a quota reading taken for the view is not put
+not by marking the job, which the summary view of `usage` still does, and a quota reading taken for the view is not put
 in the cache.
 
 The text view is rendered from the same dict that is returned, so the two cannot disagree. It shows a

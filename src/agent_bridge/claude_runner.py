@@ -421,6 +421,8 @@ class ClaudeRunner:
         started = time.monotonic()
         reported_model = effective_model or "claude-default"
         reported_effort = effective_effort
+        if on_model:
+            on_model(reported_model, "requested" if effective_model else "default")
 
         def _early(
             *,
@@ -487,8 +489,6 @@ class ClaudeRunner:
             effective_model=effective_model,
             effective_effort=effective_effort,
         )
-        if on_model:
-            on_model(reported_model)
         if on_activity:
             on_activity(f"running claude ({reported_model})")
 
@@ -570,10 +570,10 @@ class ClaudeRunner:
                 if isinstance(sid, str) and sid and on_session:
                     on_session(sid)
                 live_model = event.get("model")
-                if isinstance(live_model, str) and live_model and live_model != reported_model:
+                if isinstance(live_model, str) and live_model:
                     reported_model = live_model
                     if on_model:
-                        on_model(live_model)
+                        on_model(live_model, "observed")
             if on_activity:
                 activity = _describe_claude_event(event)
                 if activity:

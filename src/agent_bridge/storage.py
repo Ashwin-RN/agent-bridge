@@ -7,7 +7,8 @@ import logging
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -189,13 +190,44 @@ def _loads_opt(raw: str | None) -> dict[str, Any] | None:
 def _is_owner_row_alive(
     pid: int | None,
     exited_at: float | None,
+    process_identity: str | None = None,
     *,
     is_pid_alive_fn: Callable[[int], bool],
+    process_identity_fn: Callable[[int], str | None] | None = None,
 ) -> bool:
-    """Single canonical liveness predicate used by status checks, cancellation, recovery, and session claims."""
+    """Single canonical liveness predicate used by status checks, cancellation, recovery, and session claims.
+
+    An owner is live while its row has no exit time, its pid is alive, and that pid is still the process
+    that registered: the identity read from the kernel now equals the one recorded, exactly (see
+    `nesting.process_identity`; nothing in it follows the wall clock). Where either is unknown (a row
+    from an older bridge, a platform with no such identity, no reader given, or one that cannot be read
+    now) the pid check decides alone, as before.
+    """
     if exited_at is not None or pid is None:
         return False
-    return bool(is_pid_alive_fn(int(pid)))
+    if not is_pid_alive_fn(int(pid)):
+        return False
+    if process_identity is None or process_identity_fn is None:
+        return True
+    current = process_identity_fn(int(pid))
+    if current is None:
+        return True
+    return current == process_identity
+
+
+class SessionHeldError(RuntimeError):
+    """A job's CLI reported a session that another job, not yet ended, holds. Nothing was written."""
+
+    def __init__(self, *, backend: str, session_id: str, holder_job_id: str) -> None:
+        self.backend = backend
+        self.session_id = session_id
+        self.holder_job_id = holder_job_id
+        super().__init__(
+            f"Session {session_id!r} on {backend!r} is held by job {holder_job_id!r}, which has not ended."
+        )
+
+
+FinalizeOutcome = Literal["written", "kept", "missing"]
 
 
 def is_sqlite_lock_error(exc: BaseException) -> bool:
@@ -251,6 +283,9 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         error=row["error"],
         stderr_tail=row["stderr_tail"],
         last_activity=row["last_activity"],
+        last_activity_at=row["last_activity_at"] if "last_activity_at" in keys else None,
+        model_source=row["model_source"] if "model_source" in keys else None,
+        response_chars=row["response_chars"] if "response_chars" in keys else None,
         provider_invoked=bool(row["provider_invoked"]) if "provider_invoked" in keys else (row["started_at"] is not None),
         attempts=attempts_val,
     )
@@ -278,6 +313,7 @@ def _insert_usage_event_row_cur(
     usage_status: str,
     usage: dict[str, Any] | None,
     provider_metrics: dict[str, Any] | None,
+    keep_existing: bool = False,
 ) -> None:
     u = usage if isinstance(usage, dict) else {}
     iso_time = datetime.fromtimestamp(now_ts).astimezone().isoformat(timespec="seconds")
@@ -286,14 +322,16 @@ def _insert_usage_event_row_cur(
         v = u.get(key)
         return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
+    conflict = "ON CONFLICT(job_id, attempt_number) DO NOTHING" if keep_existing else ""
     cur.execute(
-        """
+        f"""
         INSERT OR REPLACE INTO usage_events (
             job_id, attempt_number, is_final_attempt, owner_id, ts, iso_time, backend, quota_pool,
             model, effort, mode, status, duration_seconds, cwd, parent_run, label, session_id,
             usage_status, input_tokens, output_tokens, cached_tokens, cache_write_tokens,
             reasoning_tokens, total_tokens, provider_metrics_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        {conflict}
         """,
         (
             job_id,
@@ -330,15 +368,22 @@ def _insert_usage_event_cur(
     record: JobRecord,
     *,
     attempts: list[dict[str, Any]] | None = None,
+    keep_existing: bool = False,
 ) -> None:
+    if keep_existing and cur.execute(
+        "SELECT 1 FROM usage_events WHERE job_id = ? AND is_final_attempt = 1", (record.job_id,),
+    ).fetchone():
+        return  # This pruned job already has its final ledger.
+
     now_ts = record.finished_at or time.time()
     att_list = attempts if attempts and len(attempts) >= 1 else None
     if att_list is None and record.attempts and len(record.attempts) >= 1:
         att_list = record.attempts
 
     if att_list is not None and len(att_list) > 1:
-        # Clear any stale attempt rows beyond len(att_list) and replace cleanly with real job_id + attempt_number!
-        cur.execute("DELETE FROM usage_events WHERE job_id = ?", (record.job_id,))
+        if not keep_existing:
+            # Clear any stale attempt rows beyond len(att_list) before writing the final ledger.
+            cur.execute("DELETE FROM usage_events WHERE job_id = ?", (record.job_id,))
         total_att = len(att_list)
         for idx, att in enumerate(att_list, start=1):
             is_last = idx == total_att
@@ -370,6 +415,7 @@ def _insert_usage_event_cur(
                 usage_status=att_ustatus,
                 usage=att_usage,
                 provider_metrics=att_pm,
+                keep_existing=keep_existing,
             )
         return
 
@@ -414,6 +460,7 @@ def _insert_usage_event_cur(
         usage_status=final_ustatus,
         usage=final_usage,
         provider_metrics=record.provider_metrics,
+        keep_existing=keep_existing,
     )
 
 
@@ -441,13 +488,14 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
     else:
         rec.duration_seconds = 0.0
     rec.last_activity = "owner_exited"
+    rec.last_activity_at = now
     rec.usage_status = "missing"
 
     cur.execute(
         """
         UPDATE jobs SET
             status = ?, failure_reason = ?, provider_state = ?, retry_guidance = ?,
-            error = ?, finished_at = ?, duration_seconds = ?, last_activity = ?,
+            error = ?, finished_at = ?, duration_seconds = ?, last_activity = ?, last_activity_at = ?,
             usage_status = ?
         WHERE job_id = ? AND status IN ('queued', 'running')
         """,
@@ -460,6 +508,7 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
             rec.finished_at,
             rec.duration_seconds,
             rec.last_activity,
+            rec.last_activity_at,
             rec.usage_status,
             rec.job_id,
         ),
@@ -488,6 +537,83 @@ def _recover_job_row_cur(cur: sqlite3.Cursor, row: sqlite3.Row, now: float) -> b
                 (rec.backend, rec.session_id, rec.job_id, rec.provider_state, now),
             )
     return changed
+
+
+def _live_session_holder_cur(
+    cur: sqlite3.Cursor,
+    backend: str,
+    session_id: str,
+    *,
+    job_id: str,
+    owner_id: str,
+    now: float,
+    is_pid_alive_fn: Callable[[int], bool] | None,
+    process_identity_fn: Callable[[int], str | None] | None = None,
+) -> str | None:
+    """The job, other than `job_id`, that holds `(backend, session_id)` and is live, or None.
+
+    The one claim decision, for a turn that asks for a session and for one whose CLI reveals it. A claim
+    whose job has ended is dropped. A claim whose job's window has died is released by recovering that
+    job (failed, owner_exited; which leaves the session blocked as `unknown` if the turn had started).
+    Without a pid check (`is_pid_alive_fn=None`) any holder that has not ended counts as live.
+    """
+    claim = cur.execute(
+        "SELECT job_id FROM session_claims WHERE backend = ? AND session_id = ?",
+        (backend, session_id),
+    ).fetchone()
+    if claim is None or str(claim["job_id"]) == job_id:
+        return None
+    holder_id = str(claim["job_id"])
+    holder_row = cur.execute(
+        """
+        SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+               o.process_identity AS owner_process_identity
+        FROM jobs j
+        LEFT JOIN owners o ON j.owner_id = o.owner_id
+        WHERE j.job_id = ?
+        """,
+        (holder_id,),
+    ).fetchone()
+    if holder_row is None or str(holder_row["status"]) in TERMINAL_STATUSES:
+        cur.execute(
+            "DELETE FROM session_claims WHERE backend = ? AND session_id = ?",
+            (backend, session_id),
+        )
+        return None
+    if is_pid_alive_fn is None:
+        return holder_id
+    holder_alive = str(holder_row["owner_id"]) == owner_id or _is_owner_row_alive(
+        holder_row["owner_pid"],
+        holder_row["owner_exited_at"],
+        holder_row["owner_process_identity"],
+        is_pid_alive_fn=is_pid_alive_fn,
+        process_identity_fn=process_identity_fn,
+    )
+    if holder_alive:
+        return holder_id
+    # Dead owner held the claim: recover its job atomically, which releases the claim.
+    _recover_job_row_cur(cur, holder_row, now)
+    if holder_row["owner_pid"] is not None and holder_row["owner_exited_at"] is None:
+        cur.execute(
+            "UPDATE owners SET exited_at = ? WHERE owner_id = ? AND exited_at IS NULL",
+            (now, str(holder_row["owner_id"])),
+        )
+    return None
+
+
+def session_held_error_text(session_id: str, holder_job_id: str) -> str:
+    return (
+        f"The CLI reported session {session_id!r}, which job {holder_job_id!r} holds and has not ended. Two "
+        "turns must not run on one session at once, so this job was stopped, and that session is not "
+        "recorded on it."
+    )
+
+
+def session_held_guidance(session_id: str, holder_job_id: str) -> str:
+    return (
+        f"Wait for job {holder_job_id!r} to end, then pass resume_from={session_id!r} if this turn was meant "
+        "to continue that session. For edit tasks inspect git status/diff first."
+    )
 
 
 def _reconcile_session_safety_cur(
@@ -628,6 +754,12 @@ class BridgeStore:
                 cur.execute("UPDATE jobs SET provider_invoked = 1 WHERE started_at IS NOT NULL")
             if "cleanup_seconds" not in job_cols:
                 cur.execute("ALTER TABLE jobs ADD COLUMN cleanup_seconds REAL")
+            if "last_activity_at" not in job_cols:
+                cur.execute("ALTER TABLE jobs ADD COLUMN last_activity_at REAL")
+            if "model_source" not in job_cols:
+                cur.execute("ALTER TABLE jobs ADD COLUMN model_source TEXT")
+            if "response_chars" not in job_cols:
+                cur.execute("ALTER TABLE jobs ADD COLUMN response_chars INTEGER")
 
             # Always backfill any NULL quota_pool rows atomically (recovers interrupted prior migrations too).
             if cur.execute("SELECT 1 FROM jobs WHERE quota_pool IS NULL LIMIT 1").fetchone() is not None:
@@ -836,7 +968,20 @@ class BridgeStore:
                 (str(now),),
             )
 
+            self._migrate_owner_process_identity_cur(cur)
+
         self._import_legacy_files_if_needed()
+
+    @staticmethod
+    def _migrate_owner_process_identity_cur(cur: sqlite3.Cursor) -> None:
+        """Migration step: `owners.process_identity`, a token naming the owning process itself.
+
+        Additive and nullable. A row without it, written by an older bridge or on a platform with no
+        stable identity, is "unknown": its liveness is the pid check alone, as before.
+        """
+        owner_cols = {str(r["name"]) for r in cur.execute("PRAGMA table_info(owners)").fetchall()}
+        if "process_identity" not in owner_cols:
+            cur.execute("ALTER TABLE owners ADD COLUMN process_identity TEXT")
 
     def _import_legacy_files_if_needed(self) -> None:
         """One-time, idempotent import of v1 `jobs.json` and `usage.jsonl` into SQLite."""
@@ -1115,22 +1260,17 @@ class BridgeStore:
 
     # --- Owner tracking & crash recovery ---
 
-    def register_owner(self, owner_id: str, pid: int) -> None:
+    def register_owner(self, owner_id: str, pid: int, *, process_identity: str | None = None) -> None:
+        """Record a live bridge process. `process_identity` names that process, None when unknown."""
         now = time.time()
         with self._tx(write=True) as cur:
             cur.execute(
                 """
-                INSERT OR REPLACE INTO owners (owner_id, pid, started_at, last_heartbeat, exited_at)
-                VALUES (?, ?, ?, ?, NULL)
+                INSERT OR REPLACE INTO owners (
+                    owner_id, pid, started_at, last_heartbeat, exited_at, process_identity
+                ) VALUES (?, ?, ?, ?, NULL, ?)
                 """,
-                (owner_id, int(pid), now, now),
-            )
-
-    def heartbeat_owner(self, owner_id: str) -> None:
-        with self._tx(write=True) as cur:
-            cur.execute(
-                "UPDATE owners SET last_heartbeat = ? WHERE owner_id = ?",
-                (time.time(), owner_id),
+                (owner_id, int(pid), now, now, process_identity),
             )
 
     def mark_owner_exited(self, owner_id: str) -> None:
@@ -1155,12 +1295,11 @@ class BridgeStore:
         owner_id: str,
         *,
         is_pid_alive_fn: Callable[[int], bool],
-        stale_seconds: float = 30.0,
+        process_identity_fn: Callable[[int], str | None] | None = None,
     ) -> bool:
-        _ = stale_seconds  # Kept for API compatibility; liveness uses the unified OS PID check.
         with self._tx(write=False) as cur:
             row = cur.execute(
-                "SELECT pid, exited_at FROM owners WHERE owner_id = ?",
+                "SELECT pid, exited_at, process_identity FROM owners WHERE owner_id = ?",
                 (owner_id,),
             ).fetchone()
             if row is None:
@@ -1168,7 +1307,9 @@ class BridgeStore:
             return _is_owner_row_alive(
                 row["pid"],
                 row["exited_at"],
+                row["process_identity"],
                 is_pid_alive_fn=is_pid_alive_fn,
+                process_identity_fn=process_identity_fn,
             )
 
     def recover_dead_owner_jobs(
@@ -1176,16 +1317,16 @@ class BridgeStore:
         current_owner_id: str,
         *,
         is_pid_alive_fn: Callable[[int], bool],
-        stale_seconds: float = 30.0,
+        process_identity_fn: Callable[[int], str | None] | None = None,
     ) -> list[str]:
         """Recover only queued/running jobs whose owning bridge process has actually exited."""
-        _ = stale_seconds
         recovered: list[str] = []
         now = time.time()
         with self._tx(write=True) as cur:
             rows = cur.execute(
                 """
-                SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at
+                SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+                       o.process_identity AS owner_process_identity
                 FROM jobs j
                 LEFT JOIN owners o ON j.owner_id = o.owner_id
                 WHERE j.status IN ('queued', 'running') AND j.owner_id != ?
@@ -1198,7 +1339,9 @@ class BridgeStore:
                 alive = _is_owner_row_alive(
                     row["owner_pid"],
                     row["owner_exited_at"],
+                    row["owner_process_identity"],
                     is_pid_alive_fn=is_pid_alive_fn,
+                    process_identity_fn=process_identity_fn,
                 )
                 if alive:
                     continue
@@ -1250,6 +1393,7 @@ class BridgeStore:
         owner_id: str,
         *,
         is_pid_alive_fn: Callable[[int], bool],
+        process_identity_fn: Callable[[int], str | None] | None = None,
         confirm_prior_job_id: str | None = None,
     ) -> tuple[Literal["claimed", "busy", "blocked"], str | None, str | None]:
         """Atomically claim `(backend, session_id)` for `job_id`.
@@ -1263,56 +1407,29 @@ class BridgeStore:
         now = time.time()
         with self._tx(write=True) as cur:
             claim = cur.execute(
-                """
-                SELECT job_id, owner_id FROM session_claims
-                WHERE backend = ? AND session_id = ?
-                """,
+                "SELECT job_id FROM session_claims WHERE backend = ? AND session_id = ?",
                 (backend, session_id),
             ).fetchone()
-
-            if claim is not None:
-                holder_id = str(claim["job_id"])
-                if holder_id == job_id:
-                    return "claimed", None, None
-
-                holder_row = cur.execute(
-                    """
-                    SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at
-                    FROM jobs j
-                    LEFT JOIN owners o ON j.owner_id = o.owner_id
-                    WHERE j.job_id = ?
-                    """,
-                    (holder_id,),
-                ).fetchone()
-
-                if holder_row is None or str(holder_row["status"]) in TERMINAL_STATUSES:
-                    cur.execute(
-                        "DELETE FROM session_claims WHERE backend = ? AND session_id = ?",
-                        (backend, session_id),
-                    )
-                else:
-                    holder_alive = (
-                        str(holder_row["owner_id"]) == owner_id
-                        or _is_owner_row_alive(
-                            holder_row["owner_pid"],
-                            holder_row["owner_exited_at"],
-                            is_pid_alive_fn=is_pid_alive_fn,
-                        )
-                    )
-                    if holder_alive:
-                        return "busy", holder_id, None
-                    # Dead owner held the claim: recover its job atomically and continue.
-                    _recover_job_row_cur(cur, holder_row, now)
-                    if holder_row["owner_pid"] is not None and holder_row["owner_exited_at"] is None:
-                        cur.execute(
-                            "UPDATE owners SET exited_at = ? WHERE owner_id = ? AND exited_at IS NULL",
-                            (now, str(holder_row["owner_id"])),
-                        )
+            if claim is not None and str(claim["job_id"]) == job_id:
+                return "claimed", None, None
+            holder_id = _live_session_holder_cur(
+                cur,
+                backend,
+                session_id,
+                job_id=job_id,
+                owner_id=owner_id,
+                now=now,
+                is_pid_alive_fn=is_pid_alive_fn,
+                process_identity_fn=process_identity_fn,
+            )
+            if holder_id is not None:
+                return "busy", holder_id, None
 
             # Defensive check: ensure no active RUNNING job on `(backend, session_id)` lacks a claim row.
             running_rows = cur.execute(
                 """
-                SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at
+                SELECT j.*, o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+                       o.process_identity AS owner_process_identity
                 FROM jobs j
                 LEFT JOIN owners o ON j.owner_id = o.owner_id
                 WHERE j.backend = ? AND j.session_id = ?
@@ -1328,7 +1445,9 @@ class BridgeStore:
                     or _is_owner_row_alive(
                         rrow["owner_pid"],
                         rrow["owner_exited_at"],
+                        rrow["owner_process_identity"],
                         is_pid_alive_fn=is_pid_alive_fn,
+                        process_identity_fn=process_identity_fn,
                     )
                 )
                 if running_alive:
@@ -1452,6 +1571,8 @@ class BridgeStore:
             record.model or record.requested_model,
         )
         record.quota_pool = pool
+        if record.last_activity is not None and record.last_activity_at is None:
+            record.last_activity_at = time.time()
         with self._tx(write=True) as cur:
             cur.execute(
                 """
@@ -1463,10 +1584,10 @@ class BridgeStore:
                     failure_reason, provider_state, retry_guidance, created_at,
                     started_at, finished_at, duration_seconds, response, usage_json,
                     provider_metrics_json, usage_status, exit_code, error, stderr_tail,
-                    last_activity, provider_invoked
+                    last_activity, provider_invoked, last_activity_at, model_source
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -1509,6 +1630,8 @@ class BridgeStore:
                     record.stderr_tail,
                     record.last_activity,
                     1 if record.provider_invoked else 0,
+                    record.last_activity_at,
+                    record.model_source,
                 ),
             )
             cur.execute(
@@ -1526,14 +1649,18 @@ class BridgeStore:
         started_at: float | None = None,
         session_id: str | None = None,
         model: str | None = None,
+        model_source: str | None = None,
         quota_pool: str | None = None,
         effective_cwd: str | None = None,
         worktree_path: str | None = None,
         worktree_branch: str | None = None,
         worktree_commit: str | None = None,
         last_activity: str | None = None,
+        last_activity_at: float | None = None,
         provider_invoked: bool | None = None,
         lock_timeout: float = 2.0,
+        is_pid_alive_fn: Callable[[int], bool] | None = None,
+        process_identity_fn: Callable[[int], str | None] | None = None,
     ) -> None:
         sets: list[str] = []
         vals: list[Any] = []
@@ -1549,6 +1676,9 @@ class BridgeStore:
         if model is not None:
             sets.append("model = ?")
             vals.append(model)
+        if model is not None or model_source is not None:
+            sets.append("model_source = ?")
+            vals.append(model_source)
         if quota_pool is not None:
             sets.append("quota_pool = ?")
             vals.append(quota_pool)
@@ -1565,8 +1695,8 @@ class BridgeStore:
             sets.append("worktree_commit = ?")
             vals.append(worktree_commit)
         if last_activity is not None:
-            sets.append("last_activity = ?")
-            vals.append(last_activity)
+            sets.extend(("last_activity = ?", "last_activity_at = ?"))
+            vals.extend((last_activity, last_activity_at if last_activity_at is not None else time.time()))
         if provider_invoked is not None:
             sets.append("provider_invoked = ?")
             vals.append(1 if provider_invoked else 0)
@@ -1575,6 +1705,28 @@ class BridgeStore:
         vals.append(job_id)
         now = time.time()
         with self._tx(write=True, lock_timeout=lock_timeout) as cur:
+            if session_id is not None:
+                # A session another job holds and has not ended is refused before anything is written:
+                # the error rolls this transaction back, and the caller stops its run.
+                claim_backend = backend
+                if not claim_backend:
+                    brow = cur.execute("SELECT backend FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                    claim_backend = str(brow["backend"]) if brow is not None else None
+                if claim_backend:
+                    # The claim decision a resume gets: a holder whose window has died is recovered, not
+                    # obeyed. With no pid check given, any holder that has not ended counts as live.
+                    holder = _live_session_holder_cur(
+                        cur,
+                        claim_backend,
+                        session_id,
+                        job_id=job_id,
+                        owner_id=owner_id,
+                        now=now,
+                        is_pid_alive_fn=is_pid_alive_fn,
+                        process_identity_fn=process_identity_fn,
+                    )
+                    if holder is not None:
+                        raise SessionHeldError(backend=claim_backend, session_id=session_id, holder_job_id=holder)
             cur.execute(
                 f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ? "
                 "AND status NOT IN ('completed', 'failed', 'cancelled', 'timed_out')",
@@ -1633,8 +1785,19 @@ class BridgeStore:
         touched_provider: bool | None = None,
         attempts: list[dict[str, Any]] | None = None,
         lock_timeout: float = 5.0,
-    ) -> None:
-        """Atomically and idempotently persist terminal status, per-attempt usage, claim release, and safety state."""
+        is_pid_alive_fn: Callable[[int], bool] | None = None,
+        process_identity_fn: Callable[[int], str | None] | None = None,
+    ) -> FinalizeOutcome:
+        """Atomically persist terminal status, per-attempt usage, claim release, and safety state.
+
+        Only the write that ends an active row stores a result and touches session state. Returns
+        "written" for that; "kept" when the row had already ended, whatever this record says, and it is
+        then left exactly as it is, usage, watermark and safety state included; or "missing" when there
+        is no row (pruned), in which case the run's usage is recorded and its own claim released, and
+        no session state is touched.
+        """
+        shared_record = record
+        record = replace(record)
         now = time.time()
         pool = record.quota_pool or classify_quota_pool(
             record.backend,
@@ -1654,6 +1817,69 @@ class BridgeStore:
             pm["attempts"] = att_list
             record.provider_metrics = pm
         with self._tx(write=True, lock_timeout=lock_timeout) as cur:
+            current = cur.execute(
+                "SELECT status, failure_reason FROM jobs WHERE job_id = ?", (record.job_id,)
+            ).fetchone()
+            if current is not None and str(current["status"]) in TERMINAL_STATUSES:
+                # A late writer never overwrites a result that is already stored, even with the same
+                # status: its reply, usage or checkpoint may be older than the stored ones. A retried
+                # write of the stored result itself lands here too, which is as it should be.
+                same = (str(current["status"]), current["failure_reason"]) == (record.status, record.failure_reason)
+                (logger.info if same else logger.warning)(
+                    "Job %s had already ended %s (%s); a later %s (%s) result is not written over it.",
+                    record.job_id,
+                    current["status"],
+                    current["failure_reason"],
+                    record.status,
+                    record.failure_reason,
+                )
+                cur.execute("DELETE FROM session_claims WHERE job_id = ?", (record.job_id,))
+                return "kept"
+            if current is None:
+                # No active row is being ended, so no session state is touched; the run's usage still goes
+                # in the ledger, and its own claim is released.
+                logger.warning(
+                    "Job %s has no row to store its result in; only its usage is recorded.", record.job_id
+                )
+                _insert_usage_event_cur(cur, record, attempts=att_list, keep_existing=True)
+                cur.execute("DELETE FROM session_claims WHERE job_id = ?", (record.job_id,))
+                return "missing"
+
+            # A session the CLI revealed (not the one this turn asked for and was let into) that another live
+            # job holds: two turns ran on one session, which is a failure, whatever the run said. The row
+            # keeps the session it had, and that session's watermark and safety state are left alone. This
+            # is the same decision as while the job ran, for when that check had not finished in time.
+            revealed = bool(record.session_id) and record.session_id != record.requested_session_id
+            if revealed:
+                holder = _live_session_holder_cur(
+                    cur,
+                    record.backend,
+                    str(record.session_id),
+                    job_id=record.job_id,
+                    owner_id=record.owner_id,
+                    now=now,
+                    is_pid_alive_fn=is_pid_alive_fn,
+                    process_identity_fn=process_identity_fn,
+                )
+                if holder is not None:
+                    logger.warning(
+                        "Job %s reported session %s, which job %s holds; it is stored failed, without that session.",
+                        record.job_id,
+                        record.session_id,
+                        holder,
+                    )
+                    ended = f"{record.status}" + (f", {record.failure_reason}" if record.failure_reason else "")
+                    held_sid = str(record.session_id)
+                    record.status = "failed"
+                    record.failure_reason = "cli_error"
+                    record.error = f"{session_held_error_text(held_sid, holder)} The run itself had ended {ended}."
+                    record.retry_guidance = session_held_guidance(held_sid, holder)
+                    row_sid = cur.execute(
+                        "SELECT session_id FROM jobs WHERE job_id = ?", (record.job_id,)
+                    ).fetchone()
+                    record.session_id = row_sid["session_id"] if row_sid is not None else None
+
+            record.last_activity = record.status
             cur.execute(
                 """
                 UPDATE jobs SET
@@ -1663,7 +1889,7 @@ class BridgeStore:
                     retry_guidance = ?, started_at = ?, finished_at = ?, duration_seconds = ?,
                     cleanup_seconds = ?, response = ?, usage_json = ?, provider_metrics_json = ?,
                     usage_status = ?, exit_code = ?, error = ?, stderr_tail = ?, last_activity = ?,
-                    provider_invoked = ?
+                    provider_invoked = ?, last_activity_at = ?, model_source = ?, response_chars = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -1695,6 +1921,10 @@ class BridgeStore:
                     record.stderr_tail,
                     record.last_activity,
                     1 if invoked else 0,
+                    (record.last_activity_at if record.last_activity_at is not None else now)
+                    if record.last_activity is not None else None,
+                    record.model_source,
+                    len(record.response),
                     record.job_id,
                 ),
             )
@@ -1750,10 +1980,18 @@ class BridgeStore:
                             record.finished_at or now,
                         ),
                     )
-                else:
+                elif record.session_id == record.requested_session_id:
+                    # The turn was let into this session past its block (confirmed), and has stopped.
                     cur.execute(
                         "DELETE FROM session_safety_state WHERE backend = ? AND session_id = ?",
                         (record.backend, record.session_id),
+                    )
+                else:
+                    # A session the CLI revealed never passed its block, so another job's block stays (such as
+                    # the `unknown` one a recovered holder leaves); only this job's own is cleared.
+                    cur.execute(
+                        "DELETE FROM session_safety_state WHERE backend = ? AND session_id = ? AND blocking_job_id = ?",
+                        (record.backend, record.session_id, record.job_id),
                     )
 
             # Atomically release any session claim held by this job right as terminal state commits.
@@ -1764,7 +2002,8 @@ class BridgeStore:
                 (now, record.owner_id),
             )
 
-            # Prune only oldest TERMINAL jobs beyond max_stored_jobs (never prune active jobs or self).
+            # Keep the newest max_stored_jobs FINISHED jobs. Queued and running jobs are never pruned, and do
+            # not count against the cap, so a burst of active jobs cannot push finished results out.
             cur.execute(
                 """
                 DELETE FROM jobs
@@ -1772,12 +2011,25 @@ class BridgeStore:
                   AND job_id != ?
                   AND job_id NOT IN (
                       SELECT job_id FROM jobs
+                      WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')
                       ORDER BY MAX(created_at, COALESCE(finished_at, 0)) DESC
                       LIMIT ?
                   )
                 """,
                 (record.job_id, self.max_stored_jobs),
             )
+
+        shared_record.quota_pool = record.quota_pool
+        shared_record.provider_invoked = record.provider_invoked
+        shared_record.attempts = record.attempts
+        shared_record.provider_metrics = record.provider_metrics
+        shared_record.status = record.status
+        shared_record.failure_reason = record.failure_reason
+        shared_record.error = record.error
+        shared_record.retry_guidance = record.retry_guidance
+        shared_record.session_id = record.session_id
+        shared_record.last_activity = record.last_activity
+        return "written"
 
     def delete_aborted_queued_job(self, job_id: str, *, lock_timeout: float = 2.0) -> bool:
         """Remove a queued job row whose submission was cancelled before execution started."""
@@ -1835,8 +2087,14 @@ class BridgeStore:
             )
 
     def get_job(self, job_id: str) -> JobRecord | None:
-        with self._tx(write=False) as cur:
-            row = cur.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return self.peek_job(job_id)
+
+    def peek_job(self, job_id: str) -> JobRecord | None:
+        """Read the committed row through a connection opened read-only."""
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             return _row_to_job(row) if row is not None else None
 
     def list_jobs(
@@ -2002,38 +2260,6 @@ class BridgeStore:
 
     # --- Usage aggregation (direct SQL GROUP BY) ---
 
-    def session_compact_summary(self, owner_id: str) -> dict[str, Any]:
-        with self._tx(write=False) as cur:
-            rows = cur.execute(
-                """
-                SELECT backend,
-                       COUNT(DISTINCT job_id) AS runs,
-                       COUNT(*) AS attempts,
-                       SUM(CASE WHEN is_final_attempt = 1 AND status = 'completed' THEN 1 ELSE 0 END) AS completed,
-                       ROUND(COALESCE(SUM(duration_seconds), 0.0), 2) AS duration_seconds,
-                       SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
-                       SUM(CASE WHEN usage_status IN ('partial', 'missing') THEN 1 ELSE 0 END) AS incomplete_usage_runs
-                FROM usage_events
-                WHERE owner_id = ?
-                GROUP BY backend
-                """,
-                (owner_id,),
-            ).fetchall()
-        out: dict[str, Any] = {}
-        for r in rows:
-            entry: dict[str, Any] = {
-                "runs": int(r["runs"]),
-                "completed": int(r["completed"] or 0),
-                "duration_seconds": round(float(r["duration_seconds"] or 0.0), 2),
-                "total_tokens": int(r["total_tokens"] or 0),
-            }
-            if int(r["attempts"] or 0) > int(r["runs"] or 0):
-                entry["attempts"] = int(r["attempts"])
-            if int(r["incomplete_usage_runs"] or 0) > 0:
-                entry["incomplete_usage_runs"] = int(r["incomplete_usage_runs"])
-            out[str(r["backend"])] = entry
-        return out
-
     def summarize_usage(
         self,
         *,
@@ -2043,9 +2269,14 @@ class BridgeStore:
         quota_pool: str | None = None,
         cwd: str | None = None,
         parent_run: str | None = None,
-        recent_limit: int = 10,
-        compact: bool = False,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
     ) -> dict[str, Any]:
+        """Runs, outcomes, time and counted tokens over the usage records, per backend and per quota pool.
+
+        `since_ts` (inclusive) and `until_ts` (exclusive) bound the records by when they were written,
+        on top of `period`.
+        """
         clauses: list[str] = []
         vals: list[Any] = []
         if period == "session":
@@ -2056,6 +2287,12 @@ class BridgeStore:
             if cutoff is not None:
                 clauses.append("ts >= ?")
                 vals.append(cutoff)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            vals.append(since_ts)
+        if until_ts is not None:
+            clauses.append("ts < ?")
+            vals.append(until_ts)
         if backend:
             clauses.append("backend = ?")
             vals.append(backend)
@@ -2072,7 +2309,6 @@ class BridgeStore:
             vals.append(parent_run)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        recent_n = max(0, min(int(recent_limit), 50))
         pool_expr = "COALESCE(quota_pool, CASE WHEN backend = 'codex' THEN 'codex' WHEN backend = 'claude' THEN 'claude' ELSE 'agy_gemini' END)"
 
         with self._tx(write=False) as cur:
@@ -2140,45 +2376,6 @@ class BridgeStore:
                 """,
                 vals,
             ).fetchall()
-
-            model_rows: list[sqlite3.Row] = []
-            recent_rows: list[sqlite3.Row] = []
-            if not compact:
-                model_rows = cur.execute(
-                    f"""
-                    SELECT
-                        backend,
-                        COALESCE(NULLIF(model, ''), backend || '-default') AS model_name,
-                        COUNT(DISTINCT job_id) AS runs,
-                        COUNT(*) AS attempts,
-                        SUM(CASE WHEN is_final_attempt = 1 AND status = 'completed' THEN 1 ELSE 0 END) AS completed,
-                        ROUND(COALESCE(SUM(duration_seconds), 0.0), 2) AS duration_seconds,
-                        SUM(CASE WHEN usage_status IN ('exact', 'delta') THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
-                        SUM(CASE WHEN usage_status = 'exact' THEN 1 ELSE 0 END) AS cov_exact,
-                        SUM(CASE WHEN usage_status = 'delta' THEN 1 ELSE 0 END) AS cov_delta,
-                        SUM(CASE WHEN usage_status = 'partial' THEN 1 ELSE 0 END) AS cov_partial,
-                        SUM(CASE WHEN usage_status NOT IN ('exact', 'delta', 'partial') THEN 1 ELSE 0 END) AS cov_missing
-                    FROM usage_events
-                    {where}
-                    GROUP BY backend, model_name
-                    """,
-                    vals,
-                ).fetchall()
-
-                if recent_n > 0:
-                    recent_rows = cur.execute(
-                        f"""
-                        SELECT iso_time, job_id, attempt_number, is_final_attempt, backend,
-                               {pool_expr} AS quota_pool, model,
-                               status, duration_seconds, usage_status, total_tokens,
-                               effort, parent_run, label
-                        FROM usage_events
-                        {where}
-                        ORDER BY ts DESC, id DESC
-                        LIMIT ?
-                        """,
-                        [*vals, recent_n],
-                    ).fetchall()
 
         def _empty_bucket(in_flight_cnt: int) -> dict[str, Any]:
             return {
@@ -2302,68 +2499,6 @@ class BridgeStore:
             "by_quota_pool": by_quota_pool,
         }
 
-        if compact:
-            return summary
-
-        if "neon" in by_backend:
-            by_backend["neon"]["token_note"] = (
-                "Per-turn Antigravity tokens across agy_gemini and agy_claude_gpt pools "
-                "(agy cache_read_tokens can exceed reported total_tokens; compare pools via quota)."
-            )
-        if "codex" in by_backend:
-            by_backend["codex"]["token_note"] = (
-                "Per-turn Codex tokens (cached_tokens is a subset of input_tokens; "
-                "reasoning_tokens is a subset of output_tokens)."
-            )
-
-        if "claude" in by_backend:
-            by_backend["claude"]["token_note"] = (
-                "Per-run Claude Code tokens (input_tokens includes cache reads and cache writes; "
-                "cached_tokens is the cache-read part)."
-            )
-
-        by_model: dict[str, dict[str, Any]] = {}
-        for mr in model_rows:
-            mkey = f"{mr['backend']}:{mr['model_name']}"
-            by_model[mkey] = {
-                "runs": int(mr["runs"] or 0),
-                "attempts": int(mr["attempts"] or 0),
-                "completed": int(mr["completed"] or 0),
-                "duration_seconds": round(float(mr["duration_seconds"] or 0.0), 2),
-                "total_tokens": int(mr["total_tokens"] or 0),
-                "usage_coverage": {
-                    "exact": int(mr["cov_exact"] or 0),
-                    "delta": int(mr["cov_delta"] or 0),
-                    "partial": int(mr["cov_partial"] or 0),
-                    "missing": int(mr["cov_missing"] or 0),
-                },
-            }
-        summary["by_model"] = by_model
-
-        recent: list[dict[str, Any]] = []
-        for rr in recent_rows:
-            item: dict[str, Any] = {
-                "time": rr["iso_time"],
-                "job_id": rr["job_id"],
-                "attempt": int(rr["attempt_number"] or 1),
-                "backend": rr["backend"],
-                "quota_pool": rr["quota_pool"],
-                "model": rr["model"],
-                "status": rr["status"],
-                "duration_seconds": rr["duration_seconds"],
-                "usage_status": rr["usage_status"],
-                "total_tokens": rr["total_tokens"],
-            }
-            if int(rr["is_final_attempt"] if rr["is_final_attempt"] is not None else 1) == 0:
-                item["is_final_attempt"] = False
-            if rr["effort"]:
-                item["effort"] = rr["effort"]
-            if rr["parent_run"]:
-                item["parent_run"] = rr["parent_run"]
-            if rr["label"]:
-                item["label"] = rr["label"]
-            recent.append(item)
-        summary["recent"] = recent
         return summary
 
     def dashboard_records(
@@ -2374,6 +2509,7 @@ class BridgeStore:
         session_owner_id: str,
         only_session: bool,
         is_pid_alive_fn: Callable[[int], bool],
+        process_identity_fn: Callable[[int], str | None] | None = None,
     ) -> dict[str, Any]:
         """Every record the usage dashboard reads, from one snapshot so that its figures agree. It writes nothing.
 
@@ -2424,7 +2560,8 @@ class BridgeStore:
                 f"""
                 SELECT j.job_id, j.owner_id, j.backend, j.quota_pool, j.model, j.requested_model, j.status,
                        j.created_at, j.started_at, j.last_activity, j.provider_invoked,
-                       o.pid AS owner_pid, o.exited_at AS owner_exited_at
+                       o.pid AS owner_pid, o.exited_at AS owner_exited_at,
+                       o.process_identity AS owner_process_identity
                 FROM jobs j
                 LEFT JOIN owners o ON o.owner_id = j.owner_id
                 {running_where}
@@ -2444,9 +2581,14 @@ class BridgeStore:
             job = dict(r)
             pid = job.pop("owner_pid")
             exited_at = job.pop("owner_exited_at")
+            process_identity = job.pop("owner_process_identity")
             # The calling window is alive by definition. Any other: the check recovery uses, read only.
             job["owner_alive"] = job["owner_id"] == session_owner_id or _is_owner_row_alive(
-                pid, exited_at, is_pid_alive_fn=is_pid_alive_fn
+                pid,
+                exited_at,
+                process_identity,
+                is_pid_alive_fn=is_pid_alive_fn,
+                process_identity_fn=process_identity_fn,
             )
             running_jobs.append(job)
 

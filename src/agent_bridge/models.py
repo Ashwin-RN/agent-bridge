@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from agent_bridge.config import BackendName, EffortLevel, ExecutionMode, QuotaPool, classify_quota_pool
+from agent_bridge.status_text import SEP, format_job_line
+
+# A job reply holds this much of the reply text unless the caller asks for more, up to the maximum.
+DEFAULT_RESPONSE_CHARS = 20_000
+MAX_RESPONSE_CHARS = 100_000
 
 JobStatus = Literal[
     "queued",
@@ -52,12 +57,12 @@ class RunRequest:
     review_commit: str | None = None
     job_id: str | None = None
     owner_id: str | None = None
-    confirm_prior_stopped: bool = False
     confirm_prior_job_id: str | None = None
     allow_cross_pool_fallback: bool = False
     prior_quota_pool: QuotaPool | None = None
     prior_model: str | None = None
     resume_notice: str | None = None
+    fast: bool = False
 
 
 @dataclass(slots=True)
@@ -140,135 +145,199 @@ class JobRecord:
     last_activity: str | None = None
     provider_invoked: bool = False
     attempts: list[dict[str, Any]] | None = None
+    last_activity_at: float | None = None
+    model_source: Literal["observed", "requested", "default"] | None = None
+    response_chars: int | None = None
+    fast: bool = False
 
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
 
-    def elapsed_seconds(self) -> float:
-        if self.duration_seconds is not None:
-            return round(self.duration_seconds, 2)
-        if self.started_at is not None:
-            end = self.finished_at if self.finished_at is not None else time.time()
-            return round(max(0.0, end - self.started_at), 2)
-        return 0.0
+    # --- Replies to a host ---
+    #
+    # Every reply about a job opens with its status line, then carries only what the host can act on.
+    # Nothing that is null, nothing about the window rather than the job, and the reply text in pages.
 
-    def to_summary(self) -> dict[str, Any]:
-        pool = self.quota_pool or classify_quota_pool(self.backend, self.model or self.requested_model)
-        out: dict[str, Any] = {
-            "job_id": self.job_id,
-            "owner_id": self.owner_id,
+    def model_value(self) -> str | None:
+        """The model name to show, or None when the bridge only knows the CLI's default."""
+        model = self.model or self.requested_model
+        return None if not model or model == f"{self.backend}-default" else model
+
+    def pool(self) -> QuotaPool:
+        return self.quota_pool or classify_quota_pool(self.backend, self.model or self.requested_model)
+
+    def line_fields(self) -> dict[str, Any]:
+        """What the status line is built from. A finished job's activity is its status, so it is left out."""
+        effort = self.effort
+        if self.fast and self.backend == "codex":
+            effort = f"{effort}{SEP}fast" if effort else "fast"
+        return {
             "backend": self.backend,
-            "quota_pool": pool,
+            "model": self.model,
+            "requested_model": self.requested_model,
+            "model_source": self.model_source,
+            "effort": effort,
             "status": self.status,
-            "mode": self.mode,
-            "model": self.model or self.requested_model or f"{self.backend}-default",
-            "cwd": self.cwd,
-            "effective_cwd": self.effective_cwd or self.cwd,
-            "elapsed_seconds": self.elapsed_seconds(),
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_seconds": self.duration_seconds,
+            "last_activity": None if self.is_terminal else self.last_activity,
+            "last_activity_at": self.last_activity_at,
+            "label": self.label,
+            "quota_pool": self.pool(),
+        }
+
+    def line(self, *, now: float | None = None) -> str:
+        return format_job_line(self.line_fields(), now=time.time() if now is None else now, long=True)
+
+    def model_source_value(self) -> str:
+        if self.model_source:
+            return self.model_source
+        if self.model_value() is None:
+            return "default"
+        return "requested" if self.backend == "codex" or not self.model else "observed"
+
+    def to_summary(self, *, now: float | None = None) -> dict[str, Any]:
+        """One entry of a job list: the line, the ids, and why it failed when it did."""
+        out: dict[str, Any] = {
+            "line": self.line(now=now),
+            "job_id": self.job_id,
+            "status": self.status,
             "prompt_preview": self.prompt_preview,
         }
-        if self.effort:
-            out["effort"] = self.effort
-        if self.label:
-            out["label"] = self.label
-        if self.parent_run:
-            out["parent_run"] = self.parent_run
-        if self.session_id:
-            out["session_id"] = self.session_id
-        if self.worktree_path:
-            out["worktree_path"] = self.worktree_path
-        if self.usage:
-            out["total_tokens"] = self.usage.get("total_tokens")
-            out["usage_status"] = self.usage_status
-        elif self.is_terminal:
-            out["usage_status"] = self.usage_status
-        if self.model_notice:
-            out["model_notice"] = self.model_notice
-        if self.last_activity and not self.is_terminal:
-            out["last_activity"] = self.last_activity
-        if self.failure_reason:
+        if self.is_terminal and self.status != "completed" and self.failure_reason:
             out["failure_reason"] = self.failure_reason
-        if self.provider_state and self.status != "completed":
-            out["provider_state"] = self.provider_state
-        if self.error:
-            out["error"] = self.error
         return out
 
-    def to_detail(self, *, max_response_chars: int | None = None) -> dict[str, Any]:
-        response = self.response
-        truncated = False
-        if max_response_chars is not None and len(response) > max_response_chars:
-            response = response[:max_response_chars] + "\n...[truncated]"
-            truncated = True
-
-        pool = self.quota_pool or classify_quota_pool(self.backend, self.model or self.requested_model)
+    def to_receipt(self, *, timeout_seconds: int, next_call: str, now: float | None = None) -> dict[str, Any]:
+        """The reply to a job started in the background: what it is, and the call that collects it."""
         out: dict[str, Any] = {
+            "line": self.line(now=now),
             "job_id": self.job_id,
-            "owner_id": self.owner_id,
-            "backend": self.backend,
-            "quota_pool": pool,
             "status": self.status,
-            "mode": self.mode,
-            "model": self.model or self.requested_model or f"{self.backend}-default",
-            "cwd": self.cwd,
-            "effective_cwd": self.effective_cwd or self.cwd,
-            "elapsed_seconds": self.elapsed_seconds(),
+            "backend": self.backend,
         }
-        if self.cleanup_seconds is not None and (
-            self.cleanup_seconds > 0 or self.status in {"timed_out", "cancelled"}
-        ):
-            out["cleanup_seconds"] = round(self.cleanup_seconds, 2)
+        if (model := self.model_value()) is not None:
+            out["model"] = model
+        out["timeout_seconds"] = timeout_seconds
+        out["next"] = next_call
+        return out
+
+    def to_detail(
+        self,
+        *,
+        response_offset: int = 0,
+        response_chars: int = DEFAULT_RESPONSE_CHARS,
+        response_file: str | None = None,
+        verbose: bool = False,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """The full reply about one job, with paged text or a preview of the exported text."""
+        out: dict[str, Any] = {
+            "line": self.line(now=now),
+            "job_id": self.job_id,
+            "status": self.status,
+            "backend": self.backend,
+        }
+        if (model := self.model_value()) is not None:
+            out["model"] = model
+        out["model_source"] = self.model_source_value()
+        if self.requested_model and self.model and self.requested_model != self.model:
+            out["requested_model"] = self.requested_model
         if self.effort:
             out["effort"] = self.effort
-        if self.requested_model and self.requested_model != self.model:
-            out["requested_model"] = self.requested_model
-        if self.model_notice:
-            out["model_notice"] = self.model_notice
-        if self.label:
-            out["label"] = self.label
-        if self.parent_run:
-            out["parent_run"] = self.parent_run
-        if self.worktree or self.worktree_path:
-            if self.worktree:
-                out["worktree"] = True
-            if self.worktree_path:
-                out["worktree_path"] = self.worktree_path
-            if self.worktree_branch:
-                out["worktree_branch"] = self.worktree_branch
-            if self.worktree_commit:
-                out["worktree_commit"] = self.worktree_commit
-        if self.session_id:
-            out["session_id"] = self.session_id
-        if self.last_activity and not self.is_terminal:
-            out["last_activity"] = self.last_activity
-        if self.is_terminal or response:
-            out["response"] = response
-            if truncated:
-                out["response_truncated"] = True
+        out["quota_pool"] = self.pool()
+        out["mode"] = self.mode
+        for key in ("session_id", "parent_run", "model_notice", "worktree_path", "worktree_branch"):
+            if value := getattr(self, key):
+                out[key] = value
+        if self.effective_cwd and self.effective_cwd != self.cwd:
+            out["effective_cwd"] = self.effective_cwd
+        if response_file is not None:
+            kept = len(self.response)
+            total = max(self.response_chars or 0, kept)
+            out.update(
+                response_file=response_file,
+                response_head=self.response[:400],
+                response_total_chars=total,
+            )
+            if total > kept:
+                out.update(self._response_storage_cut(kept, total))
+        elif self.is_terminal or self.response:
+            out.update(self._response_page(response_offset, response_chars))
         if self.usage:
-            out["usage"] = self.usage
-        if self.provider_metrics:
-            out["provider_metrics"] = self.provider_metrics
-        attempts_list = self.attempts
-        if not attempts_list and isinstance(self.provider_metrics, dict):
-            raw_att = self.provider_metrics.get("attempts")
-            if isinstance(raw_att, list) and len(raw_att) > 1:
-                attempts_list = raw_att
-        if attempts_list and len(attempts_list) > 1:
-            out["attempts"] = attempts_list
-        if self.is_terminal:
+            out["usage"] = self.usage if verbose else {
+                k: v for k in _REPLY_USAGE_KEYS if (v := self.usage.get(k)) not in (None, 0)
+            }
+        if self.is_terminal and self.usage_status != "exact":
             out["usage_status"] = self.usage_status
-        if self.exit_code is not None and self.exit_code != 0:
+        if self.is_terminal and self.status != "completed":
+            out.update(self._failure_fields())
+        if verbose:
+            if self.provider_metrics:
+                out["provider_metrics"] = self.provider_metrics
+            attempts = self.attempts
+            if not attempts and isinstance(self.provider_metrics, dict):
+                attempts = self.provider_metrics.get("attempts")
+            if isinstance(attempts, list) and len(attempts) > 1:
+                out["attempts"] = attempts
+        return out
+
+    def _response_page(self, offset: int, chars: int) -> dict[str, Any]:
+        stored = self.response
+        kept = len(stored)
+        total = max(self.response_chars or 0, kept)
+        offset = max(0, offset)
+        chars = max(1, min(int(chars), MAX_RESPONSE_CHARS))
+        piece = stored[offset : offset + chars]
+        end = offset + len(piece)
+        out: dict[str, Any] = {"response": piece}
+        if offset:
+            out["response_offset"] = offset
+        if end < kept:
+            out.update(
+                response_truncated=True,
+                response_total_chars=total,
+                next_offset=end,
+                response_note=(
+                    f"This is characters {offset} to {end} of {total}. Call jobs(job_ids=['{self.job_id}'], "
+                    f"response_offset={end}) for the next part."
+                ),
+            )
+        elif total > kept:
+            out.update(self._response_storage_cut(kept, total))
+        if self.status == "completed" and not stored.strip() and total == kept:
+            out["warning"] = (
+                "The job completed with an empty reply: the subagent returned no text. Check what it did "
+                "(git status and diff for an edit job) before relying on it, or run it again."
+            )
+        return out
+
+    @staticmethod
+    def _response_storage_cut(kept: int, total: int) -> dict[str, Any]:
+        return {
+            "response_truncated": True,
+            "response_total_chars": total,
+            "response_note": (
+                f"The bridge kept only the first {kept} of {total} characters of this reply; the rest was not kept."
+            ),
+        }
+
+    def _failure_fields(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key in ("failure_reason", "provider_state", "retry_guidance", "error"):
+            if value := getattr(self, key):
+                out[key] = value
+        if self.exit_code not in (None, 0):
             out["exit_code"] = self.exit_code
-        if self.failure_reason:
-            out["failure_reason"] = self.failure_reason
-        if self.provider_state and self.status != "completed":
-            out["provider_state"] = self.provider_state
-        if self.retry_guidance and self.status != "completed":
-            out["retry_guidance"] = self.retry_guidance
-        if self.error:
-            out["error"] = self.error
-        if self.stderr_tail and (self.error or self.status != "completed"):
+        if self.cleanup_seconds is not None:
+            out["cleanup_seconds"] = round(self.cleanup_seconds, 2)
+        if self.stderr_tail:
             out["stderr_tail"] = self.stderr_tail
         return out
+
+
+# A job reply carries the total only; `verbose` gives the CLI's full count by kind.
+_REPLY_USAGE_KEYS: tuple[str, ...] = ("total_tokens",)
